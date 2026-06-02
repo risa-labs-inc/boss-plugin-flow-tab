@@ -1,0 +1,131 @@
+{
+  "nodes": [
+    {
+      "id": "r1",
+      "type": "TRIGGER",
+      "title": "Start",
+      "x": 80.0,
+      "y": 140.0,
+      "config": {}
+    },
+    {
+      "id": "r2",
+      "type": "OPEN_BROWSER",
+      "title": "Open blank page",
+      "x": 360.0,
+      "y": 140.0,
+      "config": {
+        "url": "",
+        "headless": "false"
+      }
+    },
+    {
+      "id": "r3",
+      "type": "INJECT",
+      "title": "Build a form",
+      "x": 640.0,
+      "y": 140.0,
+      "config": {
+        "script": "document.body.innerHTML = '<h1>Flow Demo</h1><input id=\"q\" placeholder=\"query\"><button id=\"go\">Search</button><div id=\"out\">idle</div><a href=\"https://risa.dev\">link one</a> <a href=\"https://example.org\">link two</a>';document.getElementById('go').onclick = function(){document.getElementById('out').innerText = 'You searched: ' + document.getElementById('q').value;};true"
+      }
+    },
+    {
+      "id": "r4",
+      "type": "TYPE",
+      "title": "Type query",
+      "x": 920.0,
+      "y": 140.0,
+      "config": {
+        "selectorType": "css",
+        "selector": "#q",
+        "text": "flow nodes"
+      }
+    },
+    {
+      "id": "r5",
+      "type": "CLICK",
+      "title": "Click Search",
+      "x": 1200.0,
+      "y": 140.0,
+      "config": {
+        "selectorType": "css",
+        "selector": "#go"
+      }
+    },
+    {
+      "id": "r6",
+      "type": "EXTRACT",
+      "title": "Extract result",
+      "x": 1480.0,
+      "y": 140.0,
+      "config": {
+        "selectorType": "css",
+        "selector": "#out",
+        "mode": "text",
+        "attr": "",
+        "field": "result",
+        "multiple": "false"
+      }
+    },
+    {
+      "id": "r7",
+      "type": "EXTRACT",
+      "title": "Extract links",
+      "x": 1480.0,
+      "y": 340.0,
+      "config": {
+        "selectorType": "css",
+        "selector": "a",
+        "mode": "attr",
+        "attr": "href",
+        "field": "link",
+        "multiple": "true"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "id": "re1",
+      "fromNode": "r1",
+      "fromPort": 0,
+      "toNode": "r2",
+      "toPort": 0
+    },
+    {
+      "id": "re2",
+      "fromNode": "r2",
+      "fromPort": 0,
+      "toNode": "r3",
+      "toPort": 0
+    },
+    {
+      "id": "re3",
+      "fromNode": "r3",
+      "fromPort": 0,
+      "toNode": "r4",
+      "toPort": 0
+    },
+    {
+      "id": "re4",
+      "fromNode": "r4",
+      "fromPort": 0,
+      "toNode": "r5",
+      "toPort": 0
+    },
+    {
+      "id": "re5",
+      "fromNode": "r5",
+      "fromPort": 0,
+      "toNode": "r6",
+      "toPort": 0
+    },
+    {
+      "id": "re6",
+      "fromNode": "r5",
+      "fromPort": 0,
+      "toNode": "r7",
+      "toPort": 0
+    }
+  ],
+  "nextId": 100
+}

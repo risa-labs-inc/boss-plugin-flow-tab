@@ -1,0 +1,512 @@
+package ai.rever.boss.plugin.dynamic.flowtab
+
+import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.boss.plugin.api.TabComponentWithUI
+import ai.rever.boss.plugin.api.TabInfo
+import ai.rever.boss.plugin.api.TabTypeInfo
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.TooltipArea
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.DropdownMenu
+import androidx.compose.material.DropdownMenuItem
+import androidx.compose.material.Icon
+import androidx.compose.material.IconButton
+import androidx.compose.material.Text
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AccountTree
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.FiberManualRecord
+import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.FitScreen
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.RestartAlt
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.ZoomIn
+import androidx.compose.material.icons.filled.ZoomOut
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.arkivanov.decompose.ComponentContext
+import com.arkivanov.essenty.lifecycle.Lifecycle
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlin.math.roundToInt
+
+private val ToolbarBg = Color(0xFF202024)
+private val PaletteBg = Color(0xFF1F1F23)
+private val ToolbarBorder = Color(0xFF303036)
+private val IconTint = Color(0xFFCDCDD4)
+// Dark banner backgrounds for the single status bar (foreground text stays white).
+private val ConfirmBg = Color(0xFF3A2E12)
+private val NoticeBg = Color(0xFF26456E)
+private val RunGreen = Color(0xFF2E7D32)
+
+/**
+ * Flow tab component: a node-based canvas where nodes are spawned from the left
+ * palette, dragged around, and connected by dragging from output to input ports.
+ *
+ * Layout: a top toolbar (zoom / fit / clear), a left node palette, and the
+ * [FlowCanvas] filling the rest. Graph state is persisted per-tab to plugin
+ * storage and restored on reopen.
+ */
+class FlowTabComponent(
+    private val ctx: ComponentContext,
+    override val config: TabInfo,
+    private val context: PluginContext
+) : TabComponentWithUI, ComponentContext by ctx {
+
+    override val tabTypeInfo: TabTypeInfo = FlowTabType
+
+    private val coroutineScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private val json = Json { ignoreUnknownKeys = true; isLenient = true }
+    private val storageKey = "graph:${config.id}"
+
+    init {
+        lifecycle.subscribe(
+            object : Lifecycle.Callbacks {
+                override fun onDestroy() {
+                    coroutineScope.cancel()
+                }
+            }
+        )
+    }
+
+    @Composable
+    override fun Content() {
+        val state = remember { FlowGraphState() }
+        var viewportSize by remember { mutableStateOf(Size.Zero) }
+        var loaded by remember { mutableStateOf(false) }
+        val focusRequester = remember { FocusRequester() }
+
+        val storage = remember {
+            context.pluginStorageFactory?.createStorage("ai.rever.boss.plugin.dynamic.flowtab")
+        }
+
+        // Load persisted graph (or seed a starter Trigger node) once.
+        LaunchedEffect(config.id) {
+            val saved = runCatching { storage?.getJson(storageKey) }.getOrNull()
+            if (!saved.isNullOrBlank()) {
+                runCatching {
+                    state.load(json.decodeFromString(GraphSnapshot.serializer(), saved))
+                }
+            }
+            if (state.nodes.isEmpty()) {
+                state.addNode(NodeType.TRIGGER, Offset(320f, 200f))
+                state.selection = null
+            }
+            // Restore the last run's per-node status/output, if any.
+            runCatching { storage?.getJson("runstate:${config.id}") }.getOrNull()?.let { rs ->
+                runCatching {
+                    state.runStates.putAll(json.decodeFromString(RunSnapshot.serializer(), rs).toRuns())
+                }
+            }
+            loaded = true
+            focusRequester.requestFocus()
+        }
+
+        // Debounced autosave: collectLatest cancels the pending save when the
+        // graph changes again, so we only write after a quiet period.
+        LaunchedEffect(loaded) {
+            if (!loaded || storage == null) return@LaunchedEffect
+            snapshotFlow { state.toSnapshot() }.collectLatest { snapshot ->
+                delay(400)
+                runCatching {
+                    storage.putJson(storageKey, json.encodeToString(GraphSnapshot.serializer(), snapshot))
+                }
+            }
+        }
+
+        fun viewCenterScreen(): Offset =
+            Offset(viewportSize.width / 2f, viewportSize.height / 2f)
+
+        // ---- run wiring ----
+        val executor = remember { FlowExecutor(context) }
+        var runJob by remember { mutableStateOf<Job?>(null) }
+
+        fun startRun() {
+            if (state.isRunning) return
+            state.clearRun()
+            state.notice = null
+            state.isRunning = true
+            val plan = state.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
+            val edges = state.edges.toList()
+            runJob = coroutineScope.launch(Dispatchers.Default) {
+                try {
+                    executor.run(plan, edges) { id, run -> state.runStates[id] = run }
+                } catch (ce: CancellationException) {
+                    // stopped by user
+                } catch (e: Exception) {
+                    state.runError = e.message ?: e.toString()
+                } finally {
+                    state.isRunning = false
+                    // Persist the run results (capped) so they survive reopening.
+                    withContext(NonCancellable) {
+                        runCatching {
+                            storage?.putJson(
+                                "runstate:${config.id}",
+                                json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        fun stopRun() {
+            runJob?.cancel()
+        }
+
+        // ---- export / import ----
+        val uiScope = rememberCoroutineScope()
+        val prettyJson = remember { Json { prettyPrint = true; ignoreUnknownKeys = true } }
+
+        fun exportFlow() {
+            val text = prettyJson.encodeToString(GraphSnapshot.serializer(), state.toSnapshot())
+            val picker = context.filePickerProvider
+            if (picker != null) {
+                picker.pickSaveFile(suggestedFileName = "flow.json", filters = listOf("json")) { path ->
+                    if (path != null) runCatching { java.io.File(path).writeText(text) }
+                }
+            } else {
+                context.clipboardProvider?.setText(text)
+            }
+        }
+
+        fun loadFromText(text: String) {
+            uiScope.launch {
+                runCatching { state.load(json.decodeFromString(GraphSnapshot.serializer(), text)) }
+                    .onFailure { state.runError = "Import failed: ${it.message}" }
+            }
+        }
+
+        fun importFlow() {
+            val picker = context.filePickerProvider
+            if (picker != null) {
+                picker.pickFile(title = "Import flow", filters = listOf("json")) { path ->
+                    if (path != null) runCatching { java.io.File(path).readText() }.getOrNull()?.let(::loadFromText)
+                }
+            } else {
+                context.clipboardProvider?.readText()?.let(::loadFromText)
+            }
+        }
+
+        fun doClear() {
+            state.nodes.clear()
+            state.edges.clear()
+            state.clearRun()
+            state.selection = null
+            uiScope.launch { runCatching { storage?.remove("runstate:${config.id}") } }
+        }
+
+        // Import an RPA Recorder config → a chain of browser nodes on the canvas.
+        fun applyRecording(text: String) {
+            val result = runCatching { RpaRecorderImport.convert(text) }.getOrElse {
+                state.runError = "RPA import failed: ${it.message}"; return
+            }
+            if (result.steps.isEmpty()) { state.notice = "No importable actions in that recording"; return }
+            uiScope.launch {
+                state.importChain(result.steps, state.toWorld(Offset(120f, 120f)))
+                state.notice = "Imported ${result.steps.size} node(s)" +
+                    if (result.skipped.isNotEmpty()) " · skipped: ${result.skipped.joinToString(", ")}" else ""
+            }
+        }
+
+        fun importRpaRecording() {
+            val picker = context.filePickerProvider
+            if (picker != null) {
+                picker.pickFile(title = "Import RPA recording", filters = listOf("json")) { path ->
+                    if (path != null) runCatching { java.io.File(path).readText() }.getOrNull()?.let(::applyRecording)
+                }
+            } else {
+                context.clipboardProvider?.readText()?.let(::applyRecording)
+            }
+        }
+
+        val selectedNode = (state.selection as? Selection.Node)?.let { state.nodeById(it.id) }
+        var confirmClear by remember { mutableStateOf(false) }
+
+        Column(Modifier.fillMaxSize().background(CanvasBackground)) {
+            Toolbar(
+                scale = state.scale,
+                isRunning = state.isRunning,
+                onRun = { startRun() },
+                onStop = { stopRun() },
+                onNewFlow = {
+                    context.splitViewOperations?.openTab(
+                        FlowTabData(id = "flow-${java.util.UUID.randomUUID()}", title = "Flow")
+                    )
+                },
+                onZoomIn = { state.zoomBy(1.2f, viewCenterScreen()) },
+                onZoomOut = { state.zoomBy(1f / 1.2f, viewCenterScreen()) },
+                onFit = { state.fitToContent(viewportSize) },
+                onReset = { state.resetView() },
+                onClear = { confirmClear = true },
+                onExport = { exportFlow() },
+                onImport = { importFlow() },
+                onImportRpa = { importRpaRecording() }
+            )
+
+            // One status bar at a time, prioritized: clear-confirm > run error > notice.
+            // (Stacking three banners pushed the canvas down and read as noise.)
+            when {
+                confirmClear -> Row(
+                    modifier = Modifier.fillMaxWidth().background(ConfirmBg).padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Clear all ${state.nodes.size} nodes and ${state.edges.size} edges?", color = Color.White, fontSize = 12.sp)
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        "Clear",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clip(RoundedCornerShape(FlowTheme.rSm)).background(FlowTheme.Error)
+                            .clickable { confirmClear = false; doClear() }
+                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Cancel",
+                        color = FlowTheme.TextMuted,
+                        fontSize = 12.sp,
+                        modifier = Modifier.clickable { confirmClear = false }.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+                state.runError != null -> Text(
+                    text = "Error: ${state.runError}  (click to dismiss)",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    modifier = Modifier.fillMaxWidth().background(FlowTheme.Error).clickable { state.runError = null }
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                )
+                state.notice != null -> Text(
+                    text = state.notice!!,
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(NoticeBg)
+                        .clickable { state.notice = null }
+                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                )
+            }
+
+            Row(Modifier.fillMaxWidth().weight(1f)) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .weight(1f)
+                        .focusRequester(focusRequester)
+                        .focusable()
+                        .onPreviewKeyEvent { event ->
+                            // Don't steal Backspace/Delete while the picker's search box is open.
+                            if (event.type == KeyEventType.KeyDown &&
+                                state.pickerRequest == null &&
+                                (event.key == Key.Delete || event.key == Key.Backspace)
+                            ) {
+                                if (state.selection != null) {
+                                    state.deleteSelection()
+                                    true
+                                } else false
+                            } else false
+                        }
+                ) {
+                    FlowCanvas(
+                        state = state,
+                        onViewportSize = { viewportSize = it }
+                    )
+                }
+
+                if (selectedNode != null) {
+                    FlowInspector(state, selectedNode)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun Toolbar(
+    scale: Float,
+    isRunning: Boolean,
+    onRun: () -> Unit,
+    onStop: () -> Unit,
+    onNewFlow: () -> Unit,
+    onZoomIn: () -> Unit,
+    onZoomOut: () -> Unit,
+    onFit: () -> Unit,
+    onReset: () -> Unit,
+    onClear: () -> Unit,
+    onExport: () -> Unit,
+    onImport: () -> Unit,
+    onImportRpa: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(44.dp)
+            .background(ToolbarBg)
+            .border(width = 1.dp, color = ToolbarBorder)
+            .padding(horizontal = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(
+            imageVector = FlowTabType.icon,
+            contentDescription = null,
+            tint = FlowTheme.PrimaryTint,
+            modifier = Modifier.size(18.dp)
+        )
+        Spacer(Modifier.width(8.dp))
+        Text("Flow", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+
+        Spacer(Modifier.width(12.dp))
+        // Run / Stop
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(7.dp))
+                .background(if (isRunning) FlowTheme.Error else RunGreen)
+                .clickable(onClick = if (isRunning) onStop else onRun)
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                if (isRunning) Icons.Filled.Stop else Icons.Filled.PlayArrow,
+                contentDescription = if (isRunning) "Stop" else "Run",
+                tint = Color.White,
+                modifier = Modifier.size(15.dp)
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(if (isRunning) "Stop" else "Run", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        }
+
+        Spacer(Modifier.width(8.dp))
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(7.dp))
+                .background(FlowTheme.Primary)
+                .clickable(onClick = onNewFlow)
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Filled.Add, contentDescription = null, tint = Color.White, modifier = Modifier.size(14.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("New Flow", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        }
+
+        Spacer(Modifier.weight(1f))
+
+        ToolbarButton(Icons.Filled.ZoomOut, "Zoom out", onZoomOut)
+        Text(
+            text = "${(scale * 100).roundToInt()}%",
+            color = IconTint,
+            fontSize = 12.sp,
+            modifier = Modifier.width(48.dp),
+        )
+        ToolbarButton(Icons.Filled.ZoomIn, "Zoom in", onZoomIn)
+        ToolbarButton(Icons.Filled.FitScreen, "Fit to content", onFit)
+        ToolbarButton(Icons.Filled.RestartAlt, "Reset view", onReset)
+        ToolbarButton(Icons.Filled.DeleteOutline, "Clear canvas", onClear)
+        ToolbarButton(Icons.Filled.FileDownload, "Export workflow", onExport)
+        ImportMenu(onImport, onImportRpa)
+    }
+}
+
+/** Import button with a dropdown: workflow JSON or an RPA-recorder config. */
+@Composable
+private fun ImportMenu(onImport: () -> Unit, onImportRpa: () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        ToolbarButton(Icons.Filled.FileUpload, "Import…") { open = true }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(onClick = { open = false; onImport() }) {
+                Icon(Icons.Filled.AccountTree, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Import workflow (.json)", fontSize = 13.sp)
+            }
+            DropdownMenuItem(onClick = { open = false; onImportRpa() }) {
+                Icon(Icons.Filled.FiberManualRecord, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Import RPA recording", fontSize = 13.sp)
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun ToolbarButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    description: String,
+    onClick: () -> Unit
+) {
+    TooltipArea(
+        delayMillis = 350,
+        tooltip = {
+            Box(
+                Modifier
+                    .shadow(4.dp, RoundedCornerShape(6.dp))
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color(0xFF111114))
+                    .border(1.dp, ToolbarBorder, RoundedCornerShape(6.dp))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(description, color = Color.White, fontSize = 11.sp)
+            }
+        }
+    ) {
+        IconButton(onClick = onClick, modifier = Modifier.size(34.dp)) {
+            Icon(icon, contentDescription = description, tint = IconTint, modifier = Modifier.size(18.dp))
+        }
+    }
+}

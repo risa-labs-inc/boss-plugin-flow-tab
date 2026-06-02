@@ -1,0 +1,220 @@
+{
+  "nodes": [
+    {
+      "id": "b1",
+      "type": "TRIGGER",
+      "title": "Start",
+      "x": 80.0,
+      "y": 120.0,
+      "config": {}
+    },
+    {
+      "id": "b2",
+      "type": "OPEN_BROWSER",
+      "title": "Open blank page",
+      "x": 360.0,
+      "y": 120.0,
+      "config": {
+        "url": "",
+        "headless": "false"
+      }
+    },
+    {
+      "id": "b3",
+      "type": "INJECT",
+      "title": "Build a form",
+      "x": 640.0,
+      "y": 120.0,
+      "config": {
+        "script": "document.body.innerHTML = '<h1>Flow Demo</h1><input id=\"q\" placeholder=\"query\"><button id=\"go\">Search</button><div id=\"out\">idle</div><a href=\"https://risa.dev\">link one</a> <a href=\"https://example.org\">link two</a>';document.getElementById('go').onclick = function(){document.getElementById('out').innerText = 'You searched: ' + document.getElementById('q').value;};true"
+      }
+    },
+    {
+      "id": "b4",
+      "type": "TYPE",
+      "title": "Type query",
+      "x": 920.0,
+      "y": 120.0,
+      "config": {
+        "selectorType": "css",
+        "selector": "#q",
+        "text": "flow nodes"
+      }
+    },
+    {
+      "id": "b5",
+      "type": "CLICK",
+      "title": "Click Search",
+      "x": 1200.0,
+      "y": 120.0,
+      "config": {
+        "selectorType": "css",
+        "selector": "#go"
+      }
+    },
+    {
+      "id": "b6",
+      "type": "EXTRACT",
+      "title": "Extract result",
+      "x": 1480.0,
+      "y": 120.0,
+      "config": {
+        "selectorType": "css",
+        "selector": "#out",
+        "mode": "text",
+        "attr": "",
+        "field": "result",
+        "multiple": "false"
+      }
+    },
+    {
+      "id": "b7",
+      "type": "EXTRACT",
+      "title": "Extract links",
+      "x": 1480.0,
+      "y": 320.0,
+      "config": {
+        "selectorType": "css",
+        "selector": "a",
+        "mode": "attr",
+        "attr": "href",
+        "field": "link",
+        "multiple": "true"
+      }
+    },
+    {
+      "id": "h1",
+      "type": "HTTP",
+      "title": "GitHub repo API",
+      "x": 80.0,
+      "y": 520.0,
+      "config": {
+        "method": "GET",
+        "url": "https://api.github.com/repos/risa-labs-inc/boss-plugins",
+        "headers": "{\"Accept\": \"application/vnd.github+json\"}",
+        "body": ""
+      }
+    },
+    {
+      "id": "h2",
+      "type": "SET",
+      "title": "Pick fields",
+      "x": 360.0,
+      "y": 520.0,
+      "config": {
+        "assignments": "{\"repo\": \"{{ $json.body.name }}\", \"stars\": \"{{ $json.body.stargazers_count }}\"}"
+      }
+    },
+    {
+      "id": "h3",
+      "type": "IF",
+      "title": "Branch (placeholder)",
+      "x": 640.0,
+      "y": 520.0,
+      "config": {}
+    },
+    {
+      "id": "h4",
+      "type": "MERGE",
+      "title": "Merge (placeholder)",
+      "x": 920.0,
+      "y": 520.0,
+      "config": {}
+    },
+    {
+      "id": "h5",
+      "type": "CODE",
+      "title": "Code (placeholder)",
+      "x": 360.0,
+      "y": 700.0,
+      "config": {}
+    }
+  ],
+  "edges": [
+    {
+      "id": "be1",
+      "fromNode": "b1",
+      "fromPort": 0,
+      "toNode": "b2",
+      "toPort": 0
+    },
+    {
+      "id": "be2",
+      "fromNode": "b2",
+      "fromPort": 0,
+      "toNode": "b3",
+      "toPort": 0
+    },
+    {
+      "id": "be3",
+      "fromNode": "b3",
+      "fromPort": 0,
+      "toNode": "b4",
+      "toPort": 0
+    },
+    {
+      "id": "be4",
+      "fromNode": "b4",
+      "fromPort": 0,
+      "toNode": "b5",
+      "toPort": 0
+    },
+    {
+      "id": "be5",
+      "fromNode": "b5",
+      "fromPort": 0,
+      "toNode": "b6",
+      "toPort": 0
+    },
+    {
+      "id": "be6",
+      "fromNode": "b5",
+      "fromPort": 0,
+      "toNode": "b7",
+      "toPort": 0
+    },
+    {
+      "id": "ce1",
+      "fromNode": "b1",
+      "fromPort": 0,
+      "toNode": "h1",
+      "toPort": 0
+    },
+    {
+      "id": "ce2",
+      "fromNode": "h1",
+      "fromPort": 0,
+      "toNode": "h2",
+      "toPort": 0
+    },
+    {
+      "id": "ce3",
+      "fromNode": "h2",
+      "fromPort": 0,
+      "toNode": "h3",
+      "toPort": 0
+    },
+    {
+      "id": "ce4",
+      "fromNode": "h3",
+      "fromPort": 0,
+      "toNode": "h4",
+      "toPort": 0
+    },
+    {
+      "id": "ce5",
+      "fromNode": "h3",
+      "fromPort": 1,
+      "toNode": "h4",
+      "toPort": 1
+    },
+    {
+      "id": "ce6",
+      "fromNode": "h2",
+      "fromPort": 0,
+      "toNode": "h5",
+      "toPort": 0
+    }
+  ],
+  "nextId": 200
+}
