@@ -87,7 +87,7 @@ class RunContext(val context: PluginContext) {
             return null
         }
         val tabId = try {
-            withContext(Dispatchers.Main) { tabs.createBrowserTabInRightSplit("about:blank", "Flow Browser") }
+            withContext(Dispatchers.Main) { tabs.createBrowserTabInRightSplit("about:blank", "Browser") }
         } catch (e: Exception) {
             log("Right-split open threw: ${e.message ?: e.toString()}")
             null
