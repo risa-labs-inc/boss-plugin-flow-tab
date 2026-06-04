@@ -51,6 +51,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.snapshots.Snapshot
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -168,15 +169,16 @@ class FlowTabComponent(
             }
         }
 
-        // While a run is in progress, force snapshot apply-notifications on a tick.
-        // Node status is written from the background run thread; if the visible
-        // browser view is contending for the UI thread those cross-thread writes
-        // aren't flushed/recomposed until it settles (you'd only see results after
-        // closing the browser tab). Pushing notifications here makes the canvas
-        // reflect each node's status live during the run.
+        // While a run is in progress, drive frames continuously so the canvas keeps
+        // repainting live. Compose Desktop renders on demand; with a heavyweight
+        // browser view present in the split, the canvas's in-place recompositions
+        // aren't flushed to a frame until something forces one (e.g. switching tabs),
+        // so node status appeared to "stick" until then. Requesting a frame each loop
+        // (as an animation would) keeps rendering, and sendApplyNotifications delivers
+        // the background-thread status writes into that frame.
         LaunchedEffect(state.isRunning) {
             while (state.isRunning) {
-                delay(80)
+                withFrameNanos { }
                 Snapshot.sendApplyNotifications()
             }
         }
