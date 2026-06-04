@@ -130,8 +130,8 @@ class FlowTabComponent(
     // "Headless" run-level override: force every Open Browser node headless (no
     // visible window) for this run, regardless of its per-node config.
     private var headless by mutableStateOf(false)
-    // The visible browser tab opened by a prior run, reused on rerun so it stays
-    // visible instead of stacking a new split (and falling back to headless).
+    // The visible browser tab this flow opened; closed at the start of the next run
+    // so each Run opens a fresh tab (no stale reuse, no stacked splits).
     private var visibleTabId: String? = null
 
     init {
@@ -218,6 +218,11 @@ class FlowTabComponent(
         // so an in-flight run survives the split-induced composition recreation)
         fun startRun() {
             if (state.isRunning) return
+            // Fresh start: close the browser tab a prior run opened (no-op if the user
+            // already closed it) and clear tracking, so this run opens a new visible
+            // tab rather than reusing a stale/closed one or stacking splits.
+            visibleTabId?.let { id -> runCatching { context.activeTabsProvider?.closeTab(id) } }
+            visibleTabId = null
             state.clearRun()
             state.notice = null
             state.isRunning = true
@@ -234,7 +239,6 @@ class FlowTabComponent(
                         plan, edges,
                         humanize = realistic,
                         forceHeadless = headless,
-                        preferredVisibleTabId = visibleTabId,
                         onVisibleTab = { id -> visibleTabId = id },
                     ) { id, run -> state.runStates[id] = run }
                 } catch (ce: CancellationException) {

@@ -46,7 +46,6 @@ class FlowExecutor(private val context: PluginContext) {
         edges: List<EdgeModel>,
         humanize: Boolean = false,
         forceHeadless: Boolean = false,
-        preferredVisibleTabId: String? = null,
         onVisibleTab: (String?) -> Unit = {},
         onStatus: (nodeId: String, NodeRun) -> Unit
     ) {
@@ -62,7 +61,6 @@ class FlowExecutor(private val context: PluginContext) {
         val ctx = RunContext(
             context,
             forceHeadless = forceHeadless,
-            preferredVisibleTabId = preferredVisibleTabId,
             onVisibleTab = onVisibleTab,
         )
 
