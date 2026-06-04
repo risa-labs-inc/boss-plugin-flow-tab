@@ -50,6 +50,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -164,6 +165,19 @@ class FlowTabComponent(
                 runCatching {
                     storage.putJson(storageKey, json.encodeToString(GraphSnapshot.serializer(), snapshot))
                 }
+            }
+        }
+
+        // While a run is in progress, force snapshot apply-notifications on a tick.
+        // Node status is written from the background run thread; if the visible
+        // browser view is contending for the UI thread those cross-thread writes
+        // aren't flushed/recomposed until it settles (you'd only see results after
+        // closing the browser tab). Pushing notifications here makes the canvas
+        // reflect each node's status live during the run.
+        LaunchedEffect(state.isRunning) {
+            while (state.isRunning) {
+                delay(80)
+                Snapshot.sendApplyNotifications()
             }
         }
 
