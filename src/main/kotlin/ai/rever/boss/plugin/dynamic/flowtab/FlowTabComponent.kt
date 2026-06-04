@@ -183,7 +183,12 @@ class FlowTabComponent(
             val edges = state.edges.toList()
             runJob = coroutineScope.launch(Dispatchers.Default) {
                 try {
-                    executor.run(plan, edges) { id, run -> state.runStates[id] = run }
+                    // The run executes off the UI thread; marshal each per-node status
+                    // update onto the Main scope so the canvas recomposes in real time
+                    // as nodes start/finish (writes stay ordered: the Main queue is FIFO).
+                    executor.run(plan, edges) { id, run ->
+                        coroutineScope.launch { state.runStates[id] = run }
+                    }
                 } catch (ce: CancellationException) {
                     // stopped by user
                 } catch (e: Exception) {
