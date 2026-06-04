@@ -23,6 +23,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.Icon
 import androidx.compose.material.Text
@@ -54,7 +55,6 @@ private val PanelBorder = FlowTheme.Border
 private val FieldBg = FlowTheme.Canvas
 private val Muted = FlowTheme.TextFaint
 private val prettyJson = Json { prettyPrint = true; isLenient = true }
-private val compactJson = Json { isLenient = true }
 
 /** Replace one config field on [node], preserving the rest. */
 private fun setConfig(node: FlowNode, key: String, value: String) {
@@ -70,7 +70,9 @@ private fun configValue(node: FlowNode, field: ConfigField): String =
  */
 @Composable
 fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Modifier) {
-    var tab by remember(node.id) { mutableStateOf(0) } // 0 params, 1 json, 2 output
+    // Default to the Output tab once a node has run, so its extracted data (or error)
+    // is the first thing shown; otherwise start on Parameters.
+    var tab by remember(node.id) { mutableStateOf(if (state.runStates[node.id] != null) 2 else 0) } // 0 params, 1 json, 2 output
     val accent = Color(node.type.accent)
 
     Column(
@@ -207,7 +209,9 @@ private fun OutputTab(state: FlowGraphState, node: FlowNode) {
             }.getOrDefault("[]")
         }
         Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(FlowTheme.rSm)).background(FieldBg).padding(8.dp)) {
-            Text(rendered, color = FlowTheme.TextPrimary, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            SelectionContainer {
+                Text(rendered, color = FlowTheme.TextPrimary, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            }
         }
     }
 }
@@ -255,28 +259,6 @@ private fun StatusBanner(run: NodeRun?) {
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 4.dp)
             )
-        }
-        // On success, preview the extracted data inline (full data is in the Output tab).
-        if (status == RunStatus.SUCCESS && run != null && run.output.isNotEmpty()) {
-            val preview = remember(run) {
-                runCatching {
-                    compactJson.encodeToString(
-                        kotlinx.serialization.builtins.ListSerializer(JsonObject.serializer()),
-                        run.output.map { it.json }
-                    )
-                }.getOrDefault("")
-            }
-            if (preview.isNotBlank()) {
-                Text(
-                    if (preview.length > 240) preview.take(240) + "…" else preview,
-                    color = FlowTheme.TextMuted,
-                    fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace,
-                    maxLines = 4,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.padding(top = 4.dp)
-                )
-            }
         }
     }
 }

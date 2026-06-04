@@ -45,6 +45,7 @@ class FlowExecutor(private val context: PluginContext) {
         nodes: List<PlanNode>,
         edges: List<EdgeModel>,
         humanize: Boolean = false,
+        forceHeadless: Boolean = false,
         onStatus: (nodeId: String, NodeRun) -> Unit
     ) {
         val byId = nodes.associateBy { it.id }
@@ -56,7 +57,7 @@ class FlowExecutor(private val context: PluginContext) {
         val outputsById = ConcurrentHashMap<String, List<Item>>()
         val failed = ConcurrentHashMap.newKeySet<String>()
         val done = nodes.associate { it.id to CompletableDeferred<Unit>() }
-        val ctx = RunContext(context)
+        val ctx = RunContext(context, forceHeadless = forceHeadless)
 
         try {
             coroutineScope {

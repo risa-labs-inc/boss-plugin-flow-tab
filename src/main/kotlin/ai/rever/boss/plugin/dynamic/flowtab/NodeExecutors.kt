@@ -42,7 +42,12 @@ private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
  * [ai.rever.boss.plugin.browser.BrowserHandle] on a throwaway
  * ([BrowserConfig.ephemeralProfile]) profile.
  */
-class RunContext(val context: PluginContext) {
+class RunContext(
+    val context: PluginContext,
+    /** Run-level override: when true, every Open Browser node runs headless
+     *  regardless of its own `headless` config (toolbar "Headless" toggle). */
+    val forceHeadless: Boolean = false,
+) {
     var session: BrowserIntegration? = null
 
     /** Releases the session on [close] (disposes a headless handle; visible tabs are
@@ -164,7 +169,7 @@ object NodeCatalog {
         NodeType.TRIGGER -> NodeExecutor { _, _, _, _ -> SEED_ITEMS }
 
         NodeType.OPEN_BROWSER -> NodeExecutor { ctx, cfg, inputs, log ->
-            val session = ctx.openSession(cfg.bool("headless"), log)
+            val session = ctx.openSession(cfg.bool("headless") || ctx.forceHeadless, log)
             log(if (session is BrowserHandleIntegration) "Browser session ready (headless)" else "Browser session ready (visible)")
             val url = cfg.str("url")
             if (url.isNotBlank()) { ctx.requireSession().navigate(url); log("Navigated to $url") }

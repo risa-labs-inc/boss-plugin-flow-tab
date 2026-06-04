@@ -105,7 +105,7 @@ class FlowGraphState {
      */
     fun importChain(steps: List<ImportStep>, origin: Offset) {
         if (steps.isEmpty()) return
-        val stepX = nodeOuterWidth() + 70f
+        val stepX = nodeOuterWidth() + 120f
         var prevId: String? = null
         var firstId: String? = null
         steps.forEachIndexed { i, step ->

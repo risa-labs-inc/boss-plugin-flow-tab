@@ -24,23 +24,20 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.DropdownMenu
-import androidx.compose.material.DropdownMenuItem
 import androidx.compose.material.Icon
 import androidx.compose.material.IconButton
 import androidx.compose.material.Text
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AccountTree
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DeleteOutline
-import androidx.compose.material.icons.filled.FiberManualRecord
-import androidx.compose.material.icons.filled.FileDownload
-import androidx.compose.material.icons.filled.FileUpload
+import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.FitScreen
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RestartAlt
+import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.ZoomOut
 import androidx.compose.runtime.Composable
@@ -84,6 +81,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
 import kotlin.math.roundToInt
 
 private val ToolbarBg = Color(0xFF202024)
@@ -193,6 +191,9 @@ class FlowTabComponent(
         // "Realistic" mode: pace the run with human-like delays between steps, so
         // it's watchable and mimics a person driving the page.
         var realistic by remember { mutableStateOf(false) }
+        // "Headless" run-level override: force every Open Browser node headless
+        // (no visible window) for this run, regardless of its per-node config.
+        var headless by remember { mutableStateOf(false) }
 
         fun startRun() {
             if (state.isRunning) return
@@ -208,7 +209,7 @@ class FlowTabComponent(
                     // and the canvas updates live. (Marshalling them onto the Main scope
                     // instead queued them behind the browser's own Main-thread work, so
                     // they only landed once the browser tab was closed.)
-                    executor.run(plan, edges, humanize = realistic) { id, run -> state.runStates[id] = run }
+                    executor.run(plan, edges, humanize = realistic, forceHeadless = headless) { id, run -> state.runStates[id] = run }
                 } catch (ce: CancellationException) {
                     // stopped by user
                 } catch (e: Exception) {
@@ -270,20 +271,6 @@ class FlowTabComponent(
             }
         }
 
-        fun importFlow() {
-            val onText: (String) -> Unit = { text ->
-                openImportedInNewTab(text, "Imported Flow", "Opened the imported flow in a new tab")
-            }
-            val picker = context.filePickerProvider
-            if (picker != null) {
-                picker.pickFile(title = "Import flow", filters = listOf("json")) { path ->
-                    if (path != null) runCatching { java.io.File(path).readText() }.getOrNull()?.let(onText)
-                }
-            } else {
-                context.clipboardProvider?.readText()?.let(onText)
-            }
-        }
-
         fun doClear() {
             state.nodes.clear()
             state.edges.clear()
@@ -306,14 +293,25 @@ class FlowTabComponent(
             openImportedInNewTab(snapshotJson, "Imported RPA", "Imported ${result.steps.size} node(s) in a new tab$skipped")
         }
 
-        fun importRpaRecording() {
+        // Smart import: detect whether the file is an exported flow (a GraphSnapshot —
+        // it has a "nodes" array) or an RPA recording, and route accordingly. One
+        // Import button, no format picker for the user to pick wrong.
+        fun importAny(text: String) {
+            val isFlow = runCatching {
+                (json.parseToJsonElement(text) as? JsonObject)?.containsKey("nodes") == true
+            }.getOrDefault(false)
+            if (isFlow) openImportedInNewTab(text, "Imported Flow", "Opened the imported flow in a new tab")
+            else applyRecording(text)
+        }
+
+        fun importFlow() {
             val picker = context.filePickerProvider
             if (picker != null) {
-                picker.pickFile(title = "Import RPA recording", filters = listOf("json")) { path ->
-                    if (path != null) runCatching { java.io.File(path).readText() }.getOrNull()?.let(::applyRecording)
+                picker.pickFile(title = "Import flow or recording", filters = listOf("json")) { path ->
+                    if (path != null) runCatching { java.io.File(path).readText() }.getOrNull()?.let(::importAny)
                 }
             } else {
-                context.clipboardProvider?.readText()?.let(::applyRecording)
+                context.clipboardProvider?.readText()?.let(::importAny)
             }
         }
 
@@ -326,6 +324,8 @@ class FlowTabComponent(
                 isRunning = state.isRunning,
                 realistic = realistic,
                 onToggleRealistic = { realistic = !realistic },
+                headless = headless,
+                onToggleHeadless = { headless = !headless },
                 onRun = { startRun() },
                 onStop = { stopRun() },
                 onNewFlow = {
@@ -339,8 +339,7 @@ class FlowTabComponent(
                 onReset = { state.resetView() },
                 onClear = { confirmClear = true },
                 onExport = { exportFlow() },
-                onImport = { importFlow() },
-                onImportRpa = { importRpaRecording() }
+                onImport = { importFlow() }
             )
 
             // One status bar at a time, prioritized: clear-confirm > run error > notice.
@@ -428,6 +427,8 @@ private fun Toolbar(
     isRunning: Boolean,
     realistic: Boolean,
     onToggleRealistic: () -> Unit,
+    headless: Boolean,
+    onToggleHeadless: () -> Unit,
     onRun: () -> Unit,
     onStop: () -> Unit,
     onNewFlow: () -> Unit,
@@ -437,13 +438,12 @@ private fun Toolbar(
     onReset: () -> Unit,
     onClear: () -> Unit,
     onExport: () -> Unit,
-    onImport: () -> Unit,
-    onImportRpa: () -> Unit
+    onImport: () -> Unit
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(44.dp)
+            .height(38.dp)
             .background(ToolbarBg)
             .border(width = 1.dp, color = ToolbarBorder)
             .padding(horizontal = 10.dp),
@@ -465,14 +465,14 @@ private fun Toolbar(
                 .clip(RoundedCornerShape(7.dp))
                 .background(if (isRunning) FlowTheme.Error else RunGreen)
                 .clickable(onClick = if (isRunning) onStop else onRun)
-                .padding(horizontal = 10.dp, vertical = 5.dp),
+                .padding(horizontal = 9.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
                 if (isRunning) Icons.Filled.Stop else Icons.Filled.PlayArrow,
                 contentDescription = if (isRunning) "Stop" else "Run",
                 tint = Color.White,
-                modifier = Modifier.size(15.dp)
+                modifier = Modifier.size(13.dp)
             )
             Spacer(Modifier.width(4.dp))
             Text(if (isRunning) "Stop" else "Run", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
@@ -486,14 +486,14 @@ private fun Toolbar(
                 .background(if (realistic) FlowTheme.Primary.copy(alpha = 0.22f) else Color.Transparent)
                 .border(1.dp, if (realistic) FlowTheme.Primary else ToolbarBorder, RoundedCornerShape(7.dp))
                 .clickable(onClick = onToggleRealistic)
-                .padding(horizontal = 10.dp, vertical = 5.dp),
+                .padding(horizontal = 9.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
                 Icons.Filled.Schedule,
                 contentDescription = "Realistic run (human-like delays between steps)",
                 tint = if (realistic) FlowTheme.PrimaryTint else IconTint,
-                modifier = Modifier.size(14.dp)
+                modifier = Modifier.size(13.dp)
             )
             Spacer(Modifier.width(4.dp))
             Text(
@@ -505,15 +505,41 @@ private fun Toolbar(
         }
 
         Spacer(Modifier.width(8.dp))
+        // Headless run-level toggle: force all browser nodes headless this run.
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(7.dp))
+                .background(if (headless) FlowTheme.Primary.copy(alpha = 0.22f) else Color.Transparent)
+                .border(1.dp, if (headless) FlowTheme.Primary else ToolbarBorder, RoundedCornerShape(7.dp))
+                .clickable(onClick = onToggleHeadless)
+                .padding(horizontal = 9.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Filled.VisibilityOff,
+                contentDescription = "Headless (force all browser nodes to run with no visible window)",
+                tint = if (headless) FlowTheme.PrimaryTint else IconTint,
+                modifier = Modifier.size(13.dp)
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                "Headless",
+                color = if (headless) FlowTheme.PrimaryTint else IconTint,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
+        }
+
+        Spacer(Modifier.width(8.dp))
         Row(
             modifier = Modifier
                 .clip(RoundedCornerShape(7.dp))
                 .background(FlowTheme.Primary)
                 .clickable(onClick = onNewFlow)
-                .padding(horizontal = 10.dp, vertical = 5.dp),
+                .padding(horizontal = 9.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Icon(Icons.Filled.Add, contentDescription = null, tint = Color.White, modifier = Modifier.size(14.dp))
+            Icon(Icons.Filled.Add, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.dp))
             Spacer(Modifier.width(4.dp))
             Text("New Flow", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
         }
@@ -531,29 +557,8 @@ private fun Toolbar(
         ToolbarButton(Icons.Filled.FitScreen, "Fit to content", onFit)
         ToolbarButton(Icons.Filled.RestartAlt, "Reset view", onReset)
         ToolbarButton(Icons.Filled.DeleteOutline, "Clear canvas", onClear)
-        ToolbarButton(Icons.Filled.FileDownload, "Export workflow", onExport)
-        ImportMenu(onImport, onImportRpa)
-    }
-}
-
-/** Import button with a dropdown: workflow JSON or an RPA-recorder config. */
-@Composable
-private fun ImportMenu(onImport: () -> Unit, onImportRpa: () -> Unit) {
-    var open by remember { mutableStateOf(false) }
-    Box {
-        ToolbarButton(Icons.Filled.FileUpload, "Import…") { open = true }
-        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            DropdownMenuItem(onClick = { open = false; onImport() }) {
-                Icon(Icons.Filled.AccountTree, null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Import workflow (.json)", fontSize = 13.sp)
-            }
-            DropdownMenuItem(onClick = { open = false; onImportRpa() }) {
-                Icon(Icons.Filled.FiberManualRecord, null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Import RPA recording", fontSize = 13.sp)
-            }
-        }
+        ToolbarButton(Icons.Filled.SaveAlt, "Export workflow", onExport)
+        ToolbarButton(Icons.Filled.FileOpen, "Import flow or recording", onImport)
     }
 }
 
