@@ -1,9 +1,8 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.PluginContext
-import ai.rever.boss.plugin.api.RpaBrowserSession
-import ai.rever.boss.plugin.api.RpaBrowserSpec
-import ai.rever.boss.plugin.api.RpaProfileChoice
+import ai.rever.boss.plugin.browser.BrowserConfig
+import ai.rever.boss.plugin.browser.BrowserHandle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
@@ -29,9 +28,16 @@ class ExecError(message: String) : Exception(message)
 
 private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 
-/** Runtime resources shared across a single run. Owns the browser session. */
+/**
+ * Runtime resources shared across a single run. Owns the browser session.
+ *
+ * The session is a [BrowserHandle] from the host's central [browser service]
+ * [ai.rever.boss.plugin.browser.BrowserService], created on a throwaway
+ * ([BrowserConfig.ephemeralProfile]) isolated profile that the host deletes on
+ * dispose. Nodes drive it via [BrowserHandle.loadUrlAndWait] / [executeJavaScript].
+ */
 class RunContext(val context: PluginContext) {
-    var session: RpaBrowserSession? = null
+    var session: BrowserHandle? = null
 
     /** Serializes browser-session access across parallel branches (the "fence"). */
     val sessionMutex = Mutex()
@@ -39,22 +45,28 @@ class RunContext(val context: PluginContext) {
     /** Node outputs keyed by node title, for `$node["Title"]` expressions. Thread-safe. */
     val outputsByTitle = ConcurrentHashMap<String, List<Item>>()
 
-    suspend fun openSession(headless: Boolean): RpaBrowserSession {
-        val provider = context.rpaBrowserProvider
-            ?: throw ExecError("Browser is unavailable in this build (no rpaBrowserProvider)")
-        val s = provider.openSession(
-            RpaBrowserSpec(profile = RpaProfileChoice.Ephemeral, auth = null, headless = headless)
-        ) ?: throw ExecError("Failed to open a browser session")
-        session = s
-        return s
+    /**
+     * Open the run's browser session. [headless] is accepted for node-config
+     * stability; the session is always an offscreen engine browser (driving a
+     * *visible* tab needs host tab machinery this plugin doesn't reach).
+     */
+    suspend fun openSession(headless: Boolean): BrowserHandle {
+        val service = context.browserService
+            ?: throw ExecError("Browser is unavailable in this build (no browserService)")
+        if (!service.isAvailable()) throw ExecError("Browser engine is not available")
+        val handle = service.createBrowser(BrowserConfig(ephemeralProfile = true))
+            ?: throw ExecError("Failed to open a browser session")
+        session = handle
+        return handle
     }
 
-    fun requireSession(): RpaBrowserSession =
+    fun requireSession(): BrowserHandle =
         session ?: throw ExecError("No browser session — add an 'Open Browser' node upstream")
 
     suspend fun close() {
-        runCatching { session?.close() }
+        val handle = session
         session = null
+        if (handle != null) runCatching { context.browserService?.disposeBrowser(handle) }
     }
 }
 
@@ -91,18 +103,17 @@ object NodeCatalog {
         NodeType.TRIGGER -> NodeExecutor { _, _, _, _ -> SEED_ITEMS }
 
         NodeType.OPEN_BROWSER -> NodeExecutor { ctx, cfg, inputs, log ->
-            val headless = cfg.bool("headless")
-            ctx.openSession(headless)
-            log(if (headless) "Opened headless browser session" else "Opened visible browser session")
+            ctx.openSession(cfg.bool("headless"))
+            log("Opened browser session")
             val url = cfg.str("url")
-            if (url.isNotBlank()) { ctx.requireSession().navigate(url); log("Navigated to $url") }
+            if (url.isNotBlank()) { ctx.requireSession().loadUrlAndWait(url); log("Navigated to $url") }
             inputs.ifEmpty { SEED_ITEMS }
         }
 
         NodeType.NAVIGATE -> NodeExecutor { ctx, cfg, inputs, log ->
             val url = cfg.str("url")
             if (url.isBlank()) throw ExecError("Navigate needs a URL")
-            ctx.requireSession().navigate(url)
+            ctx.requireSession().loadUrlAndWait(url)
             log("Navigated to $url")
             inputs.ifEmpty { SEED_ITEMS }
         }

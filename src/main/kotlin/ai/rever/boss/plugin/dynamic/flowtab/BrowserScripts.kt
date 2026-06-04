@@ -1,7 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 /**
- * JavaScript builders for browser actions, run via [RpaBrowserSession.executeJavaScript].
+ * JavaScript builders for browser actions, run via [ai.rever.boss.plugin.browser.BrowserHandle.executeJavaScript].
  *
  * NOTE: the eng review's plan was to promote these from rpaengine into the shared
  * `boss-plugin-api`. That package is parent-first / host-provided (like the

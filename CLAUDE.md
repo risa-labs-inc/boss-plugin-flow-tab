@@ -9,7 +9,7 @@ self-contained Compose UI with a pan/zoom canvas, draggable nodes, and bezier ed
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.flowtab`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.flowtab.FlowTabDynamicPlugin`
-- **API Version**: 1.0.27
+- **API Version**: 1.0.41
 
 ## Essential Commands
 

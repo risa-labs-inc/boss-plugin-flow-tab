@@ -35,7 +35,7 @@ repositories {
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.27.jar"))
+        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.41.jar"))
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
@@ -63,9 +63,9 @@ dependencies {
     testImplementation(kotlin("test-junit5"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     // The boss-plugin-api is compileOnly for main (host-provided); tests need it
-    // on the classpath to build a fake PluginContext / RpaBrowserProvider.
+    // on the classpath to build a fake PluginContext / BrowserService / BrowserHandle.
     if (useLocalDependencies) {
-        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.27.jar"))
+        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.41.jar"))
     } else {
         testImplementation(files("build/downloaded-deps/boss-plugin-api.jar"))
     }

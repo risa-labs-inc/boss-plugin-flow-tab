@@ -2,12 +2,12 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.PanelRegistry
 import ai.rever.boss.plugin.api.PluginContext
-import ai.rever.boss.plugin.api.RpaAuthSpec
-import ai.rever.boss.plugin.api.RpaBrowserProvider
-import ai.rever.boss.plugin.api.RpaBrowserSession
-import ai.rever.boss.plugin.api.RpaBrowserSpec
-import ai.rever.boss.plugin.api.RpaProfileInfo
 import ai.rever.boss.plugin.api.TabRegistry
+import ai.rever.boss.plugin.browser.BrowserConfig
+import ai.rever.boss.plugin.browser.BrowserHandle
+import ai.rever.boss.plugin.browser.BrowserService
+import ai.rever.boss.plugin.browser.ContextMenuCallback
+import androidx.compose.runtime.Composable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -27,24 +27,27 @@ import kotlin.test.assertTrue
 
 // ---- fakes -----------------------------------------------------------------
 
-/** A fake browser session that records calls and (optionally) overlaps detection. */
-private class FakeSession(
+/**
+ * A fake [BrowserHandle] that records the calls the executors actually make
+ * (loadUrlAndWait / executeJavaScript) and detects overlap. The rest of the
+ * (large) BrowserHandle surface is stubbed — the executors never touch it.
+ */
+private class FakeHandle(
     private val responder: (String) -> Any? = { true },
     private val delayMs: Long = 0
-) : RpaBrowserSession {
-    override val profileId = "fake"
+) : BrowserHandle {
     val navigated = mutableListOf<String>()
     val jsCalls = mutableListOf<String>()
     private val concurrency = AtomicInteger(0)
     val maxConcurrency = AtomicInteger(0)
 
-    override suspend fun navigate(url: String) = bracket { navigated.add(url) }
+    override suspend fun loadUrl(url: String) = bracket { navigated.add(url) }
+    override suspend fun loadUrlAndWait(url: String) = bracket { navigated.add(url) }
     override suspend fun executeJavaScript(script: String): Any? {
         var result: Any? = null
         bracket { jsCalls.add(script); result = responder(script) }
         return result
     }
-    override suspend fun close() {}
 
     private suspend fun bracket(body: () -> Unit) {
         val c = concurrency.incrementAndGet()
@@ -56,21 +59,62 @@ private class FakeSession(
             concurrency.decrementAndGet()
         }
     }
+
+    // --- unused BrowserHandle surface (no-op stubs) ---
+    override val id = "fake"
+    override val isValid = true
+    override fun getCurrentUrl() = ""
+    override fun getTitle() = ""
+    override fun addNavigationListener(listener: (String) -> Unit) {}
+    override fun removeNavigationListener(listener: (String) -> Unit) {}
+    override fun addTitleListener(listener: (String) -> Unit) {}
+    override fun removeTitleListener(listener: (String) -> Unit) {}
+    override fun addFaviconListener(listener: (String?) -> Unit) {}
+    override fun removeFaviconListener(listener: (String?) -> Unit) {}
+    override fun goBack() {}
+    override fun goForward() {}
+    override fun reload() {}
+    override fun stop() {}
+    override fun canGoBack() = false
+    override fun canGoForward() = false
+    override fun getZoomLevel() = 1.0
+    override fun setZoomLevel(level: Double) {}
+    override fun zoomIn() {}
+    override fun zoomOut() {}
+    override fun resetZoom() {}
+    override fun addZoomListener(listener: (Double) -> Unit) {}
+    override fun removeZoomListener(listener: (Double) -> Unit) {}
+    override fun isLoading() = false
+    override fun addLoadingListener(listener: (Boolean) -> Unit) {}
+    override fun removeLoadingListener(listener: (Boolean) -> Unit) {}
+    override fun isSecure() = false
+    override fun setContextMenuCallback(callback: ContextMenuCallback?) {}
+    override suspend fun fillCredentials(username: String, password: String, fillBoth: Boolean) = true
+    override fun copySelection() {}
+    override fun paste() {}
+    override fun cut() {}
+    override fun selectAll() {}
+    override fun setOpenInNewTabCallback(callback: (String) -> Unit) {}
+    override fun requestPictureInPicture() {}
+    override fun setFullscreenHandler(tabId: String, onEnterFullscreen: () -> Unit, onExitFullscreen: () -> Unit) {}
+    override fun requestExitFullscreen() {}
+    override fun showDevTools() {}
+    @Composable override fun Content() {}
+    override fun dispose() {}
 }
 
-private class FakeProvider(val session: FakeSession) : RpaBrowserProvider {
-    override suspend fun openSession(spec: RpaBrowserSpec): RpaBrowserSession = session
-    override suspend fun seedNamedProfile(profileId: String, auth: RpaAuthSpec?) =
-        RpaProfileInfo(profileId, 0, 0, false)
-    override fun deleteProfile(profileId: String) = true
-    override fun listProfiles() = emptyList<RpaProfileInfo>()
+private class FakeService(private val handle: FakeHandle) : BrowserService {
+    override fun isAvailable() = true
+    override suspend fun createBrowser(config: BrowserConfig): BrowserHandle = handle
+    override suspend fun disposeBrowser(handle: BrowserHandle) {}
+    override fun getActiveBrowserCount() = 1
 }
 
-private class FakeContext(private val provider: RpaBrowserProvider?) : PluginContext {
+private class FakeContext(private val service: BrowserService?) : PluginContext {
     override val panelRegistry = PanelRegistry()
     override val tabRegistry = TabRegistry()
     override val pluginScope = CoroutineScope(Dispatchers.Default)
-    override val rpaBrowserProvider: RpaBrowserProvider? get() = provider
+    override val browserService: BrowserService? get() = service
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -84,11 +128,11 @@ private fun e(from: String, to: String, fp: Int = 0, tp: Int = 0) =
 private fun runGraph(
     nodes: List<PlanNode>,
     edges: List<EdgeModel>,
-    provider: RpaBrowserProvider? = null
+    service: BrowserService? = null
 ): Map<String, NodeRun> {
     val states = ConcurrentHashMap<String, NodeRun>()
     runBlocking(Dispatchers.Default) {
-        FlowExecutor(FakeContext(provider)).run(nodes, edges) { id, r -> states[id] = r }
+        FlowExecutor(FakeContext(service)).run(nodes, edges) { id, r -> states[id] = r }
     }
     return states
 }
@@ -122,7 +166,7 @@ class FlowExecutorTest {
 
     @Test
     fun `per-item run mode runs once per input item`() {
-        val session = FakeSession(responder = { """{"ok":true,"value":["a","b","c"]}""" })
+        val handle = FakeHandle(responder = { """{"ok":true,"value":["a","b","c"]}""" })
         val nodes = listOf(
             n("t", NodeType.TRIGGER),
             n("open", NodeType.OPEN_BROWSER),
@@ -130,7 +174,7 @@ class FlowExecutorTest {
             n("set", NodeType.SET, "assignments" to """{"seen":"yes"}""")
         )
         val edges = listOf(e("t", "open"), e("open", "ex"), e("ex", "set"))
-        val states = runGraph(nodes, edges, FakeProvider(session))
+        val states = runGraph(nodes, edges, FakeService(handle))
 
         assertEquals(3, states["ex"]?.output?.size) // one item per matched element
         assertEquals(3, states["set"]?.output?.size) // SET ran once per item
@@ -139,7 +183,7 @@ class FlowExecutorTest {
 
     @Test
     fun `failure skips downstream but independent branch still runs`() {
-        val session = FakeSession(responder = { script ->
+        val handle = FakeHandle(responder = { script ->
             if (script.contains("JSON.stringify")) """{"ok":false,"error":"boom"}""" else true
         })
         val nodes = listOf(
@@ -150,7 +194,7 @@ class FlowExecutorTest {
             n("indep", NodeType.SET, "assignments" to """{"y":"2"}""")  // independent branch
         )
         val edges = listOf(e("t", "open"), e("open", "ex"), e("ex", "after"), e("t", "indep"))
-        val states = runGraph(nodes, edges, FakeProvider(session))
+        val states = runGraph(nodes, edges, FakeService(handle))
 
         assertEquals(RunStatus.ERROR, states["ex"]?.status)
         assertNull(states["after"]?.status) // skipped (never ran)
@@ -159,7 +203,7 @@ class FlowExecutorTest {
 
     @Test
     fun `browser nodes drive the session with the right calls`() {
-        val session = FakeSession(responder = { script ->
+        val handle = FakeHandle(responder = { script ->
             if (script.contains("JSON.stringify")) """{"ok":true,"value":"Hello"}""" else true
         })
         val nodes = listOf(
@@ -170,11 +214,11 @@ class FlowExecutorTest {
             n("ex", NodeType.EXTRACT, "selector" to "h1", "field" to "title")
         )
         val edges = listOf(e("t", "open"), e("open", "nav"), e("nav", "click"), e("click", "ex"))
-        val states = runGraph(nodes, edges, FakeProvider(session))
+        val states = runGraph(nodes, edges, FakeService(handle))
 
-        assertTrue(session.navigated.contains("https://example.com"))   // Open Browser start url
-        assertTrue(session.navigated.contains("https://example.com/x")) // Navigate
-        assertTrue(session.jsCalls.any { it.contains("#go") })          // Click selector in JS
+        assertTrue(handle.navigated.contains("https://example.com"))   // Open Browser start url
+        assertTrue(handle.navigated.contains("https://example.com/x")) // Navigate
+        assertTrue(handle.jsCalls.any { it.contains("#go") })          // Click selector in JS
         assertEquals("Hello", states["ex"]!!.output.single().json.str("title")) // Extract returned data
     }
 
@@ -182,16 +226,16 @@ class FlowExecutorTest {
     fun `session fence serializes parallel browser nodes`() {
         // Two Clicks both depend only on Open Browser, so they are ready together;
         // the session mutex must keep them from overlapping (max concurrency 1).
-        val session = FakeSession(responder = { true }, delayMs = 40)
+        val handle = FakeHandle(responder = { true }, delayMs = 40)
         val nodes = listOf(
             n("open", NodeType.OPEN_BROWSER),
             n("c1", NodeType.CLICK, "selector" to "#a"),
             n("c2", NodeType.CLICK, "selector" to "#b")
         )
         val edges = listOf(e("open", "c1"), e("open", "c2"))
-        runGraph(nodes, edges, FakeProvider(session))
+        runGraph(nodes, edges, FakeService(handle))
 
-        assertEquals(1, session.maxConcurrency.get())
+        assertEquals(1, handle.maxConcurrency.get())
     }
 
     @Test
