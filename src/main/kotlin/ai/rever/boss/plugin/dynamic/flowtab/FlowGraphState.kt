@@ -8,6 +8,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -99,6 +100,25 @@ class FlowGraphState {
      * forced a frame. The canvas reads this, so each bump guarantees a fresh frame.
      */
     var repaintTick by mutableStateOf(0)
+
+    // ---- headless (Open Browser nodes) ----
+    /** True when there's at least one Open Browser node and all of them are headless.
+     *  Drives the toolbar "Headless" toggle so it reflects the actual node config. */
+    val allBrowserHeadless: Boolean
+        get() = nodes.filter { it.type == NodeType.OPEN_BROWSER }
+            .let { browsers ->
+                browsers.isNotEmpty() && browsers.all {
+                    (it.config["headless"] as? JsonPrimitive)?.content == "true"
+                }
+            }
+
+    /** Set `headless` on every Open Browser node, so the toolbar toggle writes the
+     *  real per-node config (and it shows correctly in the inspector + persists). */
+    fun setAllBrowserHeadless(value: Boolean) {
+        nodes.filter { it.type == NodeType.OPEN_BROWSER }.forEach { node ->
+            node.config = JsonObject(node.config + ("headless" to JsonPrimitive(value.toString())))
+        }
+    }
 
     /** Transient neutral status message (e.g. import results). */
     var notice by mutableStateOf<String?>(null)

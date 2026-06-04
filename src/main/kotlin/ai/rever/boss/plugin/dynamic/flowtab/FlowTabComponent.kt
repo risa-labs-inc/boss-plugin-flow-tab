@@ -127,9 +127,6 @@ class FlowTabComponent(
     // "Realistic" mode: pace the run with human-like delays between steps, so it's
     // watchable and mimics a person driving the page. Observed by the toolbar.
     private var realistic by mutableStateOf(false)
-    // "Headless" run-level override: force every Open Browser node headless (no
-    // visible window) for this run, regardless of its per-node config.
-    private var headless by mutableStateOf(false)
     // The visible browser tab this flow opened; closed at the start of the next run
     // so each Run opens a fresh tab (no stale reuse, no stacked splits).
     private var visibleTabId: String? = null
@@ -238,7 +235,6 @@ class FlowTabComponent(
                     executor.run(
                         plan, edges,
                         humanize = realistic,
-                        forceHeadless = headless,
                         onVisibleTab = { id -> visibleTabId = id },
                     ) { id, run -> state.runStates[id] = run }
                 } catch (ce: CancellationException) {
@@ -355,8 +351,8 @@ class FlowTabComponent(
                 isRunning = state.isRunning,
                 realistic = realistic,
                 onToggleRealistic = { realistic = !realistic },
-                headless = headless,
-                onToggleHeadless = { headless = !headless },
+                headless = state.allBrowserHeadless,
+                onToggleHeadless = { state.setAllBrowserHeadless(!state.allBrowserHeadless) },
                 onRun = { startRun() },
                 onStop = { stopRun() },
                 onNewFlow = {

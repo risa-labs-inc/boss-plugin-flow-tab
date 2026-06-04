@@ -385,10 +385,10 @@ private fun DrawScope.drawEdgePath(
         if (len > 0.01f) {
             val ux = dx / len
             val uy = dy / len
-            val size = 9f
+            val size = 13f
             val baseX = end.x - ux * size
             val baseY = end.y - uy * size
-            val half = size * 0.6f
+            val half = size * 0.62f
             val head = Path().apply {
                 moveTo(end.x, end.y)
                 lineTo(baseX - uy * half, baseY + ux * half)

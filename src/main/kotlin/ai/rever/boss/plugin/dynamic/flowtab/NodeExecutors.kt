@@ -73,9 +73,6 @@ private suspend fun BrowserIntegration.awaitElement(
  */
 class RunContext(
     val context: PluginContext,
-    /** Run-level override: when true, every Open Browser node runs headless
-     *  regardless of its own `headless` config (toolbar "Headless" toggle). */
-    val forceHeadless: Boolean = false,
     /** Reports the visible browser tab id this run opened, so the UI can close it
      *  before the next run (each run opens a fresh tab — see startRun). */
     private val onVisibleTab: (String?) -> Unit = {},
@@ -201,7 +198,7 @@ object NodeCatalog {
         NodeType.TRIGGER -> NodeExecutor { _, _, _, _ -> SEED_ITEMS }
 
         NodeType.OPEN_BROWSER -> NodeExecutor { ctx, cfg, inputs, log ->
-            val session = ctx.openSession(cfg.bool("headless") || ctx.forceHeadless, log)
+            val session = ctx.openSession(cfg.bool("headless"), log)
             log(if (session is BrowserHandleIntegration) "Browser session ready (headless)" else "Browser session ready (visible)")
             val url = cfg.str("url")
             if (url.isNotBlank()) { ctx.requireSession().navigate(url); log("Navigated to $url") }

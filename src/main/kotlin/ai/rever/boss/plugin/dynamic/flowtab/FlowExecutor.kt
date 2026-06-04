@@ -45,7 +45,6 @@ class FlowExecutor(private val context: PluginContext) {
         nodes: List<PlanNode>,
         edges: List<EdgeModel>,
         humanize: Boolean = false,
-        forceHeadless: Boolean = false,
         onVisibleTab: (String?) -> Unit = {},
         onStatus: (nodeId: String, NodeRun) -> Unit
     ) {
@@ -60,7 +59,6 @@ class FlowExecutor(private val context: PluginContext) {
         val done = nodes.associate { it.id to CompletableDeferred<Unit>() }
         val ctx = RunContext(
             context,
-            forceHeadless = forceHeadless,
             onVisibleTab = onVisibleTab,
         )
 
