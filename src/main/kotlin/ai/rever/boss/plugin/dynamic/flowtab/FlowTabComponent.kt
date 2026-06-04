@@ -112,6 +112,28 @@ class FlowTabComponent(
     private val json = Json { ignoreUnknownKeys = true; isLenient = true }
     private val storageKey = "graph:${config.id}"
 
+    // Run/graph state lives on the COMPONENT, not in the composition. Opening a
+    // visible browser tab restructures the split tree, which repositions this tab's
+    // composable into a different parent — `key()` doesn't move state across parents,
+    // so Compose disposes and recreates the composition. If `state` were a
+    // `remember`, that recreation would rebuild it empty and an in-flight run's node
+    // status would vanish (it kept writing to the orphaned old instance). On the
+    // component, it survives the recreation. The component itself is reused across
+    // the split (the panel keeps its tab component).
+    private val state = FlowGraphState()
+    private val executor = FlowExecutor(context)
+    private var runJob: Job? = null
+    private var initialized = false
+    // "Realistic" mode: pace the run with human-like delays between steps, so it's
+    // watchable and mimics a person driving the page. Observed by the toolbar.
+    private var realistic by mutableStateOf(false)
+    // "Headless" run-level override: force every Open Browser node headless (no
+    // visible window) for this run, regardless of its per-node config.
+    private var headless by mutableStateOf(false)
+    // The visible browser tab opened by a prior run, reused on rerun so it stays
+    // visible instead of stacking a new split (and falling back to headless).
+    private var visibleTabId: String? = null
+
     init {
         lifecycle.subscribe(
             object : Lifecycle.Callbacks {
@@ -124,41 +146,45 @@ class FlowTabComponent(
 
     @Composable
     override fun Content() {
-        val state = remember { FlowGraphState() }
         var viewportSize by remember { mutableStateOf(Size.Zero) }
-        var loaded by remember { mutableStateOf(false) }
         val focusRequester = remember { FocusRequester() }
 
         val storage = remember {
             context.pluginStorageFactory?.createStorage("ai.rever.boss.plugin.dynamic.flowtab")
         }
 
-        // Load persisted graph (or seed a starter Trigger node) once.
+        // Load persisted graph + last run state ONCE per component (guarded by the
+        // [initialized] field, not a remembered flag). A split rebuilds this
+        // composition; reloading then would clobber an in-flight run's status with
+        // the stale persisted snapshot, so we must not redo it on recreation.
         LaunchedEffect(config.id) {
-            val saved = runCatching { storage?.getJson(storageKey) }.getOrNull()
-            if (!saved.isNullOrBlank()) {
-                runCatching {
-                    state.load(json.decodeFromString(GraphSnapshot.serializer(), saved))
+            if (!initialized) {
+                val saved = runCatching { storage?.getJson(storageKey) }.getOrNull()
+                if (!saved.isNullOrBlank()) {
+                    runCatching {
+                        state.load(json.decodeFromString(GraphSnapshot.serializer(), saved))
+                    }
                 }
-            }
-            if (state.nodes.isEmpty()) {
-                state.addNode(NodeType.TRIGGER, Offset(320f, 200f))
-                state.selection = null
-            }
-            // Restore the last run's per-node status/output, if any.
-            runCatching { storage?.getJson("runstate:${config.id}") }.getOrNull()?.let { rs ->
-                runCatching {
-                    state.runStates.putAll(json.decodeFromString(RunSnapshot.serializer(), rs).toRuns())
+                if (state.nodes.isEmpty()) {
+                    state.addNode(NodeType.TRIGGER, Offset(320f, 200f))
+                    state.selection = null
                 }
+                // Restore the last run's per-node status/output, if any.
+                runCatching { storage?.getJson("runstate:${config.id}") }.getOrNull()?.let { rs ->
+                    runCatching {
+                        state.runStates.putAll(json.decodeFromString(RunSnapshot.serializer(), rs).toRuns())
+                    }
+                }
+                initialized = true
             }
-            loaded = true
             focusRequester.requestFocus()
         }
 
-        // Debounced autosave: collectLatest cancels the pending save when the
-        // graph changes again, so we only write after a quiet period.
-        LaunchedEffect(loaded) {
-            if (!loaded || storage == null) return@LaunchedEffect
+        // Debounced autosave: waits for the one-time load, then writes after a quiet
+        // period (collectLatest cancels a pending save when the graph changes again).
+        LaunchedEffect(config.id) {
+            if (storage == null) return@LaunchedEffect
+            while (!initialized) delay(20)
             snapshotFlow { state.toSnapshot() }.collectLatest { snapshot ->
                 delay(400)
                 runCatching {
@@ -188,19 +214,8 @@ class FlowTabComponent(
         fun viewCenterScreen(): Offset =
             Offset(viewportSize.width / 2f, viewportSize.height / 2f)
 
-        // ---- run wiring ----
-        val executor = remember { FlowExecutor(context) }
-        var runJob by remember { mutableStateOf<Job?>(null) }
-        // "Realistic" mode: pace the run with human-like delays between steps, so
-        // it's watchable and mimics a person driving the page.
-        var realistic by remember { mutableStateOf(false) }
-        // "Headless" run-level override: force every Open Browser node headless
-        // (no visible window) for this run, regardless of its per-node config.
-        var headless by remember { mutableStateOf(false) }
-        // The visible browser tab opened by a prior run, reused on rerun so it stays
-        // visible instead of stacking a new split (and falling back to headless).
-        var visibleTabId by remember { mutableStateOf<String?>(null) }
-
+        // ---- run wiring ---- (state/executor/runJob/toggles are component fields,
+        // so an in-flight run survives the split-induced composition recreation)
         fun startRun() {
             if (state.isRunning) return
             state.clearRun()
