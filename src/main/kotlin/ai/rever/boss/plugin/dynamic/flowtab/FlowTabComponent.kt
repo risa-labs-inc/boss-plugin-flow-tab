@@ -197,6 +197,9 @@ class FlowTabComponent(
         // "Headless" run-level override: force every Open Browser node headless
         // (no visible window) for this run, regardless of its per-node config.
         var headless by remember { mutableStateOf(false) }
+        // The visible browser tab opened by a prior run, reused on rerun so it stays
+        // visible instead of stacking a new split (and falling back to headless).
+        var visibleTabId by remember { mutableStateOf<String?>(null) }
 
         fun startRun() {
             if (state.isRunning) return
@@ -212,7 +215,13 @@ class FlowTabComponent(
                     // and the canvas updates live. (Marshalling them onto the Main scope
                     // instead queued them behind the browser's own Main-thread work, so
                     // they only landed once the browser tab was closed.)
-                    executor.run(plan, edges, humanize = realistic, forceHeadless = headless) { id, run -> state.runStates[id] = run }
+                    executor.run(
+                        plan, edges,
+                        humanize = realistic,
+                        forceHeadless = headless,
+                        preferredVisibleTabId = visibleTabId,
+                        onVisibleTab = { id -> visibleTabId = id },
+                    ) { id, run -> state.runStates[id] = run }
                 } catch (ce: CancellationException) {
                     // stopped by user
                 } catch (e: Exception) {

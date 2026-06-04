@@ -76,6 +76,13 @@ class RunContext(
     /** Run-level override: when true, every Open Browser node runs headless
      *  regardless of its own `headless` config (toolbar "Headless" toggle). */
     val forceHeadless: Boolean = false,
+    /** A visible browser tab this flow opened on a previous run, if any. Reused
+     *  (instead of stacking another right-split each run) when it's still attached,
+     *  so reruns stay visible and don't nest panels. */
+    private val preferredVisibleTabId: String? = null,
+    /** Reports the visible browser tab id now in use (or null), so the UI can hand
+     *  it back as [preferredVisibleTabId] on the next run. */
+    private val onVisibleTab: (String?) -> Unit = {},
 ) {
     var session: BrowserIntegration? = null
 
@@ -128,6 +135,18 @@ class RunContext(
             log("No activeTabsProvider in this context")
             return null
         }
+        // Reuse the tab this flow opened on a prior run if it's still attached. Avoids
+        // stacking a fresh right-split every run — which nested panels and, worse,
+        // tended to fall back to headless when the newly nested tab didn't attach in
+        // time (the "rerun went headless" bug).
+        preferredVisibleTabId?.let { id ->
+            val existing = withContext(Dispatchers.Main) { tabs.getBrowserIntegration(id) }
+            if (existing != null) {
+                log("Reusing browser tab $id")
+                onVisibleTab(id)
+                return LoadAwaitingIntegration(existing)
+            }
+        }
         val tabId = try {
             withContext(Dispatchers.Main) { tabs.createBrowserTabInRightSplit("about:blank", "Browser") }
         } catch (e: Exception) {
@@ -143,7 +162,7 @@ class RunContext(
         var waited = 0
         while (waited < VISIBLE_TAB_TIMEOUT_MS) {
             val integration = withContext(Dispatchers.Main) { tabs.getBrowserIntegration(tabId) }
-            if (integration != null) return LoadAwaitingIntegration(integration)
+            if (integration != null) { onVisibleTab(tabId); return LoadAwaitingIntegration(integration) }
             delay(POLL_INTERVAL_MS.toLong()); waited += POLL_INTERVAL_MS
         }
         log("Browser tab never became drivable after ${VISIBLE_TAB_TIMEOUT_MS}ms")
