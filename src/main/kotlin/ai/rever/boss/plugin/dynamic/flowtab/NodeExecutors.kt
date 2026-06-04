@@ -30,6 +30,35 @@ class ExecError(message: String) : Exception(message)
 
 private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 
+// Element-wait tuning: a browser action polls for its target to appear before
+// acting, so a node firing right after a click/navigation doesn't race the page
+// still loading its content. Generic across every browser node.
+private const val ELEMENT_WAIT_MS = 20_000
+private const val ELEMENT_POLL_MS = 200
+
+/**
+ * Polls (up to [timeoutMs]) for [selector] to match an element, returning whether
+ * it appeared. Lets a node tolerate content that renders a beat after the previous
+ * step finished — the single most common cause of "it only worked the second run"
+ * flakiness, since [BrowserIntegration.executeJavaScript] is synchronous and can't
+ * await the page itself.
+ */
+private suspend fun BrowserIntegration.awaitElement(
+    selectorType: String,
+    selector: String,
+    timeoutMs: Int = ELEMENT_WAIT_MS,
+    pollMs: Int = ELEMENT_POLL_MS,
+): Boolean {
+    val existsScript =
+        "(function(){try{return !!(${BrowserScripts.elementExpr(selectorType, selector)});}catch(e){return false;}})()"
+    var waited = 0
+    while (true) {
+        if (executeJavaScript(existsScript) == true) return true
+        if (waited >= timeoutMs) return false
+        delay(pollMs.toLong()); waited += pollMs
+    }
+}
+
 /**
  * Runtime resources shared across a single run. Owns the browser session.
  *
@@ -186,8 +215,10 @@ object NodeCatalog {
 
         NodeType.CLICK -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
-            val ok = ctx.requireSession()
-                .executeJavaScript(BrowserScripts.clickScript(cfg.str("selectorType", "css"), sel)) == true
+            val type = cfg.str("selectorType", "css")
+            val session = ctx.requireSession()
+            if (!session.awaitElement(type, sel)) throw ExecError("Click: no element matched '$sel'")
+            val ok = session.executeJavaScript(BrowserScripts.clickScript(type, sel)) == true
             if (!ok) throw ExecError("Click: no element matched '$sel'")
             log("Clicked '$sel'")
             inputs.ifEmpty { SEED_ITEMS }
@@ -195,9 +226,11 @@ object NodeCatalog {
 
         NodeType.TYPE -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
+            val type = cfg.str("selectorType", "css")
             val text = cfg.str("text")
-            val ok = ctx.requireSession()
-                .executeJavaScript(BrowserScripts.inputScript(cfg.str("selectorType", "css"), sel, text)) == true
+            val session = ctx.requireSession()
+            if (!session.awaitElement(type, sel)) throw ExecError("Type: no element matched '$sel'")
+            val ok = session.executeJavaScript(BrowserScripts.inputScript(type, sel, text)) == true
             if (!ok) throw ExecError("Type: no element matched '$sel'")
             log("Typed into '$sel'")
             inputs.ifEmpty { SEED_ITEMS }
@@ -205,15 +238,20 @@ object NodeCatalog {
 
         NodeType.EXTRACT -> NodeExecutor { ctx, cfg, _, log ->
             val sel = cfg.str("selector")
+            val type = cfg.str("selectorType", "css")
             val multiple = cfg.bool("multiple")
+            val session = ctx.requireSession()
+            // Best-effort wait so extraction doesn't race a still-loading page;
+            // for `multiple` an empty result is still valid, so we proceed regardless.
+            session.awaitElement(type, sel)
             val script = BrowserScripts.extractScript(
-                selectorType = cfg.str("selectorType", "css"),
+                selectorType = type,
                 selector = sel,
                 mode = cfg.str("mode", "text"),
                 attr = cfg.str("attr"),
                 multiple = multiple
             )
-            val raw = ctx.requireSession().executeJavaScript(script)
+            val raw = session.executeJavaScript(script)
             val str = raw as? String ?: throw ExecError("Extract returned non-string: $raw")
             val obj = EXEC_JSON.parseToJsonElement(str).jsonObject
             if (obj["ok"]?.jsonPrimitive?.booleanOrNull != true) {
