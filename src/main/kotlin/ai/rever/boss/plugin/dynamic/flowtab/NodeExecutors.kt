@@ -2,8 +2,8 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.browser.BrowserConfig
-import ai.rever.boss.plugin.browser.BrowserHandle
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
@@ -31,13 +31,16 @@ private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 /**
  * Runtime resources shared across a single run. Owns the browser session.
  *
- * The session is a [BrowserHandle] from the host's central [browser service]
- * [ai.rever.boss.plugin.browser.BrowserService], created on a throwaway
- * ([BrowserConfig.ephemeralProfile]) isolated profile that the host deletes on
- * dispose. Nodes drive it via [BrowserHandle.loadUrlAndWait] / [executeJavaScript].
+ * The session is a [BrowserSession] over the host's browser stack. A **visible**
+ * run (the `headless` flag off — the default) opens a real Fluck browser tab in a
+ * right split via [ai.rever.boss.plugin.api.ActiveTabsProvider.createBrowserTabInRightSplit]
+ * and drives it through [ai.rever.boss.plugin.api.BrowserIntegration], so the page
+ * is watched live beside the canvas. A **headless** run (or a host without split
+ * support) uses an offscreen [ai.rever.boss.plugin.browser.BrowserHandle] on a
+ * throwaway ([BrowserConfig.ephemeralProfile]) profile.
  */
 class RunContext(val context: PluginContext) {
-    var session: BrowserHandle? = null
+    var session: BrowserSession? = null
 
     /** Serializes browser-session access across parallel branches (the "fence"). */
     val sessionMutex = Mutex()
@@ -46,27 +49,49 @@ class RunContext(val context: PluginContext) {
     val outputsByTitle = ConcurrentHashMap<String, List<Item>>()
 
     /**
-     * Open the run's browser session. [headless] is accepted for node-config
-     * stability; the session is always an offscreen engine browser (driving a
-     * *visible* tab needs host tab machinery this plugin doesn't reach).
+     * Open the run's browser session. When [headless] is false (default), opens a
+     * visible browser tab in a right split; if the host can't (no split support /
+     * no tabs provider), falls back to an offscreen headless browser.
      */
-    suspend fun openSession(headless: Boolean): BrowserHandle {
+    suspend fun openSession(headless: Boolean): BrowserSession {
         val service = context.browserService
             ?: throw ExecError("Browser is unavailable in this build (no browserService)")
         if (!service.isAvailable()) throw ExecError("Browser engine is not available")
-        val handle = service.createBrowser(BrowserConfig(ephemeralProfile = true))
-            ?: throw ExecError("Failed to open a browser session")
-        session = handle
-        return handle
+        val opened = (if (!headless) openVisibleSession() else null) ?: openHeadlessSession(service)
+        session = opened
+        return opened
     }
 
-    fun requireSession(): BrowserHandle =
+    private suspend fun openHeadlessSession(service: ai.rever.boss.plugin.browser.BrowserService): BrowserSession {
+        val handle = service.createBrowser(BrowserConfig(ephemeralProfile = true))
+            ?: throw ExecError("Failed to open a browser session")
+        return HandleSession(handle, service)
+    }
+
+    /** Open a visible browser tab in a right split and wait for it to become drivable. */
+    private suspend fun openVisibleSession(): BrowserSession? {
+        val tabs = context.activeTabsProvider ?: return null
+        val tabId = tabs.createBrowserTabInRightSplit("about:blank", "Flow Browser") ?: return null
+        // The browser view attaches asynchronously; poll briefly for its integration.
+        var waited = 0
+        while (waited < VISIBLE_TAB_TIMEOUT_MS) {
+            tabs.getBrowserIntegration(tabId)?.let { return TabSession(it, tabId) }
+            delay(POLL_INTERVAL_MS.toLong()); waited += POLL_INTERVAL_MS
+        }
+        return tabs.getBrowserIntegration(tabId)?.let { TabSession(it, tabId) }
+    }
+
+    fun requireSession(): BrowserSession =
         session ?: throw ExecError("No browser session — add an 'Open Browser' node upstream")
 
     suspend fun close() {
-        val handle = session
+        runCatching { session?.close() }
         session = null
-        if (handle != null) runCatching { context.browserService?.disposeBrowser(handle) }
+    }
+
+    private companion object {
+        const val VISIBLE_TAB_TIMEOUT_MS = 15_000
+        const val POLL_INTERVAL_MS = 100
     }
 }
 
@@ -106,14 +131,14 @@ object NodeCatalog {
             ctx.openSession(cfg.bool("headless"))
             log("Opened browser session")
             val url = cfg.str("url")
-            if (url.isNotBlank()) { ctx.requireSession().loadUrlAndWait(url); log("Navigated to $url") }
+            if (url.isNotBlank()) { ctx.requireSession().navigate(url); log("Navigated to $url") }
             inputs.ifEmpty { SEED_ITEMS }
         }
 
         NodeType.NAVIGATE -> NodeExecutor { ctx, cfg, inputs, log ->
             val url = cfg.str("url")
             if (url.isBlank()) throw ExecError("Navigate needs a URL")
-            ctx.requireSession().loadUrlAndWait(url)
+            ctx.requireSession().navigate(url)
             log("Navigated to $url")
             inputs.ifEmpty { SEED_ITEMS }
         }
