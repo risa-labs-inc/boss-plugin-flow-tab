@@ -91,6 +91,15 @@ class FlowGraphState {
     var isRunning by mutableStateOf(false)
     var runError by mutableStateOf<String?>(null)
 
+    /**
+     * Bumped on a timer while [isRunning] so the canvas re-reads node status and
+     * repaints live. The run writes [runStates] from a background thread; Compose
+     * Desktop only renders on invalidation, and a visible browser pane sitting idle
+     * between steps produces no frame, so those writes wouldn't show until something
+     * forced a frame. The canvas reads this, so each bump guarantees a fresh frame.
+     */
+    var repaintTick by mutableStateOf(0)
+
     /** Transient neutral status message (e.g. import results). */
     var notice by mutableStateOf<String?>(null)
 

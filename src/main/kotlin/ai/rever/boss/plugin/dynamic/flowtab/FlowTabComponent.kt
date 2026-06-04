@@ -49,7 +49,6 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.snapshots.Snapshot
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -168,17 +167,21 @@ class FlowTabComponent(
             }
         }
 
-        // While a run is in progress, drive frames continuously so the canvas keeps
-        // repainting live. Compose Desktop renders on demand; with a heavyweight
-        // browser view present in the split, the canvas's in-place recompositions
-        // aren't flushed to a frame until something forces one (e.g. switching tabs),
-        // so node status appeared to "stick" until then. Requesting a frame each loop
-        // (as an animation would) keeps rendering, and sendApplyNotifications delivers
-        // the background-thread status writes into that frame.
+        // While a run is in progress, pulse the canvas on a timer so live node status
+        // shows up even when a visible browser pane sits idle between steps. Compose
+        // Desktop renders on demand; the run writes node status from a background
+        // thread, and with the page idle nothing invalidates the canvas, so status
+        // used to "stick" until a frame was forced (tab switch, browser nav). A
+        // frame-clock loop (withFrameNanos) stalls when idle — no frames to await —
+        // so we drive this off a wall-clock delay instead: sendApplyNotifications
+        // flushes the background writes, and bumping repaintTick (read by the canvas)
+        // guarantees a fresh frame. ~10 fps is plenty for status and costs nothing
+        // when not running.
         LaunchedEffect(state.isRunning) {
             while (state.isRunning) {
-                withFrameNanos { }
+                delay(100)
                 Snapshot.sendApplyNotifications()
+                state.repaintTick++
             }
         }
 
@@ -443,10 +446,10 @@ private fun Toolbar(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(38.dp)
+            .height(42.dp)
             .background(ToolbarBg)
             .border(width = 1.dp, color = ToolbarBorder)
-            .padding(horizontal = 10.dp),
+            .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(

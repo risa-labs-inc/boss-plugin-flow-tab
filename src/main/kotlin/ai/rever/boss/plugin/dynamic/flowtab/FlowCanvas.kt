@@ -170,6 +170,12 @@ fun FlowCanvas(
         Canvas(Modifier.fillMaxSize()) { drawGrid(state.panOffset, state.scale) }
         Canvas(Modifier.fillMaxSize()) { drawEdges(state) }
 
+        // Observe the run-time repaint pulse: while a run is in progress this is
+        // bumped on a timer, forcing this subtree to recompose so live node status
+        // (written from the run's background thread) reaches a frame even when a
+        // visible browser pane is otherwise idle. No-op when not running.
+        @Suppress("UNUSED_EXPRESSION") state.repaintTick
+
         state.nodes.forEach { node ->
             key(node.id) { FlowNodeView(state, node) }
         }
