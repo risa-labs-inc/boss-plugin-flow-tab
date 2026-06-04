@@ -53,32 +53,59 @@ class RunContext(val context: PluginContext) {
      * visible browser tab in a right split; if the host can't (no split support /
      * no tabs provider), falls back to an offscreen headless browser.
      */
-    suspend fun openSession(headless: Boolean): BrowserSession {
+    suspend fun openSession(headless: Boolean, log: (String) -> Unit = {}): BrowserSession {
         val service = context.browserService
             ?: throw ExecError("Browser is unavailable in this build (no browserService)")
         if (!service.isAvailable()) throw ExecError("Browser engine is not available")
-        val opened = (if (!headless) openVisibleSession() else null) ?: openHeadlessSession(service)
+        val opened = if (headless) {
+            openHeadlessSession(service)
+        } else {
+            openVisibleSession(log) ?: run {
+                log("Visible browser unavailable — running headless (offscreen)")
+                openHeadlessSession(service)
+            }
+        }
         session = opened
         return opened
     }
 
     private suspend fun openHeadlessSession(service: ai.rever.boss.plugin.browser.BrowserService): BrowserSession {
-        val handle = service.createBrowser(BrowserConfig(ephemeralProfile = true))
+        val handle = service.createBrowser(BrowserConfig().apply { ephemeralProfile = true })
             ?: throw ExecError("Failed to open a browser session")
         return HandleSession(handle, service)
     }
 
-    /** Open a visible browser tab in a right split and wait for it to become drivable. */
-    private suspend fun openVisibleSession(): BrowserSession? {
-        val tabs = context.activeTabsProvider ?: return null
-        val tabId = tabs.createBrowserTabInRightSplit("about:blank", "Flow Browser") ?: return null
+    /**
+     * Open a visible browser tab in a right split and wait for it to become
+     * drivable. Split-view/tab creation must happen on the UI thread, so the host
+     * calls are marshalled to [Dispatchers.Main]. Returns null (with a logged
+     * reason) if the host can't open one, so the caller can fall back to headless.
+     */
+    private suspend fun openVisibleSession(log: (String) -> Unit): BrowserSession? {
+        val tabs = context.activeTabsProvider ?: run {
+            log("No activeTabsProvider in this context")
+            return null
+        }
+        val tabId = try {
+            withContext(Dispatchers.Main) { tabs.createBrowserTabInRightSplit("about:blank", "Flow Browser") }
+        } catch (e: Exception) {
+            log("Right-split open threw: ${e.message ?: e.toString()}")
+            null
+        }
+        if (tabId == null) {
+            log("createBrowserTabInRightSplit returned null (host has no split support?)")
+            return null
+        }
+        log("Opened browser tab in right split ($tabId); waiting for it to attach…")
         // The browser view attaches asynchronously; poll briefly for its integration.
         var waited = 0
         while (waited < VISIBLE_TAB_TIMEOUT_MS) {
-            tabs.getBrowserIntegration(tabId)?.let { return TabSession(it, tabId) }
+            val integration = withContext(Dispatchers.Main) { tabs.getBrowserIntegration(tabId) }
+            if (integration != null) return TabSession(integration, tabId)
             delay(POLL_INTERVAL_MS.toLong()); waited += POLL_INTERVAL_MS
         }
-        return tabs.getBrowserIntegration(tabId)?.let { TabSession(it, tabId) }
+        log("Browser tab never became drivable after ${VISIBLE_TAB_TIMEOUT_MS}ms")
+        return null
     }
 
     fun requireSession(): BrowserSession =
@@ -128,8 +155,8 @@ object NodeCatalog {
         NodeType.TRIGGER -> NodeExecutor { _, _, _, _ -> SEED_ITEMS }
 
         NodeType.OPEN_BROWSER -> NodeExecutor { ctx, cfg, inputs, log ->
-            ctx.openSession(cfg.bool("headless"))
-            log("Opened browser session")
+            val session = ctx.openSession(cfg.bool("headless"), log)
+            log(if (session is TabSession) "Browser session ready (visible)" else "Browser session ready (headless)")
             val url = cfg.str("url")
             if (url.isNotBlank()) { ctx.requireSession().navigate(url); log("Navigated to $url") }
             inputs.ifEmpty { SEED_ITEMS }
