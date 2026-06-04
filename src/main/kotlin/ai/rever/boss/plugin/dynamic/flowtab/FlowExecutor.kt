@@ -1,8 +1,10 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.PluginContext
+import kotlin.random.Random
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
@@ -42,6 +44,7 @@ class FlowExecutor(private val context: PluginContext) {
     suspend fun run(
         nodes: List<PlanNode>,
         edges: List<EdgeModel>,
+        humanize: Boolean = false,
         onStatus: (nodeId: String, NodeRun) -> Unit
     ) {
         val byId = nodes.associateBy { it.id }
@@ -70,6 +73,9 @@ class FlowExecutor(private val context: PluginContext) {
                         }
 
                         onStatus(node.id, NodeRun(RunStatus.RUNNING))
+                        // Realistic mode: pause a random, human-like beat before acting —
+                        // paces the run so it's watchable and mimics a person at the keyboard.
+                        if (humanize) delay(Random.nextLong(HUMANIZE_MIN_MS, HUMANIZE_MAX_MS))
                         val logs = mutableListOf<String>()
                         try {
                             val inputs = edges
@@ -142,5 +148,11 @@ class FlowExecutor(private val context: PluginContext) {
         }
         if (order.size != ids.size) throw ExecError("Cycle detected in the flow")
         return order
+    }
+
+    private companion object {
+        // Human-like pause range (ms) inserted before each step in realistic mode.
+        const val HUMANIZE_MIN_MS = 600L
+        const val HUMANIZE_MAX_MS = 2000L
     }
 }

@@ -39,6 +39,7 @@ import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.FitScreen
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RestartAlt
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.ZoomIn
 import androidx.compose.material.icons.filled.ZoomOut
@@ -189,6 +190,9 @@ class FlowTabComponent(
         // ---- run wiring ----
         val executor = remember { FlowExecutor(context) }
         var runJob by remember { mutableStateOf<Job?>(null) }
+        // "Realistic" mode: pace the run with human-like delays between steps, so
+        // it's watchable and mimics a person driving the page.
+        var realistic by remember { mutableStateOf(false) }
 
         fun startRun() {
             if (state.isRunning) return
@@ -204,7 +208,7 @@ class FlowTabComponent(
                     // and the canvas updates live. (Marshalling them onto the Main scope
                     // instead queued them behind the browser's own Main-thread work, so
                     // they only landed once the browser tab was closed.)
-                    executor.run(plan, edges) { id, run -> state.runStates[id] = run }
+                    executor.run(plan, edges, humanize = realistic) { id, run -> state.runStates[id] = run }
                 } catch (ce: CancellationException) {
                     // stopped by user
                 } catch (e: Exception) {
@@ -320,6 +324,8 @@ class FlowTabComponent(
             Toolbar(
                 scale = state.scale,
                 isRunning = state.isRunning,
+                realistic = realistic,
+                onToggleRealistic = { realistic = !realistic },
                 onRun = { startRun() },
                 onStop = { stopRun() },
                 onNewFlow = {
@@ -420,6 +426,8 @@ class FlowTabComponent(
 private fun Toolbar(
     scale: Float,
     isRunning: Boolean,
+    realistic: Boolean,
+    onToggleRealistic: () -> Unit,
     onRun: () -> Unit,
     onStop: () -> Unit,
     onNewFlow: () -> Unit,
@@ -468,6 +476,32 @@ private fun Toolbar(
             )
             Spacer(Modifier.width(4.dp))
             Text(if (isRunning) "Stop" else "Run", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        }
+
+        Spacer(Modifier.width(8.dp))
+        // Realistic-run toggle: human-like pauses between steps (watchable + lifelike).
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(7.dp))
+                .background(if (realistic) FlowTheme.Primary.copy(alpha = 0.22f) else Color.Transparent)
+                .border(1.dp, if (realistic) FlowTheme.Primary else ToolbarBorder, RoundedCornerShape(7.dp))
+                .clickable(onClick = onToggleRealistic)
+                .padding(horizontal = 10.dp, vertical = 5.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Filled.Schedule,
+                contentDescription = "Realistic run (human-like delays between steps)",
+                tint = if (realistic) FlowTheme.PrimaryTint else IconTint,
+                modifier = Modifier.size(14.dp)
+            )
+            Spacer(Modifier.width(4.dp))
+            Text(
+                "Realistic",
+                color = if (realistic) FlowTheme.PrimaryTint else IconTint,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
         }
 
         Spacer(Modifier.width(8.dp))

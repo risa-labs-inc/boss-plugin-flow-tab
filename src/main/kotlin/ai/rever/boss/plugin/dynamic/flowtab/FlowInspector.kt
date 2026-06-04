@@ -54,6 +54,7 @@ private val PanelBorder = FlowTheme.Border
 private val FieldBg = FlowTheme.Canvas
 private val Muted = FlowTheme.TextFaint
 private val prettyJson = Json { prettyPrint = true; isLenient = true }
+private val compactJson = Json { isLenient = true }
 
 /** Replace one config field on [node], preserving the rest. */
 private fun setConfig(node: FlowNode, key: String, value: String) {
@@ -250,10 +251,32 @@ private fun StatusBanner(run: NodeRun?) {
                 err,
                 color = FlowTheme.TextMuted,
                 fontSize = 11.sp,
-                maxLines = 2,
+                maxLines = 3,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 4.dp)
             )
+        }
+        // On success, preview the extracted data inline (full data is in the Output tab).
+        if (status == RunStatus.SUCCESS && run != null && run.output.isNotEmpty()) {
+            val preview = remember(run) {
+                runCatching {
+                    compactJson.encodeToString(
+                        kotlinx.serialization.builtins.ListSerializer(JsonObject.serializer()),
+                        run.output.map { it.json }
+                    )
+                }.getOrDefault("")
+            }
+            if (preview.isNotBlank()) {
+                Text(
+                    if (preview.length > 240) preview.take(240) + "…" else preview,
+                    color = FlowTheme.TextMuted,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    maxLines = 4,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
         }
     }
 }
