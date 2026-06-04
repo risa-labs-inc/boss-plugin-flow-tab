@@ -183,12 +183,12 @@ class FlowTabComponent(
             val edges = state.edges.toList()
             runJob = coroutineScope.launch(Dispatchers.Default) {
                 try {
-                    // The run executes off the UI thread; marshal each per-node status
-                    // update onto the Main scope so the canvas recomposes in real time
-                    // as nodes start/finish (writes stay ordered: the Main queue is FIFO).
-                    executor.run(plan, edges) { id, run ->
-                        coroutineScope.launch { state.runStates[id] = run }
-                    }
+                    // Write status straight from the run thread. These are observable
+                    // snapshot-state writes, so Compose picks them up on the next frame
+                    // and the canvas updates live. (Marshalling them onto the Main scope
+                    // instead queued them behind the browser's own Main-thread work, so
+                    // they only landed once the browser tab was closed.)
+                    executor.run(plan, edges) { id, run -> state.runStates[id] = run }
                 } catch (ce: CancellationException) {
                     // stopped by user
                 } catch (e: Exception) {
@@ -228,21 +228,39 @@ class FlowTabComponent(
             }
         }
 
-        fun loadFromText(text: String) {
+        // Seed a new Flow tab with [snapshotJson] and open it — imports land in their
+        // own tab rather than overwriting the current canvas. A tab loads its graph
+        // from storage key "graph:<tabId>", so we write there first, then open the tab.
+        // Falls back to the current tab if tab ops / storage aren't available.
+        fun openImportedInNewTab(snapshotJson: String, title: String, notice: String) {
+            val parsed = runCatching { json.decodeFromString(GraphSnapshot.serializer(), snapshotJson) }.getOrNull()
+            if (parsed == null) { state.runError = "Import failed: not a valid flow"; return }
+            val splitView = context.splitViewOperations
+            val store = storage
+            if (splitView == null || store == null) {
+                runCatching { state.load(parsed) }
+                state.notice = "Imported into the current tab (open-in-new-tab unavailable here)"
+                return
+            }
             uiScope.launch {
-                runCatching { state.load(json.decodeFromString(GraphSnapshot.serializer(), text)) }
-                    .onFailure { state.runError = "Import failed: ${it.message}" }
+                val newId = "flow-${java.util.UUID.randomUUID()}"
+                runCatching { store.putJson("graph:$newId", snapshotJson) }
+                splitView.openTab(FlowTabData(id = newId, title = title))
+                state.notice = notice
             }
         }
 
         fun importFlow() {
+            val onText: (String) -> Unit = { text ->
+                openImportedInNewTab(text, "Imported Flow", "Opened the imported flow in a new tab")
+            }
             val picker = context.filePickerProvider
             if (picker != null) {
                 picker.pickFile(title = "Import flow", filters = listOf("json")) { path ->
-                    if (path != null) runCatching { java.io.File(path).readText() }.getOrNull()?.let(::loadFromText)
+                    if (path != null) runCatching { java.io.File(path).readText() }.getOrNull()?.let(onText)
                 }
             } else {
-                context.clipboardProvider?.readText()?.let(::loadFromText)
+                context.clipboardProvider?.readText()?.let(onText)
             }
         }
 
@@ -254,17 +272,18 @@ class FlowTabComponent(
             uiScope.launch { runCatching { storage?.remove("runstate:${config.id}") } }
         }
 
-        // Import an RPA Recorder config → a chain of browser nodes on the canvas.
+        // Import an RPA Recorder config → a new tab with a chain of browser nodes.
         fun applyRecording(text: String) {
             val result = runCatching { RpaRecorderImport.convert(text) }.getOrElse {
                 state.runError = "RPA import failed: ${it.message}"; return
             }
             if (result.steps.isEmpty()) { state.notice = "No importable actions in that recording"; return }
-            uiScope.launch {
-                state.importChain(result.steps, state.toWorld(Offset(120f, 120f)))
-                state.notice = "Imported ${result.steps.size} node(s)" +
-                    if (result.skipped.isNotEmpty()) " · skipped: ${result.skipped.joinToString(", ")}" else ""
-            }
+            // Build the chain in a throwaway graph, then open it as its own tab.
+            val staged = FlowGraphState()
+            staged.importChain(result.steps, Offset(320f, 200f))
+            val snapshotJson = prettyJson.encodeToString(GraphSnapshot.serializer(), staged.toSnapshot())
+            val skipped = if (result.skipped.isNotEmpty()) " · skipped: ${result.skipped.joinToString(", ")}" else ""
+            openImportedInNewTab(snapshotJson, "Imported RPA", "Imported ${result.steps.size} node(s) in a new tab$skipped")
         }
 
         fun importRpaRecording() {
