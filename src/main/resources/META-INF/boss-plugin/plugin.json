@@ -3,7 +3,7 @@
   "pluginId": "ai.rever.boss.plugin.dynamic.flowtab",
   "displayName": "Flow",
   "version": "1.0.0",
-  "apiVersion": "1.0.27",
+  "apiVersion": "1.0.42",
   "minBossVersion": "8.16.30",
   "mainClass": "ai.rever.boss.plugin.dynamic.flowtab.FlowTabDynamicPlugin",
   "type": "tab",

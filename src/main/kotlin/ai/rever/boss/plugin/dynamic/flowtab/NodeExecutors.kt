@@ -1,10 +1,11 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import ai.rever.boss.plugin.api.BrowserIntegration
 import ai.rever.boss.plugin.api.PluginContext
-import ai.rever.boss.plugin.api.RpaBrowserSession
-import ai.rever.boss.plugin.api.RpaBrowserSpec
-import ai.rever.boss.plugin.api.RpaProfileChoice
+import ai.rever.boss.plugin.browser.BrowserConfig
+import ai.rever.boss.plugin.browser.BrowserService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
@@ -29,9 +30,58 @@ class ExecError(message: String) : Exception(message)
 
 private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 
-/** Runtime resources shared across a single run. Owns the browser session. */
-class RunContext(val context: PluginContext) {
-    var session: RpaBrowserSession? = null
+// Element-wait tuning: a browser action polls for its target to appear before
+// acting, so a node firing right after a click/navigation doesn't race the page
+// still loading its content. Generic across every browser node.
+private const val ELEMENT_WAIT_MS = 20_000
+private const val ELEMENT_POLL_MS = 200
+
+/**
+ * Polls (up to [timeoutMs]) for [selector] to match an element, returning whether
+ * it appeared. Lets a node tolerate content that renders a beat after the previous
+ * step finished — the single most common cause of "it only worked the second run"
+ * flakiness, since [BrowserIntegration.executeJavaScript] is synchronous and can't
+ * await the page itself.
+ */
+private suspend fun BrowserIntegration.awaitElement(
+    selectorType: String,
+    selector: String,
+    timeoutMs: Int = ELEMENT_WAIT_MS,
+    pollMs: Int = ELEMENT_POLL_MS,
+): Boolean {
+    val existsScript =
+        "(function(){try{return !!(${BrowserScripts.elementExpr(selectorType, selector)});}catch(e){return false;}})()"
+    var waited = 0
+    while (true) {
+        if (executeJavaScript(existsScript) == true) return true
+        if (waited >= timeoutMs) return false
+        delay(pollMs.toLong()); waited += pollMs
+    }
+}
+
+/**
+ * Runtime resources shared across a single run. Owns the browser session.
+ *
+ * The session is the host's [BrowserIntegration] driving interface. A **visible**
+ * run (the `headless` flag off — the default) opens a real Fluck browser tab in a
+ * right split via [ai.rever.boss.plugin.api.ActiveTabsProvider.createBrowserTabInRightSplit]
+ * and drives the host's own integration for it (wrapped by [LoadAwaitingIntegration]
+ * so navigation blocks until the page is loaded). A **headless** run (or a host
+ * without split support) uses a [BrowserHandleIntegration] over an offscreen
+ * [ai.rever.boss.plugin.browser.BrowserHandle] on a throwaway
+ * ([BrowserConfig.ephemeralProfile]) profile.
+ */
+class RunContext(
+    val context: PluginContext,
+    /** Reports the visible browser tab id this run opened, so the UI can close it
+     *  before the next run (each run opens a fresh tab — see startRun). */
+    private val onVisibleTab: (String?) -> Unit = {},
+) {
+    var session: BrowserIntegration? = null
+
+    /** Releases the session on [close] (disposes a headless handle; visible tabs are
+     *  left open for inspection and torn down by the host). */
+    private var closer: (suspend () -> Unit)? = null
 
     /** Serializes browser-session access across parallel branches (the "fence"). */
     val sessionMutex = Mutex()
@@ -39,22 +89,79 @@ class RunContext(val context: PluginContext) {
     /** Node outputs keyed by node title, for `$node["Title"]` expressions. Thread-safe. */
     val outputsByTitle = ConcurrentHashMap<String, List<Item>>()
 
-    suspend fun openSession(headless: Boolean): RpaBrowserSession {
-        val provider = context.rpaBrowserProvider
-            ?: throw ExecError("Browser is unavailable in this build (no rpaBrowserProvider)")
-        val s = provider.openSession(
-            RpaBrowserSpec(profile = RpaProfileChoice.Ephemeral, auth = null, headless = headless)
-        ) ?: throw ExecError("Failed to open a browser session")
-        session = s
-        return s
+    /**
+     * Open the run's browser session. When [headless] is false (default), opens a
+     * visible browser tab in a right split; if the host can't (no split support /
+     * no tabs provider), falls back to an offscreen headless browser.
+     */
+    suspend fun openSession(headless: Boolean, log: (String) -> Unit = {}): BrowserIntegration {
+        val service = context.browserService
+            ?: throw ExecError("Browser is unavailable in this build (no browserService)")
+        if (!service.isAvailable()) throw ExecError("Browser engine is not available")
+        val opened = if (headless) {
+            openHeadlessSession(service)
+        } else {
+            openVisibleSession(log) ?: run {
+                log("Visible browser unavailable — running headless (offscreen)")
+                openHeadlessSession(service)
+            }
+        }
+        session = opened
+        return opened
     }
 
-    fun requireSession(): RpaBrowserSession =
+    private suspend fun openHeadlessSession(service: BrowserService): BrowserIntegration {
+        val handle = service.createBrowser(BrowserConfig().apply { ephemeralProfile = true })
+            ?: throw ExecError("Failed to open a browser session")
+        closer = { service.disposeBrowser(handle) }
+        return BrowserHandleIntegration(handle)
+    }
+
+    /**
+     * Open a visible browser tab in a right split and wait for it to become
+     * drivable. Split-view/tab creation must happen on the UI thread, so the host
+     * calls are marshalled to [Dispatchers.Main]. Returns null (with a logged
+     * reason) if the host can't open one, so the caller can fall back to headless.
+     */
+    private suspend fun openVisibleSession(log: (String) -> Unit): BrowserIntegration? {
+        val tabs = context.activeTabsProvider ?: run {
+            log("No activeTabsProvider in this context")
+            return null
+        }
+        val tabId = try {
+            withContext(Dispatchers.Main) { tabs.createBrowserTabInRightSplit("about:blank", "Browser") }
+        } catch (e: Exception) {
+            log("Right-split open threw: ${e.message ?: e.toString()}")
+            null
+        }
+        if (tabId == null) {
+            log("createBrowserTabInRightSplit returned null (host has no split support?)")
+            return null
+        }
+        log("Opened browser tab in right split ($tabId); waiting for it to attach…")
+        // The browser view attaches asynchronously; poll briefly for its integration.
+        var waited = 0
+        while (waited < VISIBLE_TAB_TIMEOUT_MS) {
+            val integration = withContext(Dispatchers.Main) { tabs.getBrowserIntegration(tabId) }
+            if (integration != null) { onVisibleTab(tabId); return LoadAwaitingIntegration(integration) }
+            delay(POLL_INTERVAL_MS.toLong()); waited += POLL_INTERVAL_MS
+        }
+        log("Browser tab never became drivable after ${VISIBLE_TAB_TIMEOUT_MS}ms")
+        return null
+    }
+
+    fun requireSession(): BrowserIntegration =
         session ?: throw ExecError("No browser session — add an 'Open Browser' node upstream")
 
     suspend fun close() {
-        runCatching { session?.close() }
+        runCatching { closer?.invoke() }
+        closer = null
         session = null
+    }
+
+    private companion object {
+        const val VISIBLE_TAB_TIMEOUT_MS = 15_000
+        const val POLL_INTERVAL_MS = 100
     }
 }
 
@@ -91,9 +198,8 @@ object NodeCatalog {
         NodeType.TRIGGER -> NodeExecutor { _, _, _, _ -> SEED_ITEMS }
 
         NodeType.OPEN_BROWSER -> NodeExecutor { ctx, cfg, inputs, log ->
-            val headless = cfg.bool("headless")
-            ctx.openSession(headless)
-            log(if (headless) "Opened headless browser session" else "Opened visible browser session")
+            val session = ctx.openSession(cfg.bool("headless"), log)
+            log(if (session is BrowserHandleIntegration) "Browser session ready (headless)" else "Browser session ready (visible)")
             val url = cfg.str("url")
             if (url.isNotBlank()) { ctx.requireSession().navigate(url); log("Navigated to $url") }
             inputs.ifEmpty { SEED_ITEMS }
@@ -109,8 +215,10 @@ object NodeCatalog {
 
         NodeType.CLICK -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
-            val ok = ctx.requireSession()
-                .executeJavaScript(BrowserScripts.clickScript(cfg.str("selectorType", "css"), sel)) == true
+            val type = cfg.str("selectorType", "css")
+            val session = ctx.requireSession()
+            if (!session.awaitElement(type, sel)) throw ExecError("Click: no element matched '$sel'")
+            val ok = session.executeJavaScript(BrowserScripts.clickScript(type, sel)) == true
             if (!ok) throw ExecError("Click: no element matched '$sel'")
             log("Clicked '$sel'")
             inputs.ifEmpty { SEED_ITEMS }
@@ -118,9 +226,11 @@ object NodeCatalog {
 
         NodeType.TYPE -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
+            val type = cfg.str("selectorType", "css")
             val text = cfg.str("text")
-            val ok = ctx.requireSession()
-                .executeJavaScript(BrowserScripts.inputScript(cfg.str("selectorType", "css"), sel, text)) == true
+            val session = ctx.requireSession()
+            if (!session.awaitElement(type, sel)) throw ExecError("Type: no element matched '$sel'")
+            val ok = session.executeJavaScript(BrowserScripts.inputScript(type, sel, text)) == true
             if (!ok) throw ExecError("Type: no element matched '$sel'")
             log("Typed into '$sel'")
             inputs.ifEmpty { SEED_ITEMS }
@@ -128,15 +238,20 @@ object NodeCatalog {
 
         NodeType.EXTRACT -> NodeExecutor { ctx, cfg, _, log ->
             val sel = cfg.str("selector")
+            val type = cfg.str("selectorType", "css")
             val multiple = cfg.bool("multiple")
+            val session = ctx.requireSession()
+            // Best-effort wait so extraction doesn't race a still-loading page;
+            // for `multiple` an empty result is still valid, so we proceed regardless.
+            session.awaitElement(type, sel)
             val script = BrowserScripts.extractScript(
-                selectorType = cfg.str("selectorType", "css"),
+                selectorType = type,
                 selector = sel,
                 mode = cfg.str("mode", "text"),
                 attr = cfg.str("attr"),
                 multiple = multiple
             )
-            val raw = ctx.requireSession().executeJavaScript(script)
+            val raw = session.executeJavaScript(script)
             val str = raw as? String ?: throw ExecError("Extract returned non-string: $raw")
             val obj = EXEC_JSON.parseToJsonElement(str).jsonObject
             if (obj["ok"]?.jsonPrimitive?.booleanOrNull != true) {

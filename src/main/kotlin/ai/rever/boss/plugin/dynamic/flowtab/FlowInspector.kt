@@ -23,6 +23,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.Icon
 import androidx.compose.material.Text
@@ -46,6 +47,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
@@ -54,6 +58,12 @@ private val PanelBorder = FlowTheme.Border
 private val FieldBg = FlowTheme.Canvas
 private val Muted = FlowTheme.TextFaint
 private val prettyJson = Json { prettyPrint = true; isLenient = true }
+
+// Syntax colors for the collapsible JSON tree in the Output tab.
+private val JsonKeyColor = Color(0xFF7AA2F7)
+private val JsonStringColor = Color(0xFF9ECE6A)
+private val JsonNumberColor = Color(0xFFE0AF68)
+private val JsonBoolColor = Color(0xFFBB9AF7)
 
 /** Replace one config field on [node], preserving the rest. */
 private fun setConfig(node: FlowNode, key: String, value: String) {
@@ -69,7 +79,9 @@ private fun configValue(node: FlowNode, field: ConfigField): String =
  */
 @Composable
 fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Modifier) {
-    var tab by remember(node.id) { mutableStateOf(0) } // 0 params, 1 json, 2 output
+    // Default to the Output tab once a node has run, so its extracted data (or error)
+    // is the first thing shown; otherwise start on Parameters.
+    var tab by remember(node.id) { mutableStateOf(if (state.runStates[node.id] != null) 2 else 0) } // 0 params, 1 json, 2 output
     val accent = Color(node.type.accent)
 
     Column(
@@ -197,17 +209,83 @@ private fun OutputTab(state: FlowGraphState, node: FlowNode) {
             Text(run.logs.joinToString("\n"), color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
         }
         FieldLabel("Output (${run.output.size} item${if (run.output.size == 1) "" else "s"})")
-        val rendered = remember(run) {
-            runCatching {
-                prettyJson.encodeToString(
-                    kotlinx.serialization.builtins.ListSerializer(JsonObject.serializer()),
-                    run.output.map { it.json }
-                )
-            }.getOrDefault("[]")
+        // Collapsible JSON tree — click a node to fold/unfold; values are selectable
+        // for copy. Replaces the flat dump so deep/large extracts stay readable.
+        Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(FlowTheme.rSm)).background(FieldBg).padding(vertical = 6.dp, horizontal = 8.dp)) {
+            Column {
+                if (run.output.isEmpty()) {
+                    Text("[]", color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                } else {
+                    run.output.forEachIndexed { i, item ->
+                        JsonNode(label = "[$i]", element = item.json, depth = 0)
+                    }
+                }
+            }
         }
-        Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(FlowTheme.rSm)).background(FieldBg).padding(8.dp)) {
-            Text(rendered, color = FlowTheme.TextPrimary, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+    }
+}
+
+/** One node in the collapsible JSON tree: branch (object/array) or leaf (primitive). */
+@Composable
+private fun JsonNode(label: String?, element: JsonElement, depth: Int) {
+    when (element) {
+        is JsonObject -> JsonBranch(label, "{", "}", element.entries.map { it.key to it.value }, depth, keyed = true)
+        is JsonArray -> JsonBranch(label, "[", "]", element.mapIndexed { i, v -> i.toString() to v }, depth, keyed = false)
+        else -> JsonLeaf(label, element as JsonPrimitive, depth)
+    }
+}
+
+@Composable
+private fun JsonBranch(
+    label: String?,
+    open: String,
+    close: String,
+    children: List<Pair<String, JsonElement>>,
+    depth: Int,
+    keyed: Boolean,
+) {
+    // First couple of levels open by default; deeper nesting starts folded.
+    var expanded by remember { mutableStateOf(depth < 2) }
+    val indent = (depth * 14).dp
+    Column {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }
+                .padding(start = indent, top = 1.dp, bottom = 1.dp)
+        ) {
+            Text(if (expanded) "▾" else "▸", color = Muted, fontSize = 10.sp, fontFamily = FontFamily.Monospace)
+            Spacer(Modifier.width(4.dp))
+            if (label != null) {
+                Text("$label: ", color = JsonKeyColor, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            }
+            Text(if (expanded) open else "$open … $close", color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            if (!expanded) {
+                Spacer(Modifier.width(6.dp))
+                Text("${children.size} ${if (keyed) "keys" else "items"}", color = FlowTheme.TextFaint, fontSize = 10.sp)
+            }
         }
+        if (expanded) {
+            children.forEach { (k, v) ->
+                JsonNode(label = if (keyed) "\"$k\"" else k, element = v, depth = depth + 1)
+            }
+            Text(close, color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace, modifier = Modifier.padding(start = indent))
+        }
+    }
+}
+
+@Composable
+private fun JsonLeaf(label: String?, prim: JsonPrimitive, depth: Int) {
+    val (text, color) = when {
+        prim is JsonNull -> "null" to Muted
+        prim.isString -> "\"${prim.content}\"" to JsonStringColor
+        prim.content == "true" || prim.content == "false" -> prim.content to JsonBoolColor
+        else -> prim.content to JsonNumberColor
+    }
+    Row(modifier = Modifier.fillMaxWidth().padding(start = (depth * 14 + 18).dp, top = 1.dp, bottom = 1.dp)) {
+        if (label != null) {
+            Text("$label: ", color = JsonKeyColor, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+        }
+        SelectionContainer { Text(text, color = color, fontSize = 11.sp, fontFamily = FontFamily.Monospace) }
     }
 }
 
@@ -250,7 +328,7 @@ private fun StatusBanner(run: NodeRun?) {
                 err,
                 color = FlowTheme.TextMuted,
                 fontSize = 11.sp,
-                maxLines = 2,
+                maxLines = 3,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.padding(top = 4.dp)
             )

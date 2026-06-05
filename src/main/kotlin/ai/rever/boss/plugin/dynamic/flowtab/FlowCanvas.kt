@@ -170,6 +170,12 @@ fun FlowCanvas(
         Canvas(Modifier.fillMaxSize()) { drawGrid(state.panOffset, state.scale) }
         Canvas(Modifier.fillMaxSize()) { drawEdges(state) }
 
+        // Observe the run-time repaint pulse: while a run is in progress this is
+        // bumped on a timer, forcing this subtree to recompose so live node status
+        // (written from the run's background thread) reaches a frame even when a
+        // visible browser pane is otherwise idle. No-op when not running.
+        @Suppress("UNUSED_EXPRESSION") state.repaintTick
+
         state.nodes.forEach { node ->
             key(node.id) { FlowNodeView(state, node) }
         }
@@ -379,10 +385,10 @@ private fun DrawScope.drawEdgePath(
         if (len > 0.01f) {
             val ux = dx / len
             val uy = dy / len
-            val size = 9f
+            val size = 13f
             val baseX = end.x - ux * size
             val baseY = end.y - uy * size
-            val half = size * 0.6f
+            val half = size * 0.62f
             val head = Path().apply {
                 moveTo(end.x, end.y)
                 lineTo(baseX - uy * half, baseY + ux * half)
