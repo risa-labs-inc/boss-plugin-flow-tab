@@ -151,12 +151,32 @@ fun FlowNodePicker(state: FlowGraphState) {
                         modifier = Modifier.padding(12.dp)
                     )
                 }
-                for (spec in results) {
+                // Split built-ins from host/external tool nodes (kind-id `tool:…`) so
+                // the live, RBAC-filtered tool set reads as its own section (P1).
+                val (tools, builtins) = results.partition { it.id.startsWith("tool:") }
+                for (spec in builtins) {
                     PickerRow(spec) { state.resolvePicker(spec) }
+                }
+                if (tools.isNotEmpty()) {
+                    SectionLabel("Tools")
+                    for (spec in tools) {
+                        PickerRow(spec) { state.resolvePicker(spec) }
+                    }
                 }
             }
         }
     }
+}
+
+@Composable
+private fun SectionLabel(text: String) {
+    Text(
+        text.uppercase(),
+        color = FlowTheme.TextPlaceholder,
+        fontSize = 10.sp,
+        fontWeight = FontWeight.SemiBold,
+        modifier = Modifier.padding(start = 10.dp, top = 10.dp, bottom = 2.dp)
+    )
 }
 
 @Composable

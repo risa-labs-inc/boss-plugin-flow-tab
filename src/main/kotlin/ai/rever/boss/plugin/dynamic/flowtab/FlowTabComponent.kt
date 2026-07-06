@@ -135,6 +135,11 @@ class FlowTabComponent(
     private var visibleTabId: String? = null
 
     init {
+        // Surface the host registry's tools as live palette nodes, re-deriving whenever
+        // the RBAC-filtered tool set changes. A null registry (older/sandboxed host)
+        // degrades cleanly to built-ins only. The collector is tied to [coroutineScope]
+        // and cancelled on destroy.
+        runCatching { syncBossTools(context, registry, coroutineScope) }
         lifecycle.subscribe(
             object : Lifecycle.Callbacks {
                 override fun onDestroy() {

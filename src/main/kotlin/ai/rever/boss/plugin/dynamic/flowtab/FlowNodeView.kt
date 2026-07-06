@@ -27,6 +27,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CallSplit
 import androidx.compose.material.icons.automirrored.filled.MergeType
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Keyboard
@@ -92,7 +93,8 @@ fun iconForKind(kind: String): ImageVector = when (kind) {
     "IF" -> Icons.AutoMirrored.Filled.CallSplit
     "SET" -> Icons.Filled.Tune
     "MERGE" -> Icons.AutoMirrored.Filled.MergeType
-    else -> Icons.Filled.Tune
+    // Dynamic tool nodes (host/external registry) share a wrench glyph.
+    else -> if (kind.startsWith("tool:")) Icons.Filled.Build else Icons.Filled.Tune
 }
 
 /** Icon for a node spec (by its kind-id). */

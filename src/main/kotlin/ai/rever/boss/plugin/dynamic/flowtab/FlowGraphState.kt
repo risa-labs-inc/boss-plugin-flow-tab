@@ -220,7 +220,8 @@ class FlowGraphState(
             spec = spec,
             title = spec.label,
             x = worldCenter.x - nodeOuterWidth() / 2f,
-            y = worldCenter.y - h / 2f
+            y = worldCenter.y - h / 2f,
+            config = spec.defaultConfig,
         )
         nodes.add(node)
         selection = Selection.Node(node.id)

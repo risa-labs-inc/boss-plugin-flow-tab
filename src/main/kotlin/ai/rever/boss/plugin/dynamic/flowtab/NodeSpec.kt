@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.serialization.json.JsonObject
+
 /**
  * Runtime descriptor for one kind of node. Replaces the closed [NodeType] enum's
  * per-member metadata + the scattered `when` blocks: everything the canvas, the
@@ -29,6 +31,12 @@ data class NodeSpec(
     val outputLabels: List<String> = emptyList(),
     /** Per-input-port labels (e.g. Merge -> ["a","b"]); missing index -> "". */
     val inputLabels: List<String> = emptyList(),
+    /**
+     * Config seeded into a freshly-spawned node of this kind (merged under the user's
+     * fields). Tool nodes use it to cache their toolRef + schema snapshot so a saved
+     * node keeps them when the backing tool is absent at load (F4). Empty for built-ins.
+     */
+    val defaultConfig: JsonObject = JsonObject(emptyMap()),
     val executor: NodeExecutor? = null,
 ) {
     fun outputLabel(index: Int): String = outputLabels.getOrElse(index) { "" }
