@@ -2,8 +2,6 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.BrowserIntegration
 import ai.rever.boss.plugin.api.PluginContext
-import ai.rever.boss.plugin.browser.BrowserConfig
-import ai.rever.boss.plugin.browser.BrowserService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
@@ -43,7 +41,7 @@ private const val ELEMENT_POLL_MS = 200
  * flakiness, since [BrowserIntegration.executeJavaScript] is synchronous and can't
  * await the page itself.
  */
-private suspend fun BrowserIntegration.awaitElement(
+internal suspend fun BrowserIntegration.awaitElement(
     selectorType: String,
     selector: String,
     timeoutMs: Int = ELEMENT_WAIT_MS,
@@ -60,108 +58,59 @@ private suspend fun BrowserIntegration.awaitElement(
 }
 
 /**
- * Runtime resources shared across a single run. Owns the browser session.
+ * Runtime resources shared across a single run. Draws its browser session from a
+ * [SessionRegistry] (red-team F2/F12) rather than owning a single session inline:
+ * the run holds one **default session** in that registry so native browser nodes
+ * (Open/Navigate/Click/Type/Extract/Inject) behave exactly as before, while agents
+ * and browser tool-nodes can open and drive additional sessions by id.
  *
- * The session is the host's [BrowserIntegration] driving interface. A **visible**
- * run (the `headless` flag off — the default) opens a real Fluck browser tab in a
- * right split via [ai.rever.boss.plugin.api.ActiveTabsProvider.createBrowserTabInRightSplit]
- * and drives the host's own integration for it (wrapped by [LoadAwaitingIntegration]
- * so navigation blocks until the page is loaded). A **headless** run (or a host
- * without split support) uses a [BrowserHandleIntegration] over an offscreen
- * [ai.rever.boss.plugin.browser.BrowserHandle] on a throwaway
- * ([BrowserConfig.ephemeralProfile]) profile.
+ * The default session is a visible Fluck tab in a right split (wrapped by
+ * [LoadAwaitingIntegration]) or, headless / when the host can't split, an offscreen
+ * [BrowserHandleIntegration] — see [SessionRegistry].
  */
 class RunContext(
     val context: PluginContext,
     /** Reports the visible browser tab id this run opened, so the UI can close it
      *  before the next run (each run opens a fresh tab — see startRun). */
-    private val onVisibleTab: (String?) -> Unit = {},
+    onVisibleTab: (String?) -> Unit = {},
+    /** The N-session store this run draws from. Defaults to a fresh registry so tests
+     *  and the ad-hoc executor path work without threading one through. */
+    val sessions: SessionRegistry = SessionRegistry(context, onVisibleTab),
 ) {
-    var session: BrowserIntegration? = null
+    /** The id of this run's default browser session in [sessions] (native nodes use it). */
+    val defaultSessionId: String = sessions.newSessionId()
 
-    /** Releases the session on [close] (disposes a headless handle; visible tabs are
-     *  left open for inspection and torn down by the host). */
-    private var closer: (suspend () -> Unit)? = null
+    /**
+     * The default session's [BrowserIntegration], or null before it is opened. Kept as
+     * a read-only view so callers observe whatever [SessionRegistry] holds for the run.
+     */
+    val session: BrowserIntegration? get() = sessions.get(defaultSessionId)
 
-    /** Serializes browser-session access across parallel branches (the "fence"). */
-    val sessionMutex = Mutex()
+    /** Serializes access to the default browser session across parallel branches (the
+     *  "fence"). Backed by [SessionRegistry]'s per-session mutex, so it is stable for
+     *  the run even before the session is opened. */
+    val sessionMutex: Mutex get() = sessions.mutexFor(defaultSessionId)
 
     /** Node outputs keyed by node title, for `$node["Title"]` expressions. Thread-safe. */
     val outputsByTitle = ConcurrentHashMap<String, List<Item>>()
 
     /**
-     * Open the run's browser session. When [headless] is false (default), opens a
-     * visible browser tab in a right split; if the host can't (no split support /
-     * no tabs provider), falls back to an offscreen headless browser.
+     * Open the run's default browser session. When [headless] is false (default),
+     * opens a visible browser tab in a right split; if the host can't (no split
+     * support / no tabs provider), falls back to an offscreen headless browser.
      */
     suspend fun openSession(headless: Boolean, log: (String) -> Unit = {}): BrowserIntegration {
-        val service = context.browserService
-            ?: throw ExecError("Browser is unavailable in this build (no browserService)")
-        if (!service.isAvailable()) throw ExecError("Browser engine is not available")
-        val opened = if (headless) {
-            openHeadlessSession(service)
-        } else {
-            openVisibleSession(log) ?: run {
-                log("Visible browser unavailable — running headless (offscreen)")
-                openHeadlessSession(service)
-            }
-        }
-        session = opened
-        return opened
-    }
-
-    private suspend fun openHeadlessSession(service: BrowserService): BrowserIntegration {
-        val handle = service.createBrowser(BrowserConfig().apply { ephemeralProfile = true })
-            ?: throw ExecError("Failed to open a browser session")
-        closer = { service.disposeBrowser(handle) }
-        return BrowserHandleIntegration(handle)
-    }
-
-    /**
-     * Open a visible browser tab in a right split and wait for it to become
-     * drivable. Split-view/tab creation must happen on the UI thread, so the host
-     * calls are marshalled to [Dispatchers.Main]. Returns null (with a logged
-     * reason) if the host can't open one, so the caller can fall back to headless.
-     */
-    private suspend fun openVisibleSession(log: (String) -> Unit): BrowserIntegration? {
-        val tabs = context.activeTabsProvider ?: run {
-            log("No activeTabsProvider in this context")
-            return null
-        }
-        val tabId = try {
-            withContext(Dispatchers.Main) { tabs.createBrowserTabInRightSplit("about:blank", "Browser") }
-        } catch (e: Exception) {
-            log("Right-split open threw: ${e.message ?: e.toString()}")
-            null
-        }
-        if (tabId == null) {
-            log("createBrowserTabInRightSplit returned null (host has no split support?)")
-            return null
-        }
-        log("Opened browser tab in right split ($tabId); waiting for it to attach…")
-        // The browser view attaches asynchronously; poll briefly for its integration.
-        var waited = 0
-        while (waited < VISIBLE_TAB_TIMEOUT_MS) {
-            val integration = withContext(Dispatchers.Main) { tabs.getBrowserIntegration(tabId) }
-            if (integration != null) { onVisibleTab(tabId); return LoadAwaitingIntegration(integration) }
-            delay(POLL_INTERVAL_MS.toLong()); waited += POLL_INTERVAL_MS
-        }
-        log("Browser tab never became drivable after ${VISIBLE_TAB_TIMEOUT_MS}ms")
-        return null
+        sessions.open(headless, defaultSessionId, log)
+        return requireSession()
     }
 
     fun requireSession(): BrowserIntegration =
         session ?: throw ExecError("No browser session — add an 'Open Browser' node upstream")
 
+    /** Releases every session this run opened (headless handles disposed; visible tabs
+     *  left open for inspection and torn down by the host). */
     suspend fun close() {
-        runCatching { closer?.invoke() }
-        closer = null
-        session = null
-    }
-
-    private companion object {
-        const val VISIBLE_TAB_TIMEOUT_MS = 15_000
-        const val POLL_INTERVAL_MS = 100
+        sessions.closeAll()
     }
 }
 
