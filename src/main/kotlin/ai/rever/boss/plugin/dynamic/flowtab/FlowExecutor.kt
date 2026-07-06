@@ -13,10 +13,15 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.ConcurrentHashMap
 
-/** A static snapshot of a node for execution (decoupled from reactive UI state). */
+/**
+ * A static snapshot of a node for execution (decoupled from reactive UI state).
+ * [kind] is the registry kind-id; the executor resolves it to a [NodeSpec] for
+ * dispatch (run-mode, session use, executor). An unknown kind-id or a spec with no
+ * executor fails only *that* node, with a clear message — the run does not crash.
+ */
 data class PlanNode(
     val id: String,
-    val type: NodeType,
+    val kind: String,
     val title: String,
     val config: JsonObject
 )
@@ -39,7 +44,12 @@ data class PlanNode(
  *        └────► HTTP ──► Set                                 (runs in parallel)
  * ```
  */
-class FlowExecutor(private val context: PluginContext) {
+class FlowExecutor(
+    private val context: PluginContext,
+    /** Kind-id → spec map used for dispatch. Defaults to the built-ins so tests and
+     *  the ad-hoc executor path work without threading a registry through. */
+    private val registry: NodeRegistry = builtinNodeRegistry(),
+) {
 
     suspend fun run(
         nodes: List<PlanNode>,
@@ -87,7 +97,7 @@ class FlowExecutor(private val context: PluginContext) {
                                 .sortedBy { it.toPort }
                                 .flatMap { outputsById[it.fromNode].orEmpty() }
                             val out =
-                                if (node.type.usesSession()) {
+                                if (registry[node.kind]?.usesSession == true) {
                                     ctx.sessionMutex.withLock { runNode(ctx, node, inputs) { logs.add(it) } }
                                 } else {
                                     runNode(ctx, node, inputs) { logs.add(it) }
@@ -116,9 +126,11 @@ class FlowExecutor(private val context: PluginContext) {
         inputs: List<Item>,
         log: (String) -> Unit
     ): List<Item> {
-        val exec = NodeCatalog.executor(node.type)
-            ?: throw ExecError("${node.type.label} is not runnable yet (Phase 1)")
-        return when (node.type.runMode) {
+        val spec = registry[node.kind]
+            ?: throw ExecError("Unknown node kind '${node.kind}' — its provider isn't available")
+        val exec = spec.executor
+            ?: throw ExecError("${spec.label} is not runnable yet (Phase 1)")
+        return when (spec.runMode) {
             RunMode.PER_ITEM -> inputs.ifEmpty { SEED_ITEMS }.flatMap { item ->
                 exec.run(ctx, ConfigReader(node.config, item, ctx.outputsByTitle), listOf(item), log)
             }

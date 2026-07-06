@@ -120,8 +120,11 @@ class FlowTabComponent(
     // status would vanish (it kept writing to the orphaned old instance). On the
     // component, it survives the recreation. The component itself is reused across
     // the split (the panel keeps its tab component).
-    private val state = FlowGraphState()
-    private val executor = FlowExecutor(context)
+    // One registry instance per tab, threaded to both the canvas state (palette +
+    // geometry) and the executor (dispatch) so they agree on every kind-id.
+    private val registry = builtinNodeRegistry()
+    private val state = FlowGraphState(registry)
+    private val executor = FlowExecutor(context, registry)
     private var runJob: Job? = null
     private var initialized = false
     // "Realistic" mode: pace the run with human-like delays between steps, so it's
@@ -163,7 +166,7 @@ class FlowTabComponent(
                     }
                 }
                 if (state.nodes.isEmpty()) {
-                    state.addNode(NodeType.TRIGGER, Offset(320f, 200f))
+                    state.addNode(NodeType.TRIGGER.name, Offset(320f, 200f))
                     state.selection = null
                 }
                 // Restore the last run's per-node status/output, if any.
@@ -223,7 +226,7 @@ class FlowTabComponent(
             state.clearRun()
             state.notice = null
             state.isRunning = true
-            val plan = state.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
+            val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
             runJob = coroutineScope.launch(Dispatchers.Default) {
                 try {

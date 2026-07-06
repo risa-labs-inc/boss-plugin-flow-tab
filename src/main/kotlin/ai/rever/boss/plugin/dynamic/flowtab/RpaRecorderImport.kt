@@ -39,8 +39,8 @@ private data class RecConfig(
     val actions: List<RecAction> = emptyList()
 )
 
-/** One node to create when importing (type + display title + config). */
-data class ImportStep(val type: NodeType, val title: String, val config: JsonObject)
+/** One node to create when importing (registry kind-id + display title + config). */
+data class ImportStep(val kind: String, val title: String, val config: JsonObject)
 
 /** Result of converting a recording: the node chain + any skipped action types. */
 data class ImportResult(val steps: List<ImportStep>, val skipped: List<String>)
@@ -68,7 +68,7 @@ object RpaRecorderImport {
         if (firstNav != null) startIndex = 1
         steps.add(
             ImportStep(
-                NodeType.OPEN_BROWSER,
+                NodeType.OPEN_BROWSER.name,
                 if (startUrl.isNotBlank()) "Open ${shortUrl(startUrl)}" else "Open Browser",
                 buildJsonObject {
                     if (startUrl.isNotBlank()) put("url", startUrl)
@@ -89,17 +89,23 @@ object RpaRecorderImport {
         val (selType, selVal) = mapSelector(a.selector)
         val v = a.value.orEmpty()
         return when (a.type) {
-            "navigate" -> ImportStep(NodeType.NAVIGATE, a.name.ifBlank { "Navigate" },
+            "navigate" -> ImportStep(
+                NodeType.NAVIGATE.name, a.name.ifBlank { "Navigate" },
                 buildJsonObject { put("url", v) })
-            "click" -> ImportStep(NodeType.CLICK, a.name.ifBlank { "Click" },
+            "click" -> ImportStep(
+                NodeType.CLICK.name, a.name.ifBlank { "Click" },
                 buildJsonObject { put("selectorType", selType); put("selector", selVal) })
-            "input" -> ImportStep(NodeType.TYPE, a.name.ifBlank { "Type" },
+            "input" -> ImportStep(
+                NodeType.TYPE.name, a.name.ifBlank { "Type" },
                 buildJsonObject { put("selectorType", selType); put("selector", selVal); put("text", v) })
-            "select" -> ImportStep(NodeType.INJECT, a.name.ifBlank { "Select option" },
+            "select" -> ImportStep(
+                NodeType.INJECT.name, a.name.ifBlank { "Select option" },
                 buildJsonObject { put("script", selectJs(selType, selVal, v)) })
-            "scroll" -> ImportStep(NodeType.INJECT, a.name.ifBlank { "Scroll" },
+            "scroll" -> ImportStep(
+                NodeType.INJECT.name, a.name.ifBlank { "Scroll" },
                 buildJsonObject { put("script", scrollJs(v)) })
-            "run_script" -> ImportStep(NodeType.INJECT, a.name.ifBlank { "Run script" },
+            "run_script" -> ImportStep(
+                NodeType.INJECT.name, a.name.ifBlank { "Run script" },
                 buildJsonObject { put("script", v) })
             // No faithful Flow equivalent yet.
             "wait", "screenshot", "assert", "switch_frame" -> null

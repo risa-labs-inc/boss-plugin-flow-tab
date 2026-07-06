@@ -13,8 +13,14 @@ enum class RunMode {
     ONCE
 }
 
-/** Kind of input control the inspector renders for a config field. */
-enum class FieldType { TEXT, TEXTAREA, SELECT, BOOL }
+/**
+ * Kind of input control the inspector renders for a config field.
+ *
+ * [JSON] is a multiline raw-JSON editor for nested objects/arrays that don't fit a
+ * flat scalar field (tool inputs with structured schemas — see P1). [NUMBER] is a
+ * single-line numeric field. TEXT/TEXTAREA/SELECT/BOOL are unchanged.
+ */
+enum class FieldType { TEXT, TEXTAREA, SELECT, BOOL, JSON, NUMBER }
 
 /** Declarative config-field schema — rendered by the inspector, read by executors. */
 data class ConfigField(
@@ -158,10 +164,10 @@ const val NODE_PAD = 10f
 /** Full interactive width of a node (card + left/right port margins). */
 fun nodeOuterWidth(): Float = NODE_WIDTH + NODE_PAD * 2
 
-/** Total height of a node given its type (grows with its busiest side's port count). */
-fun nodeHeight(type: NodeType): Float {
-    val maxPorts = max(1, max(type.inputs, type.outputs))
-    val base = NODE_ROW_H + if (type.hasMetaRow()) NODE_META_H else 0f
+/** Total height of a node given its spec (grows with its busiest side's port count). */
+fun nodeHeight(spec: NodeSpec): Float {
+    val maxPorts = max(1, max(spec.inputs, spec.outputs))
+    val base = NODE_ROW_H + if (spec.hasMetaRow) NODE_META_H else 0f
     return base + (maxPorts - 1) * NODE_PORT_GAP
 }
 
@@ -174,21 +180,30 @@ fun portRowY(index: Int, count: Int, height: Float): Float =
     height * (index + 1) / (count + 1).toFloat()
 
 /** World position of input port [index] for a node whose top-left is (x, y). */
-fun inputPortPos(x: Float, y: Float, index: Int, type: NodeType): Offset =
-    Offset(x + NODE_PAD, y + portRowY(index, max(1, type.inputs), nodeHeight(type)))
+fun inputPortPos(x: Float, y: Float, index: Int, spec: NodeSpec): Offset =
+    Offset(x + NODE_PAD, y + portRowY(index, max(1, spec.inputs), nodeHeight(spec)))
 
 /** World position of output port [index] for a node whose top-left is (x, y). */
-fun outputPortPos(x: Float, y: Float, index: Int, type: NodeType): Offset =
-    Offset(x + NODE_PAD + NODE_WIDTH, y + portRowY(index, max(1, type.outputs), nodeHeight(type)))
+fun outputPortPos(x: Float, y: Float, index: Int, spec: NodeSpec): Offset =
+    Offset(x + NODE_PAD + NODE_WIDTH, y + portRowY(index, max(1, spec.outputs), nodeHeight(spec)))
 
 // ---------------------------------------------------------------------------
 // Serializable graph snapshot (persistence)
 // ---------------------------------------------------------------------------
 
+/**
+ * Serialized node. [type] is the registry **kind-id** (a String), not the old
+ * [NodeType] enum. Built-in kinds use the legacy enum names (`"HTTP"`, `"TRIGGER"`,
+ * …) as their ids, so graphs saved before the migration — which serialized the enum
+ * by name as `"type":"HTTP"` — decode unchanged: a kotlinx `String` field reads that
+ * exact JSON string. Dynamic kinds use namespaced ids (`"tool:boss:foo"`, `"agent"`).
+ * An id with no registered spec becomes a first-class "unavailable" node at load
+ * (it does not throw), and a clear per-node error at run.
+ */
 @Serializable
 data class NodeModel(
     val id: String,
-    val type: NodeType,
+    val type: String,
     val title: String,
     val x: Float,
     val y: Float,
@@ -210,9 +225,46 @@ data class EdgeModel(
     val toPort: Int
 )
 
+/**
+ * Optional metadata for a flow / lanager. Present on templates and agent-driven
+ * workflows; null for a plain ad-hoc canvas.
+ *
+ * @param inputs names of the values the flow expects to be supplied at run time
+ *   (used by lanager templates + the MCP `flow_run` contract).
+ */
+@Serializable
+data class FlowMeta(
+    val name: String = "",
+    val description: String = "",
+    val version: Int = 1,
+    val inputs: List<String> = emptyList()
+)
+
+/**
+ * Serialized graph.
+ *
+ * [schemaVersion] gates cross-version loads: it defaults to 1 so every graph saved
+ * before v2 (which has no such field) still decodes, and lets an older plugin build
+ * detect a newer graph and degrade gracefully instead of crashing on an unknown
+ * node kind-id. Bump it whenever the on-disk shape changes incompatibly.
+ */
 @Serializable
 data class GraphSnapshot(
     val nodes: List<NodeModel> = emptyList(),
     val edges: List<EdgeModel> = emptyList(),
-    val nextId: Long = 1L
+    val nextId: Long = 1L,
+    val schemaVersion: Int = 1,
+    val metadata: FlowMeta? = null
 )
+
+/**
+ * Highest on-disk [GraphSnapshot.schemaVersion] this build understands. Saves are
+ * written at this version (see [FlowGraphState.toSnapshot]); a graph whose version
+ * is *higher* was produced by a newer build with an incompatible shape (e.g. new
+ * node-kind semantics) and is refused gracefully rather than mis-loaded — the
+ * one-way-door protection for the enum→String `type` migration.
+ */
+const val SUPPORTED_SCHEMA_VERSION = 2
+
+/** True when this build can safely load [this] graph (its schema is not newer than we know). */
+fun GraphSnapshot.isSchemaSupported(): Boolean = schemaVersion <= SUPPORTED_SCHEMA_VERSION

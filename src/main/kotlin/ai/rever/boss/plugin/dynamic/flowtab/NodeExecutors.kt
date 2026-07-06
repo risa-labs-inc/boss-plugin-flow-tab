@@ -180,6 +180,37 @@ class ConfigReader(
     }
 
     fun bool(key: String): Boolean = raw(key).equals("true", ignoreCase = true)
+
+    /** [key] parsed as an integer, or [default] if absent/blank/non-numeric (a NUMBER field). */
+    fun int(key: String, default: Int = 0): Int = str(key).trim().toIntOrNull() ?: default
+
+    /** [key] parsed as a double, or [default] if absent/blank/non-numeric (a NUMBER field). */
+    fun double(key: String, default: Double = 0.0): Double = str(key).trim().toDoubleOrNull() ?: default
+
+    /**
+     * The raw config value for [key] as a JSON element, or null if absent. Nested
+     * objects/arrays are preserved exactly (unlike [str], which only reads scalars) —
+     * this is how a JSON-typed field's structured content reaches an executor (P1).
+     */
+    fun element(key: String): JsonElement? = config[key]
+
+    /**
+     * [key] as JSON **text**, ready to feed to a tool `argsJson`:
+     *  - a nested object/array is serialized to its JSON string,
+     *  - a JSON string field is returned unquoted with `{{ }}` interpolated (so a
+     *    JSON blob typed into a text/JSON field round-trips),
+     *  - a scalar is returned as its literal text.
+     * Returns [default] when the key is absent.
+     */
+    fun jsonText(key: String, default: String = ""): String {
+        val el = config[key] ?: return default
+        return when {
+            el is JsonPrimitive && el.isString ->
+                ExpressionEval.interpolate(el.content, item.json, outputsByTitle)
+            el is JsonPrimitive -> el.content
+            else -> el.toString()
+        }
+    }
 }
 
 /** Executes one node. Receives the current item's [cfg] and (for ONCE nodes) all [inputs]. */

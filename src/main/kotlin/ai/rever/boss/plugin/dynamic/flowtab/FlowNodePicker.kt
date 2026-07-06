@@ -67,8 +67,8 @@ fun FlowNodePicker(state: FlowGraphState) {
     val request = state.pickerRequest ?: return
     var query by remember(request) { mutableStateOf("") }
     val focusRequester = remember(request) { FocusRequester() }
-    val results = remember(query) {
-        NodeType.entries.filter {
+    val results = remember(query, state.registry.all().size) {
+        state.registry.all().filter {
             query.isBlank() || it.label.contains(query, ignoreCase = true) ||
                 it.description.contains(query, ignoreCase = true)
         }
@@ -151,8 +151,8 @@ fun FlowNodePicker(state: FlowGraphState) {
                         modifier = Modifier.padding(12.dp)
                     )
                 }
-                for (type in results) {
-                    PickerRow(type) { state.resolvePicker(type) }
+                for (spec in results) {
+                    PickerRow(spec) { state.resolvePicker(spec) }
                 }
             }
         }
@@ -160,7 +160,7 @@ fun FlowNodePicker(state: FlowGraphState) {
 }
 
 @Composable
-private fun PickerRow(type: NodeType, onClick: () -> Unit) {
+private fun PickerRow(spec: NodeSpec, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -170,15 +170,15 @@ private fun PickerRow(type: NodeType, onClick: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
-            modifier = Modifier.size(28.dp).clip(RoundedCornerShape(FlowTheme.rSm)).background(Color(type.accent)),
+            modifier = Modifier.size(28.dp).clip(RoundedCornerShape(FlowTheme.rSm)).background(Color(spec.accent)),
             contentAlignment = Alignment.Center
         ) {
-            Icon(type.icon(), null, tint = Color.White, modifier = Modifier.size(16.dp))
+            Icon(spec.icon(), null, tint = Color.White, modifier = Modifier.size(16.dp))
         }
         Spacer(Modifier.width(10.dp))
         Column {
-            Text(type.label, color = FlowTheme.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
-            Text(type.description, color = FlowTheme.TextFaint, fontSize = 11.sp)
+            Text(spec.label, color = FlowTheme.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
+            Text(spec.description, color = FlowTheme.TextFaint, fontSize = 11.sp)
         }
     }
 }
