@@ -1,6 +1,9 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import ai.rever.boss.plugin.api.McpToolDefinition
 import ai.rever.boss.plugin.api.McpToolRegistry
+import ai.rever.boss.plugin.api.McpToolResult
+import ai.rever.boss.plugin.api.RegisteredMcpTool
 import ai.rever.boss.plugin.api.PanelRegistry
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.PluginStorageFactory
@@ -11,6 +14,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -205,5 +210,65 @@ class FlowControllerTest {
         val runId = fc.startRun(tabId)
         awaitTerminal(fc, runId)
         assertTrue(storage.map.keys.any { it == "run:$runId" })
+    }
+
+    // ---- S2: run durability across controller instances ---------------------
+
+    @Test
+    fun `run status and result survive a fresh controller over the same storage`() = runBlocking {
+        val storage = FakeStorage()
+        val fc1 = controller(storage)
+        val tabId = fc1.createFlow()
+        val trig = fc1.addNode(tabId, "TRIGGER", JsonObject(emptyMap()))
+        val set = fc1.addNode(tabId, "SET", buildJsonObject { put("assignments", """{"g":"hi"}""") })
+        fc1.connect(tabId, trig, 0, set, 0)
+        val runId = fc1.startRun(tabId)
+        awaitTerminal(fc1, runId)
+
+        // A new controller (e.g. after a plugin reload) must read the persisted job back,
+        // not answer "Unknown runId" from an empty in-memory map (red-team S2).
+        val fc2 = controller(storage)
+        val job = fc2.runStatus(runId)
+        assertNotNull(job)
+        assertEquals(RunJobState.SUCCEEDED, job.state)
+        assertEquals("hi", fc2.runResult(runId)!![set]!!.output.single()["g"]!!.jsonPrimitive.content)
+    }
+
+    // ---- S1: headless controller must wire host (boss) tools -----------------
+
+    /** Minimal fake registry exposing one boss tool so syncBossTools has something to sync. */
+    private class FakeBossRegistry(name: String) : McpToolRegistry {
+        private val _tools = MutableStateFlow(
+            listOf(RegisteredMcpTool("prov", McpToolDefinition(name, "d", """{"type":"object"}""", true) { McpToolResult("ok", false) }))
+        )
+        override val tools: StateFlow<List<RegisteredMcpTool>> get() = _tools
+        override val allTools: StateFlow<List<RegisteredMcpTool>> get() = _tools
+        override val disabledToolNames: StateFlow<Set<String>> = MutableStateFlow(emptySet())
+        override fun setToolEnabled(toolName: String, enabled: Boolean) {}
+        override suspend fun invoke(toolName: String, arguments: String): McpToolResult = McpToolResult("ok", false)
+    }
+
+    private fun contextWithBossTool(storage: PluginStorageProvider, tool: String): PluginContext = object : PluginContext {
+        override val panelRegistry = PanelRegistry()
+        override val tabRegistry = TabRegistry()
+        override val pluginScope = scope
+        override val mcpToolRegistry: McpToolRegistry? = FakeBossRegistry(tool)
+        override val pluginStorageFactory = object : PluginStorageFactory {
+            override fun createStorage(pluginId: String): PluginStorageProvider = storage
+        }
+    }
+
+    @Test
+    fun `headless controller resolves boss tool node kinds so MCP flow_run can use them`() = runBlocking {
+        val storage = FakeStorage()
+        val ctx = contextWithBossTool(storage, "demo")
+        val controller = buildHeadlessController(ctx, PromptRegistry(storage), external = null, scope = scope)
+        // The tools StateFlow collector registers the kind asynchronously; wait for it.
+        withTimeout(2_000) {
+            while (controller.registry.resolve("tool:boss:demo").isUnavailable) delay(10)
+        }
+        val spec = controller.registry.resolve("tool:boss:demo")
+        assertTrue(!spec.isUnavailable, "boss tool kind must be registered on the headless registry")
+        assertNotNull(spec.executor, "boss tool node must be runnable via flow_run")
     }
 }

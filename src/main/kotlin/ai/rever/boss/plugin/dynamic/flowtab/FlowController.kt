@@ -156,11 +156,21 @@ class FlowController(
         return runId
     }
 
-    /** Current job for [runId] (state + error), or null if unknown. */
-    fun runStatus(runId: String): RunJob? = jobs[runId]
+    /**
+     * Current job for [runId], or null if unknown. Falls back to the persisted
+     * `run:<runId>` blob when the in-memory map has no entry (e.g. after a plugin
+     * reload), so advertised durability is real (red-team S2), then re-caches it.
+     */
+    suspend fun runStatus(runId: String): RunJob? =
+        jobs[runId] ?: loadJob(runId)?.also { jobs[runId] = it }
 
-    /** Per-node outputs for [runId], or null if unknown. */
-    fun runResult(runId: String): Map<String, NodeRunSnap>? = jobs[runId]?.nodes
+    /** Per-node outputs for [runId] (in-memory or read back from storage), or null. */
+    suspend fun runResult(runId: String): Map<String, NodeRunSnap>? = runStatus(runId)?.nodes
+
+    private suspend fun loadJob(runId: String): RunJob? {
+        val raw = storage?.getJson(runKey(runId)) ?: return null
+        return runCatching { json.decodeFromString(RunJob.serializer(), raw) }.getOrNull()
+    }
 
     // ---- internals ----------------------------------------------------------
 
@@ -183,4 +193,31 @@ class FlowController(
         const val GRAPH_PREFIX = "graph:"
         const val RUN_PREFIX = "run:"
     }
+}
+
+/**
+ * Assemble the headless [FlowController] used by the MCP authoring path with the SAME
+ * node kinds a UI tab has: built-ins + host (boss) registry tools + agent + lanager +
+ * external MCP tools. This is the single wiring point (red-team S1): previously the
+ * plugin built a controller that registered agent/lanager/external but never called
+ * [syncBossTools], so `flow_run` on a `tool:boss:*` node authored over MCP failed with
+ * "Unknown node kind" while the identical UI-authored flow ran fine. Keep every kind the
+ * UI can resolve resolvable here too.
+ */
+fun buildHeadlessController(
+    context: PluginContext,
+    prompts: PromptRegistry,
+    external: ExternalMcpManager?,
+    scope: CoroutineScope = context.pluginScope,
+): FlowController {
+    val controller = FlowController(context, scope)
+    // Host tools -> tool:boss:* kinds (the fix): reactively synced onto this registry.
+    syncBossTools(context, controller.registry, scope)
+    // Make agent + lanager kinds runnable in headless (MCP-driven) runs too, sharing
+    // the controller's registry so a lanager's sub-run resolves the same kinds.
+    controller.registry.register(defaultAgentNodeSpec(context, prompts, external))
+    controller.registry.register(lanagerNodeSpec(controller))
+    // Surface external MCP tools (flag-gated inside) as tool:ext:<server>/* kinds.
+    external?.let { syncExternalMcpTools(it, controller.registry, scope) }
+    return controller
 }

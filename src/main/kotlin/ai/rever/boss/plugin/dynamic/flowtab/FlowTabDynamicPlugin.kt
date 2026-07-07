@@ -72,15 +72,10 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         // gracefully — a host without an MCP registry ignores the registration.
         runCatching {
             val storage = context.pluginStorageFactory?.createStorage(FlowController.STORAGE_NAMESPACE)
-            val controller = FlowController(context)
             val prompts = PromptRegistry(storage)
-            // Make agent + lanager kinds runnable in headless (MCP-driven) runs too, sharing
-            // the controller's registry so a lanager's sub-run resolves the same kinds (P5).
-            controller.registry.register(defaultAgentNodeSpec(context, prompts, external))
-            controller.registry.register(lanagerNodeSpec(controller))
-            // Surface external MCP tools as headless nodes too (flag-gated inside refresh),
-            // so a Claude-Code-authored flow can wire `tool:ext:<server>/*` nodes.
-            external?.let { syncExternalMcpTools(it, controller.registry, context.pluginScope) }
+            // Single wiring point (S1): built-ins + boss tools + agent + lanager + external,
+            // so an MCP-authored flow_run resolves exactly what a UI-authored flow can.
+            val controller = buildHeadlessController(context, prompts, external)
             context.registerMcpToolProvider(FlowMcpToolProvider(controller, prompts))
 
             // The MCP *server* may be off by default; resolve its controller lazily and
