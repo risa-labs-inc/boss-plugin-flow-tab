@@ -77,7 +77,9 @@ class SessionRegistry(
                 openHeadless(service)
             }
         }
-        entries[id] = entry
+        // Re-opening an id must not orphan the prior browser (red-team S5): dispose the
+        // handle we're replacing before installing the new one.
+        entries.put(id, entry)?.let { prior -> runCatching { prior.closer.invoke() } }
         mutexFor(id)
         return id
     }

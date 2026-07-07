@@ -181,15 +181,26 @@ fun defaultAgentNodeSpec(
  * flat tool set spanning the host registry and the browser lane.
  */
 class MergedToolSource(private val sources: List<ToolSource>) : ToolSource {
+    /** name -> owning source, built during [list] so [invoke] is a lookup, not a re-scan
+     *  of every source (red-team S6: with external MCP that was a network call per invoke). */
+    private var routes: Map<String, ToolSource> = emptyMap()
+
     override suspend fun list(): List<ToolDescriptor> {
         val seen = HashSet<String>()
-        return sources.flatMap { it.list() }.filter { seen.add(it.ref.name) }
+        val descriptors = mutableListOf<ToolDescriptor>()
+        val table = LinkedHashMap<String, ToolSource>()
+        for (s in sources) for (d in s.list()) if (seen.add(d.ref.name)) {
+            descriptors += d
+            table[d.ref.name] = s
+        }
+        routes = table
+        return descriptors
     }
 
     override suspend fun invoke(name: String, argsJson: String): ToolResult {
-        for (s in sources) {
-            if (s.list().any { it.ref.name == name }) return s.invoke(name, argsJson)
-        }
-        return ToolResult("no tool '$name' in any source", isError = true)
+        // Refresh the route table once on a miss (a tool may have appeared since the last list).
+        val source = routes[name] ?: run { list(); routes[name] }
+        return source?.invoke(name, argsJson)
+            ?: ToolResult("no tool '$name' in any source", isError = true)
     }
 }

@@ -22,6 +22,7 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.time.Duration
 
 /** Thrown by an executor to fail its node with a clear message. */
 class ExecError(message: String) : Exception(message)
@@ -271,7 +272,9 @@ object NodeCatalog {
             val headers = parseHeaders(cfg.str("headers"))
             log("$method $url")
             val resp = withContext(Dispatchers.IO) {
-                val builder = HttpRequest.newBuilder(URI.create(url))
+                // Bounded so a hung endpoint can't stall the node (and, under MCP flow_run,
+                // the whole run) indefinitely — red-team S3.
+                val builder = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(60))
                 headers.forEach { (k, v) -> builder.header(k, v) }
                 val pub = if (method == "GET" || method == "DELETE") {
                     HttpRequest.BodyPublishers.noBody()
@@ -279,7 +282,8 @@ object NodeCatalog {
                     HttpRequest.BodyPublishers.ofString(body)
                 }
                 builder.method(method, pub)
-                HttpClient.newHttpClient().send(builder.build(), HttpResponse.BodyHandlers.ofString())
+                val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
+                client.send(builder.build(), HttpResponse.BodyHandlers.ofString())
             }
             val parsedBody = runCatching { EXEC_JSON.parseToJsonElement(resp.body()) }
                 .getOrElse { JsonPrimitive(resp.body()) }

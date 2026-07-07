@@ -267,6 +267,9 @@ class FlowTabComponent(
                         plan, edges,
                         humanize = realistic,
                         onVisibleTab = { id -> visibleTabId = id },
+                        // Seed this flow's own id so a lanager pointing back at it is caught
+                        // as a cycle at depth 0, not only one level deeper (red-team S7).
+                        ancestry = setOf(config.id),
                     ) { id, run -> state.runStates[id] = run }
                 } catch (ce: CancellationException) {
                     // stopped by user

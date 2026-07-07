@@ -20,6 +20,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -144,6 +145,16 @@ class SessionRegistryTest {
     fun `open without a browserService errors`() = runBlocking {
         val reg = SessionRegistry(Ctx(null))
         assertTrue(runCatching { reg.open(headless = true) }.exceptionOrNull() is ExecError)
+    }
+
+    @Test
+    fun `reopening an existing session id disposes the previous handle`() = runBlocking {
+        val (reg, svc) = registry { FakePage() }
+        reg.open(headless = true, id = "s")
+        reg.open(headless = true, id = "s") // reopen same id — must not orphan the first browser
+        assertEquals(2, svc.pages.size)
+        assertTrue(svc.pages[0].disposed, "previous handle disposed on reopen (no leak — red-team S5)")
+        assertFalse(svc.pages[1].disposed)
     }
 
     @Test

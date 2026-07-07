@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.test.Test
@@ -105,6 +106,20 @@ class AgentRuntimeTest {
 
         assertEquals(StopReason.TOKEN_BUDGET, result.stopReason)
         assertTrue(result.usage.total >= 150)
+    }
+
+    @Test
+    fun `a provider step that hangs is bounded by the wall-clock budget`() = runBlocking {
+        // Without a per-call timeout the budget is only checked BETWEEN steps, so a hung
+        // model/tool call runs unbounded (red-team S3). The runtime must interrupt it.
+        val source = RecordingSource(listOf(desc("x")))
+        val provider = FakeProvider { _, _, _, _ -> delay(10_000); AssistantTurn(text = "too late") }
+        val started = System.currentTimeMillis()
+        val result = AgentRuntime(provider, source, AgentBudget(timeoutMs = 200))
+            .run(system = "s", input = "go", allowlist = setOf("x"))
+        val elapsed = System.currentTimeMillis() - started
+        assertEquals(StopReason.TIMEOUT, result.stopReason)
+        assertTrue(elapsed < 3_000, "hung step must be cut near the budget, not after the full hang (was ${elapsed}ms)")
     }
 
     // ---- tool output is data, not instructions ------------------------------

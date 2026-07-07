@@ -18,6 +18,7 @@ import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import java.net.URI
 import java.net.http.HttpClient
+import java.time.Duration
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.util.concurrent.atomic.AtomicInteger
@@ -85,7 +86,9 @@ class AnthropicProvider(
     private val maxTokens: Int = 4096,
     private val keyName: String = DEFAULT_KEY_NAME,
     private val endpoint: String = ENDPOINT,
-    private val http: HttpClient = HttpClient.newHttpClient(),
+    private val http: HttpClient = HttpClient.newBuilder()
+        .connectTimeout(Duration.ofSeconds(30))
+        .build(),
 ) : AgentProvider {
 
     override suspend fun step(system: String, messages: List<AgentMessage>, tools: List<ToolDescriptor>): AssistantTurn {
@@ -105,6 +108,7 @@ class AnthropicProvider(
                 .header("x-api-key", apiKey)
                 .header("anthropic-version", API_VERSION)
                 .header("content-type", "application/json")
+                .timeout(Duration.ofSeconds(120)) // backstop; AgentRuntime also bounds the call (S3)
                 .POST(HttpRequest.BodyPublishers.ofString(body))
                 .build()
             http.send(req, HttpResponse.BodyHandlers.ofString())
@@ -182,7 +186,7 @@ class AnthropicProvider(
     }
 
     companion object {
-        const val DEFAULT_MODEL = "claude-3-5-sonnet-latest"
+        const val DEFAULT_MODEL = "claude-sonnet-5"
         const val DEFAULT_KEY_NAME = "ANTHROPIC_API_KEY"
         const val ENDPOINT = "https://api.anthropic.com/v1/messages"
         const val API_VERSION = "2023-06-01"

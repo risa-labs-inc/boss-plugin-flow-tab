@@ -1,7 +1,6 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -32,7 +31,6 @@ object LanagerNode {
 class LanagerNodeExecutor(
     private val controller: FlowController,
     private val maxDepth: Int = LanagerNode.DEFAULT_MAX_DEPTH,
-    private val timeoutMs: Long = 120_000,
 ) : NodeExecutor {
 
     override suspend fun run(
@@ -64,9 +62,16 @@ class LanagerNodeExecutor(
         )
     }
 
-    private suspend fun awaitTerminal(runId: String): RunJob = withTimeout(timeoutMs) {
+    /**
+     * Await the sub-run's terminal state. No arbitrary wall-clock cap here (red-team S4):
+     * a legitimately long sub-flow (a real browser DAG — the exact F1 scenario) must not be
+     * false-failed and left orphaned. The sub-run always reaches a terminal state (its body
+     * is wrapped so a throw becomes FAILED), and its own nodes are individually bounded
+     * (agent budgets, HTTP/element-wait timeouts), so this cannot hang indefinitely.
+     */
+    private suspend fun awaitTerminal(runId: String): RunJob {
         while (controller.runStatus(runId)?.state == RunJobState.RUNNING) delay(POLL_MS)
-        controller.runStatus(runId) ?: throw ExecError("lanager: sub-run '$runId' vanished")
+        return controller.runStatus(runId) ?: throw ExecError("lanager: sub-run '$runId' vanished")
     }
 
     private companion object {

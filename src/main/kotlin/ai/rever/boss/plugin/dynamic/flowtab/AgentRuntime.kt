@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 
 /**
@@ -111,7 +112,12 @@ class AgentRuntime(
             if (System.currentTimeMillis() - started >= budget.timeoutMs)
                 return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
 
-            val turn = provider.step(system, messages.toList(), allowed)
+            // Bound the call itself, not just the gaps between steps: a hung model call
+            // must be interrupted at the wall-clock budget (red-team S3).
+            val stepRemaining = budget.timeoutMs - (System.currentTimeMillis() - started)
+            if (stepRemaining <= 0) return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
+            val turn = withTimeoutOrNull(stepRemaining) { provider.step(system, messages.toList(), allowed) }
+                ?: return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
             steps++
             turn.usage?.let { usage += it }
             turn.text?.let { lastText = it }
@@ -128,8 +134,13 @@ class AgentRuntime(
                     ToolOutcome(c.id, c.name, "tool '${c.name}' is not in this agent's allowlist", isError = true)
                 } else {
                     log("→ ${c.name} ${c.argsJson}")
-                    val r = runCatching { source.invoke(c.name, c.argsJson) }
-                        .getOrElse { ToolResult(it.message ?: it.toString(), isError = true) }
+                    // A hung tool call is bounded by the remaining budget too (S3).
+                    val toolRemaining = budget.timeoutMs - (System.currentTimeMillis() - started)
+                    val r = if (toolRemaining <= 0) ToolResult("agent wall-clock budget exceeded", isError = true)
+                    else runCatching {
+                        withTimeoutOrNull(toolRemaining) { source.invoke(c.name, c.argsJson) }
+                            ?: ToolResult("tool '${c.name}' timed out", isError = true)
+                    }.getOrElse { ToolResult(it.message ?: it.toString(), isError = true) }
                     ToolOutcome(c.id, c.name, r.text, r.isError)
                 }
             }
