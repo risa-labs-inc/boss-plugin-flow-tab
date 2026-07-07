@@ -104,7 +104,11 @@ private val RunGreen = Color(0xFF2E7D32)
 class FlowTabComponent(
     private val ctx: ComponentContext,
     override val config: TabInfo,
-    private val context: PluginContext
+    private val context: PluginContext,
+    /** Shared external-MCP client (P7); null on hosts without storage or when the plugin
+     *  couldn't stand it up. Its tools surface as palette nodes + an agent tool lane,
+     *  flag-gated OFF by default. */
+    private val externalMcp: ExternalMcpManager? = null,
 ) : TabComponentWithUI, ComponentContext by ctx {
 
     override val tabTypeInfo: TabTypeInfo = FlowTabType
@@ -151,9 +155,12 @@ class FlowTabComponent(
         // degrades cleanly to built-ins only. The collector is tied to [coroutineScope]
         // and cancelled on destroy.
         runCatching { syncBossTools(context, registry, coroutineScope) }
+        // Surface external MCP tools (P7) as palette nodes too — flag-gated inside refresh,
+        // so nothing connects until the user enables external MCP and adds a server.
+        externalMcp?.let { runCatching { syncExternalMcpTools(it, registry, coroutineScope) } }
         // Register the agent + lanager kinds so they appear in the palette and dispatch.
         runCatching {
-            registry.register(defaultAgentNodeSpec(context, prompts))
+            registry.register(defaultAgentNodeSpec(context, prompts, externalMcp))
             registry.register(lanagerNodeSpec(controller))
         }
         lifecycle.subscribe(

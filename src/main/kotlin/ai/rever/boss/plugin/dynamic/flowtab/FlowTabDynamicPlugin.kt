@@ -3,6 +3,8 @@ package ai.rever.boss.plugin.dynamic.flowtab
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.McpServerController
 import ai.rever.boss.plugin.api.PluginContext
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Flow Tab dynamic plugin - Loaded from external JAR.
@@ -28,13 +30,26 @@ class FlowTabDynamicPlugin : DynamicPlugin {
     override val url: String = "https://github.com/risa-labs-inc/boss-plugin-flow-tab"
 
     private var pluginContext: PluginContext? = null
+    /** Shared external-MCP client (P7), feature-flagged OFF by default. One instance is
+     *  threaded into every Flow tab + the headless MCP path so external servers are
+     *  connected once and reaped once (red-team F9). Null on a host without storage. */
+    private var externalMcp: ExternalMcpManager? = null
 
     override fun register(context: PluginContext) {
         pluginContext = context
 
+        // Bring up the shared external-MCP manager (does not connect anything until the
+        // feature flag is enabled and servers are configured). Kept as a field so both
+        // the tab UI and the headless MCP path share it and dispose() reaps its children.
+        val external = runCatching {
+            val storage = context.pluginStorageFactory?.createStorage(FlowController.STORAGE_NAMESPACE)
+            ExternalMcpManager(storage, SecretResolver.fromSecrets(context), SettingsStore(storage))
+        }.getOrNull()
+        externalMcp = external
+
         // Register the main-panel TAB TYPE that renders the canvas.
         context.tabRegistry.registerTabType(FlowTabType) { tabInfo, ctx ->
-            FlowTabComponent(ctx, tabInfo, context)
+            FlowTabComponent(ctx, tabInfo, context, external)
         }
 
         // Clicking the "Flow" sidebar item opens a Flow tab *directly* — the
@@ -61,8 +76,11 @@ class FlowTabDynamicPlugin : DynamicPlugin {
             val prompts = PromptRegistry(storage)
             // Make agent + lanager kinds runnable in headless (MCP-driven) runs too, sharing
             // the controller's registry so a lanager's sub-run resolves the same kinds (P5).
-            controller.registry.register(defaultAgentNodeSpec(context, prompts))
+            controller.registry.register(defaultAgentNodeSpec(context, prompts, external))
             controller.registry.register(lanagerNodeSpec(controller))
+            // Surface external MCP tools as headless nodes too (flag-gated inside refresh),
+            // so a Claude-Code-authored flow can wire `tool:ext:<server>/*` nodes.
+            external?.let { syncExternalMcpTools(it, controller.registry, context.pluginScope) }
             context.registerMcpToolProvider(FlowMcpToolProvider(controller, prompts))
 
             // The MCP *server* may be off by default; resolve its controller lazily and
@@ -81,6 +99,12 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         pluginContext?.tabRegistry?.unregisterTabType(FlowTabType.typeId)
         pluginContext?.panelRegistry?.unregisterPanel(FlowLauncherInfo.id)
         runCatching { pluginContext?.unregisterMcpToolProvider(FlowMcpToolProvider.PROVIDER_ID) }
+        // Reap any external MCP child processes / sockets (red-team F9), bounded so a
+        // hung server can't block plugin teardown.
+        externalMcp?.let { mgr ->
+            runCatching { runBlocking { withTimeoutOrNull(5_000) { mgr.disposeAll() } } }
+        }
+        externalMcp = null
         FlowLauncherInfo.onLaunch = null // drop the captured context to avoid a leak
         pluginContext = null
     }

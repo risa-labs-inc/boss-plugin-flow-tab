@@ -152,7 +152,14 @@ fun agentNodeSpec(
  * per-run browser lane ([FlowBrowserToolSource] on the run's own [SessionRegistry]).
  * The [AgentRuntime]'s allowlist then narrows that merged set to what the node permits.
  */
-fun defaultAgentNodeSpec(context: PluginContext, prompts: PromptRegistry?): NodeSpec {
+fun defaultAgentNodeSpec(
+    context: PluginContext,
+    prompts: PromptRegistry?,
+    // Optional external-MCP lane (P7). When supplied (and its feature flag is on so it has
+    // connected servers), the agent can also call `ext:<server>/*` tools. Null keeps the
+    // agent on the in-app tool set only.
+    external: ExternalMcpManager? = null,
+): NodeSpec {
     val secrets = SecretResolver.fromSecrets(context)
     return agentNodeSpec(
         prompts = prompts,
@@ -161,6 +168,7 @@ fun defaultAgentNodeSpec(context: PluginContext, prompts: PromptRegistry?): Node
             val lanes = buildList {
                 context.mcpToolRegistry?.let { add(BossRegistryToolSource(it)) }
                 add(FlowBrowserToolSource(ctx.sessions))
+                external?.let { add(it) }
             }
             MergedToolSource(lanes)
         },
