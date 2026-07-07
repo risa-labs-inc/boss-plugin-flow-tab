@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 2,
+  "metadata": {
+    "name": "Web Scrape",
+    "description": "Open a page, navigate to a URL, and extract a heading into a field.",
+    "version": 1,
+    "inputs": ["url"]
+  },
+  "nextId": 8,
+  "nodes": [
+    { "id": "n1", "type": "TRIGGER", "title": "Trigger", "x": 200.0, "y": 220.0, "config": {} },
+    { "id": "n2", "type": "OPEN_BROWSER", "title": "Open Browser", "x": 520.0, "y": 220.0, "config": { "url": "https://example.com", "headless": "false" } },
+    { "id": "n3", "type": "NAVIGATE", "title": "Navigate", "x": 840.0, "y": 220.0, "config": { "url": "{{ $json.url }}" } },
+    { "id": "n4", "type": "EXTRACT", "title": "Extract", "x": 1160.0, "y": 220.0, "config": { "selectorType": "css", "selector": "h1", "mode": "text", "field": "title", "multiple": "false" } }
+  ],
+  "edges": [
+    { "id": "e5", "fromNode": "n1", "fromPort": 0, "toNode": "n2", "toPort": 0 },
+    { "id": "e6", "fromNode": "n2", "fromPort": 0, "toNode": "n3", "toPort": 0 },
+    { "id": "e7", "fromNode": "n3", "fromPort": 0, "toNode": "n4", "toPort": 0 }
+  ]
+}
