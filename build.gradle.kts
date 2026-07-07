@@ -39,7 +39,7 @@ val bundled: Configuration by configurations.creating
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.42.jar"))
+        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.56.jar"))
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
@@ -84,7 +84,7 @@ dependencies {
     // The boss-plugin-api is compileOnly for main (host-provided); tests need it
     // on the classpath to build a fake PluginContext / BrowserService / BrowserHandle.
     if (useLocalDependencies) {
-        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.42.jar"))
+        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.56.jar"))
     } else {
         testImplementation(files("build/downloaded-deps/boss-plugin-api.jar"))
     }
