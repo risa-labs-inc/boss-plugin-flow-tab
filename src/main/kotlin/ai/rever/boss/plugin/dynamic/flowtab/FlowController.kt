@@ -128,7 +128,7 @@ class FlowController(
      * flow or an executor throw becomes a [RunJobState.FAILED] job (never a crash); a
      * run in which any node errors is FAILED too, but always reaches a terminal state.
      */
-    fun startRun(tabId: String): String {
+    fun startRun(tabId: String, depth: Int = 0, ancestry: Set<String> = emptySet()): String {
         val runId = "run-${UUID.randomUUID()}"
         jobs[runId] = RunJob(runId, tabId, RunJobState.RUNNING)
         scope.launch(Dispatchers.Default) {
@@ -136,7 +136,11 @@ class FlowController(
                 val snap = getFlow(tabId) ?: throw IllegalStateException("No flow '$tabId'")
                 val plan = snap.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
                 val states = ConcurrentHashMap<String, NodeRun>()
-                FlowExecutor(context, registry).run(plan, snap.edges) { id, r -> states[id] = r }
+                // This flow is now on the call stack: a nested lanager pointing back at it
+                // is a cycle. Depth is threaded so the nesting bound can be enforced.
+                FlowExecutor(context, registry).run(
+                    plan, snap.edges, depth = depth, ancestry = ancestry + tabId,
+                ) { id, r -> states[id] = r }
                 val firstError = states.values.firstOrNull { it.status == RunStatus.ERROR }
                 RunJob(
                     runId = runId,

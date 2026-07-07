@@ -56,6 +56,10 @@ class FlowExecutor(
         edges: List<EdgeModel>,
         humanize: Boolean = false,
         onVisibleTab: (String?) -> Unit = {},
+        /** Nesting level of this run (0 top-level); a lanager sub-run passes parent+1. */
+        depth: Int = 0,
+        /** Flow ids already on the call stack, so a nested lanager can detect cycles. */
+        ancestry: Set<String> = emptySet(),
         onStatus: (nodeId: String, NodeRun) -> Unit
     ) {
         val byId = nodes.associateBy { it.id }
@@ -70,6 +74,8 @@ class FlowExecutor(
         val ctx = RunContext(
             context,
             onVisibleTab = onVisibleTab,
+            depth = depth,
+            ancestry = ancestry,
         )
 
         try {

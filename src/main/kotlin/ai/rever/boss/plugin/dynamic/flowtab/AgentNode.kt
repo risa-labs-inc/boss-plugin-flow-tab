@@ -1,0 +1,187 @@
+package ai.rever.boss.plugin.dynamic.flowtab
+
+import ai.rever.boss.plugin.api.PluginContext
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
+
+/**
+ * Config keys + constants for the `agent` node. Per red-team F6, an agent's entire
+ * configuration lives inside `node.config` (no sidecar map): the prompt (inline or a
+ * [PromptRegistry] id), the tool allowlist, the model, and the run budget. `__`-free
+ * keys so they render as ordinary inspector fields.
+ */
+object AgentNode {
+    const val KIND = "agent"
+
+    const val PROMPT_ID_KEY = "promptId"
+    const val SYSTEM_KEY = "system"
+    const val INPUT_KEY = "input"
+    const val ALLOWLIST_KEY = "toolAllowlist"
+    const val MODEL_KEY = "model"
+    const val MAX_STEPS_KEY = "maxSteps"
+    const val TIMEOUT_KEY = "timeoutMs"
+    const val MAX_TOKENS_KEY = "maxTokens"
+
+    const val ACCENT = 0xFF6D4AFF
+
+    val CONFIG_FIELDS: List<ConfigField> = listOf(
+        ConfigField(PROMPT_ID_KEY, "Prompt id (optional)", FieldType.TEXT, placeholder = "a saved prompt's id"),
+        ConfigField(SYSTEM_KEY, "System prompt (inline)", FieldType.TEXTAREA, placeholder = "You are…"),
+        ConfigField(INPUT_KEY, "Input", FieldType.TEXTAREA, placeholder = "task, or {{ \$json.text }}"),
+        ConfigField(ALLOWLIST_KEY, "Tool allowlist", FieldType.JSON, placeholder = """["tool_a","tool_b"]"""),
+        ConfigField(MODEL_KEY, "Model", FieldType.TEXT, default = AnthropicProvider.DEFAULT_MODEL),
+        ConfigField(MAX_STEPS_KEY, "Max steps", FieldType.NUMBER, default = "8"),
+        ConfigField(TIMEOUT_KEY, "Timeout (ms)", FieldType.NUMBER, default = "120000"),
+        ConfigField(MAX_TOKENS_KEY, "Max tokens", FieldType.NUMBER, placeholder = "unbounded if blank"),
+    )
+}
+
+/**
+ * Parsed agent configuration for one run: the resolved [input], the tool [allowlist],
+ * the [model], the [budget], and the prompt source ([promptId] or inline [system]).
+ */
+data class AgentSettings(
+    val promptId: String?,
+    val system: String,
+    val input: String,
+    val allowlist: Set<String>,
+    val model: String,
+    val budget: AgentBudget,
+)
+
+/**
+ * Executor for an `agent` node. Resolves the system prompt (a [PromptRegistry] id if
+ * given, else the inline field), builds an [AgentRuntime] from the per-node [providerFor]
+ * and a [toolSourceFor] (its own tool lane — boss registry + its own browser session in
+ * production), runs the bounded loop, and emits the final text as an [Item]. The prompt
+ * and allowlist are read straight from `node.config` (F6).
+ *
+ * [providerFor]/[toolSourceFor] are injected so tests drive a [FakeProvider] + a fake
+ * source, while production wires an [AnthropicProvider] + a merged, session-backed source.
+ */
+class AgentNodeExecutor(
+    private val prompts: PromptRegistry?,
+    private val providerFor: (AgentSettings) -> AgentProvider,
+    private val toolSourceFor: (RunContext) -> ToolSource,
+) : NodeExecutor {
+
+    override suspend fun run(
+        ctx: RunContext,
+        cfg: ConfigReader,
+        inputs: List<Item>,
+        log: (String) -> Unit,
+    ): List<Item> {
+        val settings = parse(cfg, inputs)
+        val system = resolveSystem(settings)
+        val provider = providerFor(settings)
+        val source = toolSourceFor(ctx)
+        val result = AgentRuntime(provider, source, settings.budget)
+            .run(system = system, input = settings.input, allowlist = settings.allowlist, log = log)
+        log("agent stopped: ${result.stopReason} (${result.steps} step(s), ${result.toolCalls} tool call(s))")
+        return listOf(
+            Item(buildJsonObject {
+                put("text", result.finalText)
+                put("stopReason", result.stopReason.name)
+                put("steps", result.steps)
+                put("toolCalls", result.toolCalls)
+            })
+        )
+    }
+
+    private suspend fun resolveSystem(settings: AgentSettings): String {
+        val fromId = settings.promptId?.takeIf { it.isNotBlank() }
+            ?.let { prompts?.get(it) }
+            ?.let { composeSystemPrompt(it) }
+        return fromId ?: settings.system
+    }
+
+    private fun parse(cfg: ConfigReader, inputs: List<Item>): AgentSettings {
+        val inlineInput = cfg.str(AgentNode.INPUT_KEY)
+        val input = inlineInput.ifBlank { inputs.firstOrNull()?.json?.toString() ?: "" }
+        return AgentSettings(
+            promptId = cfg.str(AgentNode.PROMPT_ID_KEY).ifBlank { null },
+            system = cfg.str(AgentNode.SYSTEM_KEY),
+            input = input,
+            allowlist = parseAllowlist(cfg),
+            model = cfg.str(AgentNode.MODEL_KEY).ifBlank { AnthropicProvider.DEFAULT_MODEL },
+            budget = AgentBudget(
+                maxSteps = cfg.int(AgentNode.MAX_STEPS_KEY, 8),
+                timeoutMs = cfg.str(AgentNode.TIMEOUT_KEY).trim().toLongOrNull() ?: 120_000,
+                maxTokens = cfg.int(AgentNode.MAX_TOKENS_KEY, Int.MAX_VALUE),
+            ),
+        )
+    }
+
+    /** Allowlist as a JSON array of names, or a comma/newline-separated string. */
+    private fun parseAllowlist(cfg: ConfigReader): Set<String> =
+        when (val el = cfg.element(AgentNode.ALLOWLIST_KEY)) {
+            is JsonArray -> el.mapNotNull { (it as? JsonPrimitive)?.content?.trim() }.filter { it.isNotEmpty() }.toSet()
+            is JsonPrimitive -> el.content.split(',', '\n').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
+            else -> emptySet()
+        }
+}
+
+/**
+ * Build the `agent` [NodeSpec] with injected dependencies (used by tests and by the
+ * production wiring below). [providerFor] resolves an [AgentProvider] from the parsed
+ * settings; [toolSourceFor] yields the tool lane for a run (bound to its [RunContext]
+ * so an agent can drive its own browser session).
+ */
+fun agentNodeSpec(
+    prompts: PromptRegistry?,
+    providerFor: (AgentSettings) -> AgentProvider,
+    toolSourceFor: (RunContext) -> ToolSource,
+): NodeSpec = NodeSpec(
+    id = AgentNode.KIND,
+    label = "Agent",
+    inputs = 1,
+    outputs = 1,
+    accent = AgentNode.ACCENT,
+    description = "Run an LLM agent: a bounded tool-loop over an allowlist of tools.",
+    runMode = RunMode.PER_ITEM,
+    hasMetaRow = false,
+    configFields = AgentNode.CONFIG_FIELDS,
+    executor = AgentNodeExecutor(prompts, providerFor, toolSourceFor),
+)
+
+/**
+ * Production `agent` spec: an [AnthropicProvider] keyed from the host secret vault, over
+ * a [MergedToolSource] of the host registry ([BossRegistryToolSource]) plus a
+ * per-run browser lane ([FlowBrowserToolSource] on the run's own [SessionRegistry]).
+ * The [AgentRuntime]'s allowlist then narrows that merged set to what the node permits.
+ */
+fun defaultAgentNodeSpec(context: PluginContext, prompts: PromptRegistry?): NodeSpec {
+    val secrets = SecretResolver.fromSecrets(context)
+    return agentNodeSpec(
+        prompts = prompts,
+        providerFor = { settings -> AnthropicProvider(secrets, model = settings.model) },
+        toolSourceFor = { ctx ->
+            val lanes = buildList {
+                context.mcpToolRegistry?.let { add(BossRegistryToolSource(it)) }
+                add(FlowBrowserToolSource(ctx.sessions))
+            }
+            MergedToolSource(lanes)
+        },
+    )
+}
+
+/**
+ * Fan-in over several [ToolSource]s: [list] concatenates (first-wins on a name clash);
+ * [invoke] routes by matching the tool name to the owning source. Lets an agent see one
+ * flat tool set spanning the host registry and the browser lane.
+ */
+class MergedToolSource(private val sources: List<ToolSource>) : ToolSource {
+    override suspend fun list(): List<ToolDescriptor> {
+        val seen = HashSet<String>()
+        return sources.flatMap { it.list() }.filter { seen.add(it.ref.name) }
+    }
+
+    override suspend fun invoke(name: String, argsJson: String): ToolResult {
+        for (s in sources) {
+            if (s.list().any { it.ref.name == name }) return s.invoke(name, argsJson)
+        }
+        return ToolResult("no tool '$name' in any source", isError = true)
+    }
+}

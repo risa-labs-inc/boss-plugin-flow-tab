@@ -59,6 +59,10 @@ class FlowTabDynamicPlugin : DynamicPlugin {
             val storage = context.pluginStorageFactory?.createStorage(FlowController.STORAGE_NAMESPACE)
             val controller = FlowController(context)
             val prompts = PromptRegistry(storage)
+            // Make agent + lanager kinds runnable in headless (MCP-driven) runs too, sharing
+            // the controller's registry so a lanager's sub-run resolves the same kinds (P5).
+            controller.registry.register(defaultAgentNodeSpec(context, prompts))
+            controller.registry.register(lanagerNodeSpec(controller))
             context.registerMcpToolProvider(FlowMcpToolProvider(controller, prompts))
 
             // The MCP *server* may be off by default; resolve its controller lazily and

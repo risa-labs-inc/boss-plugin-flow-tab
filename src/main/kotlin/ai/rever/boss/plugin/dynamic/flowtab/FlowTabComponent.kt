@@ -125,6 +125,13 @@ class FlowTabComponent(
     private val registry = builtinNodeRegistry()
     private val state = FlowGraphState(registry)
     private val executor = FlowExecutor(context, registry)
+    // Prompt store + a headless controller sharing this tab's registry, so `agent` and
+    // `lanager` nodes (P5) resolve the same kinds the canvas does. The lanager runs its
+    // sub-flow through this controller (async, off the MCP fence).
+    private val prompts = PromptRegistry(
+        runCatching { context.pluginStorageFactory?.createStorage(FlowController.STORAGE_NAMESPACE) }.getOrNull()
+    )
+    private val controller = FlowController(context, coroutineScope, registry)
     private var runJob: Job? = null
     private var initialized = false
     // "Realistic" mode: pace the run with human-like delays between steps, so it's
@@ -140,6 +147,11 @@ class FlowTabComponent(
         // degrades cleanly to built-ins only. The collector is tied to [coroutineScope]
         // and cancelled on destroy.
         runCatching { syncBossTools(context, registry, coroutineScope) }
+        // Register the agent + lanager kinds so they appear in the palette and dispatch.
+        runCatching {
+            registry.register(defaultAgentNodeSpec(context, prompts))
+            registry.register(lanagerNodeSpec(controller))
+        }
         lifecycle.subscribe(
             object : Lifecycle.Callbacks {
                 override fun onDestroy() {

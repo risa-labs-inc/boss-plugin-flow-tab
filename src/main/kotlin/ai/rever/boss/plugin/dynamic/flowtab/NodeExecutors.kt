@@ -76,6 +76,13 @@ class RunContext(
     /** The N-session store this run draws from. Defaults to a fresh registry so tests
      *  and the ad-hoc executor path work without threading one through. */
     val sessions: SessionRegistry = SessionRegistry(context, onVisibleTab),
+    /** Nesting level of this run: 0 for a top-level run, +1 for each enclosing lanager.
+     *  A [LanagerNode] uses it to enforce a cross-flow depth limit (plan §08). */
+    val depth: Int = 0,
+    /** Flow ids currently executing in this call stack, *including this run's own flow*.
+     *  A [LanagerNode] refuses to launch a sub-flow already in here — cycle detection so
+     *  nested lanagers can't recurse unbounded. */
+    val ancestry: Set<String> = emptySet(),
 ) {
     /** The id of this run's default browser session in [sessions] (native nodes use it). */
     val defaultSessionId: String = sessions.newSessionId()
