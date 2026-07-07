@@ -1,0 +1,167 @@
+package ai.rever.boss.plugin.dynamic.flowtab
+
+import ai.rever.boss.plugin.api.McpToolArgs
+import ai.rever.boss.plugin.api.McpToolDefinition
+import ai.rever.boss.plugin.api.McpToolHandler
+import ai.rever.boss.plugin.api.McpToolProvider
+import ai.rever.boss.plugin.api.McpToolResult
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
+
+/**
+ * The fixed, generic set of MCP tools Flow registers into the host's `boss` server so
+ * an attached agent (Claude Code) can author and run flows and prompts. Names take
+ * ids/kinds as **arguments** — it is deliberately NOT a tool-per-artifact surface,
+ * because [McpToolProvider.tools] is queried once and the bridge dedups first-wins
+ * (red-team F7). Every name is `flow_`/`prompt_`-prefixed to dodge the 15 reserved
+ * boss tool names and cross-plugin collisions.
+ *
+ * All handlers are storage-seated via [FlowController] (no open tab needed) and async
+ * for runs (F1: `flow_run` returns a runId, the agent polls `flow_status`/`flow_result`).
+ * Every handler is wrapped so a bad argument yields an `isError` [McpToolResult] rather
+ * than throwing across the MCP boundary.
+ */
+class FlowMcpToolProvider(
+    private val controller: FlowController,
+    private val prompts: PromptRegistry,
+    override val providerId: String = PROVIDER_ID,
+) : McpToolProvider {
+
+    private val json = Json { ignoreUnknownKeys = true; isLenient = true; encodeDefaults = true }
+
+    override fun tools(): List<McpToolDefinition> = listOf(
+        def("flow_create", "Create a new empty flow. Optional name/description. Returns {tabId}.",
+            schema("""{"name":{"type":"string"},"description":{"type":"string"}}"""), readOnly = false) { a ->
+            val o = a.obj()
+            val meta = o.metaOrNull()
+            ok(buildJsonObject { put("tabId", controller.createFlow(meta)) })
+        },
+        def("flow_add_node", "Add a node of the given kind-id to a flow. Returns {nodeId}. " +
+            "config is an object of the node's config fields.",
+            schema("""{"tabId":{"type":"string"},"kind":{"type":"string"},"config":{"type":"object"}}""",
+                required = listOf("tabId", "kind")), readOnly = false) { a ->
+            val o = a.obj()
+            val tabId = o.str("tabId") ?: return@def err("flow_add_node requires 'tabId'")
+            val kind = o.str("kind") ?: return@def err("flow_add_node requires 'kind'")
+            val config = o["config"] as? JsonObject ?: JsonObject(emptyMap())
+            ok(buildJsonObject { put("nodeId", controller.addNode(tabId, kind, config)) })
+        },
+        def("flow_connect", "Connect an output port of one node to an input port of another. " +
+            "Ports default to 0. Returns {edgeId}.",
+            schema("""{"tabId":{"type":"string"},"from":{"type":"string"},"fromPort":{"type":"integer"},"to":{"type":"string"},"toPort":{"type":"integer"}}""",
+                required = listOf("tabId", "from", "to")), readOnly = false) { a ->
+            val o = a.obj()
+            val tabId = o.str("tabId") ?: return@def err("flow_connect requires 'tabId'")
+            val from = o.str("from") ?: return@def err("flow_connect requires 'from'")
+            val to = o.str("to") ?: return@def err("flow_connect requires 'to'")
+            val edgeId = controller.connect(tabId, from, o.int("fromPort"), to, o.int("toPort"))
+            ok(buildJsonObject { put("ok", true); put("edgeId", edgeId) })
+        },
+        def("flow_run", "Start a flow running asynchronously. Returns {runId}; poll flow_status/flow_result.",
+            schema("""{"tabId":{"type":"string"}}""", required = listOf("tabId")), readOnly = false) { a ->
+            val tabId = a.obj().str("tabId") ?: return@def err("flow_run requires 'tabId'")
+            if (controller.getFlow(tabId) == null) return@def err("No flow '$tabId'")
+            ok(buildJsonObject { put("runId", controller.startRun(tabId)) })
+        },
+        def("flow_status", "Get a run's state: RUNNING | SUCCEEDED | FAILED (+ error).",
+            schema("""{"runId":{"type":"string"}}""", required = listOf("runId")), readOnly = true) { a ->
+            val runId = a.obj().str("runId") ?: return@def err("flow_status requires 'runId'")
+            val job = controller.runStatus(runId) ?: return@def err("Unknown runId '$runId'")
+            ok(buildJsonObject {
+                put("state", job.state.name)
+                job.error?.let { put("error", it) }
+            })
+        },
+        def("flow_result", "Get a run's per-node outputs (status/output/error/logs).",
+            schema("""{"runId":{"type":"string"}}""", required = listOf("runId")), readOnly = true) { a ->
+            val runId = a.obj().str("runId") ?: return@def err("flow_result requires 'runId'")
+            val job = controller.runStatus(runId) ?: return@def err("Unknown runId '$runId'")
+            McpToolResult(json.encodeToString(RunJob.serializer(), job), false)
+        },
+        def("flow_list", "List every stored flow's tabId. Returns {flows:[...]}.",
+            schema("{}"), readOnly = true) { _ ->
+            ok(buildJsonObject {
+                put("flows", json.encodeToJsonElement(ListSerializer(String.serializer()), controller.listFlows()))
+            })
+        },
+        def("flow_get", "Get a flow's full GraphSnapshot JSON.",
+            schema("""{"tabId":{"type":"string"}}""", required = listOf("tabId")), readOnly = true) { a ->
+            val tabId = a.obj().str("tabId") ?: return@def err("flow_get requires 'tabId'")
+            val snap = controller.getFlow(tabId) ?: return@def err("No flow '$tabId'")
+            McpToolResult(json.encodeToString(GraphSnapshot.serializer(), snap), false)
+        },
+        def("prompt_upsert", "Insert or replace a composable prompt. Body is the full Prompt JSON " +
+            "(id, name required; base, rules[], glossary[], goals[], toolAllowlist[]).",
+            schema("""{"id":{"type":"string"},"name":{"type":"string"},"base":{"type":"string"},"rules":{"type":"array"},"glossary":{"type":"array"},"goals":{"type":"array"}}""",
+                required = listOf("id", "name")), readOnly = false) { a ->
+            val prompt = json.decodeFromString(Prompt.serializer(), a.raw)
+            prompts.upsert(prompt)
+            ok(buildJsonObject { put("ok", true); put("id", prompt.id) })
+        },
+        def("prompt_get", "Get one prompt by id (full Prompt JSON).",
+            schema("""{"id":{"type":"string"}}""", required = listOf("id")), readOnly = true) { a ->
+            val id = a.obj().str("id") ?: return@def err("prompt_get requires 'id'")
+            val p = prompts.get(id) ?: return@def err("Unknown prompt '$id'")
+            McpToolResult(json.encodeToString(Prompt.serializer(), p), false)
+        },
+        def("prompt_list", "List every stored prompt. Returns {prompts:[...]}.",
+            schema("{}"), readOnly = true) { _ ->
+            ok(buildJsonObject {
+                put("prompts", json.encodeToJsonElement(ListSerializer(Prompt.serializer()), prompts.list()))
+            })
+        },
+    )
+
+    // ---- helpers ------------------------------------------------------------
+
+    /** Build a definition whose handler is wrapped so a throw becomes an isError result. */
+    private fun def(
+        name: String,
+        description: String,
+        inputSchema: String,
+        readOnly: Boolean,
+        block: suspend (McpToolArgs) -> McpToolResult,
+    ): McpToolDefinition = McpToolDefinition(
+        name, description, inputSchema, readOnly,
+        object : McpToolHandler {
+            override suspend fun call(args: McpToolArgs): McpToolResult =
+                runCatching { block(args) }.getOrElse { err(it.message ?: it.toString()) }
+        },
+    )
+
+    private fun ok(o: JsonObject) = McpToolResult(o.toString(), false)
+    private fun err(message: String) = McpToolResult(message, true)
+
+    /** Parse the raw arguments JSON into an object (empty on non-object / parse failure). */
+    private fun McpToolArgs.obj(): JsonObject =
+        runCatching { Json.parseToJsonElement(raw).jsonObject }.getOrDefault(JsonObject(emptyMap()))
+
+    private fun JsonObject.str(key: String): String? = (this[key] as? kotlinx.serialization.json.JsonPrimitive)?.content
+    private fun JsonObject.int(key: String, default: Int = 0): Int =
+        runCatching { this[key]?.jsonPrimitive?.int }.getOrNull() ?: default
+
+    private fun JsonObject.metaOrNull(): FlowMeta? {
+        val name = str("name")
+        val description = str("description")
+        return if (name == null && description == null) null
+        else FlowMeta(name = name ?: "", description = description ?: "")
+    }
+
+    companion object {
+        const val PROVIDER_ID = "flow-tab"
+
+        /** Wrap a properties map into a minimal JSON-Schema object string. */
+        private fun schema(properties: String, required: List<String> = emptyList()): String {
+            val req = if (required.isEmpty()) "" else
+                ""","required":[${required.joinToString(",") { "\"$it\"" }}]"""
+            return """{"type":"object","properties":$properties$req}"""
+        }
+    }
+}

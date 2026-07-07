@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.DynamicPlugin
+import ai.rever.boss.plugin.api.McpServerController
 import ai.rever.boss.plugin.api.PluginContext
 
 /**
@@ -48,12 +49,34 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         context.panelRegistry.registerPanel(FlowLauncherInfo) { ctx, panelInfo ->
             FlowLauncherComponent(ctx, panelInfo, context)
         }
+
+        // Register the fixed, generic Flow MCP tool set into the host `boss` server so
+        // an attached agent can headlessly author and run flows/prompts (P2, F1/F5/F7).
+        // Storage-seated: the controller and prompt store share the tab's namespace, so
+        // agent- and UI-authored artifacts read the same store. Everything degrades
+        // gracefully — a host without an MCP registry ignores the registration.
+        runCatching {
+            val storage = context.pluginStorageFactory?.createStorage(FlowController.STORAGE_NAMESPACE)
+            val controller = FlowController(context)
+            val prompts = PromptRegistry(storage)
+            context.registerMcpToolProvider(FlowMcpToolProvider(controller, prompts))
+
+            // The MCP *server* may be off by default; resolve its controller lazily and
+            // only note its presence — providers are picked up whenever the server runs.
+            val serverController = runCatching {
+                context.getPluginAPI(McpServerController::class.java)
+            }.getOrNull()
+            if (serverController == null) {
+                println("[flow-tab] MCP server controller unavailable; flow_ tools registered, will surface when the boss MCP server is enabled")
+            }
+        }.onFailure { println("[flow-tab] failed to register MCP tool provider: ${it.message}") }
     }
 
     override fun dispose() {
         // Unregister tab type + panel when the plugin is unloaded.
         pluginContext?.tabRegistry?.unregisterTabType(FlowTabType.typeId)
         pluginContext?.panelRegistry?.unregisterPanel(FlowLauncherInfo.id)
+        runCatching { pluginContext?.unregisterMcpToolProvider(FlowMcpToolProvider.PROVIDER_ID) }
         FlowLauncherInfo.onLaunch = null // drop the captured context to avoid a leak
         pluginContext = null
     }
