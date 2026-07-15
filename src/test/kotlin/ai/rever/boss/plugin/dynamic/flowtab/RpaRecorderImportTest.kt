@@ -26,8 +26,8 @@ class RpaRecorderImportTest {
         val result = RpaRecorderImport.convert(sample)
         // First navigate is folded into Open Browser; screenshot is skipped.
         assertEquals(
-            listOf(NodeType.OPEN_BROWSER, NodeType.TYPE, NodeType.CLICK, NodeType.INJECT),
-            result.steps.map { it.type }
+            listOf("OPEN_BROWSER", "TYPE", "CLICK", "INJECT"),
+            result.steps.map { it.kind }
         )
         assertTrue("screenshot" in result.skipped)
     }
@@ -35,13 +35,13 @@ class RpaRecorderImportTest {
     @Test
     fun `open browser takes the first navigate url`() {
         val open = RpaRecorderImport.convert(sample).steps.first()
-        assertEquals(NodeType.OPEN_BROWSER, open.type)
+        assertEquals("OPEN_BROWSER", open.kind)
         assertEquals("https://e.com", (open.config["url"] as? JsonPrimitive)?.content)
     }
 
     @Test
     fun `input maps to a Type node with selector + text`() {
-        val type = RpaRecorderImport.convert(sample).steps.first { it.type == NodeType.TYPE }
+        val type = RpaRecorderImport.convert(sample).steps.first { it.kind == "TYPE" }
         assertEquals("#q", (type.config["selector"] as? JsonPrimitive)?.content)
         assertEquals("hi", (type.config["text"] as? JsonPrimitive)?.content)
         assertEquals("css", (type.config["selectorType"] as? JsonPrimitive)?.content)
@@ -50,6 +50,6 @@ class RpaRecorderImportTest {
     @Test
     fun `empty or actionless config yields just an open-browser step`() {
         val result = RpaRecorderImport.convert("""{"name":"x","actions":[]}""")
-        assertEquals(listOf(NodeType.OPEN_BROWSER), result.steps.map { it.type })
+        assertEquals(listOf("OPEN_BROWSER"), result.steps.map { it.kind })
     }
 }

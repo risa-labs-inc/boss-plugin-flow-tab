@@ -43,7 +43,7 @@ class HttpNodeTest {
     }
 
     private fun n(id: String, type: NodeType, vararg cfg: Pair<String, String>) =
-        PlanNode(id, type, id, buildJsonObject { cfg.forEach { put(it.first, it.second) } })
+        PlanNode(id, type.name, id, buildJsonObject { cfg.forEach { put(it.first, it.second) } })
 
     private fun run(nodes: List<PlanNode>, edges: List<EdgeModel>): Map<String, NodeRun> {
         val states = ConcurrentHashMap<String, NodeRun>()

@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.FitScreen
+import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.SaveAlt
@@ -103,7 +104,11 @@ private val RunGreen = Color(0xFF2E7D32)
 class FlowTabComponent(
     private val ctx: ComponentContext,
     override val config: TabInfo,
-    private val context: PluginContext
+    private val context: PluginContext,
+    /** Shared external-MCP client (P7); null on hosts without storage or when the plugin
+     *  couldn't stand it up. Its tools surface as palette nodes + an agent tool lane,
+     *  flag-gated OFF by default. */
+    private val externalMcp: ExternalMcpManager? = null,
 ) : TabComponentWithUI, ComponentContext by ctx {
 
     override val tabTypeInfo: TabTypeInfo = FlowTabType
@@ -120,8 +125,21 @@ class FlowTabComponent(
     // status would vanish (it kept writing to the orphaned old instance). On the
     // component, it survives the recreation. The component itself is reused across
     // the split (the panel keeps its tab component).
-    private val state = FlowGraphState()
-    private val executor = FlowExecutor(context)
+    // One registry instance per tab, threaded to both the canvas state (palette +
+    // geometry) and the executor (dispatch) so they agree on every kind-id.
+    private val registry = builtinNodeRegistry()
+    private val state = FlowGraphState(registry)
+    private val executor = FlowExecutor(context, registry)
+    // Prompt store + a headless controller sharing this tab's registry, so `agent` and
+    // `lanager` nodes (P5) resolve the same kinds the canvas does. The lanager runs its
+    // sub-flow through this controller (async, off the MCP fence).
+    private val prompts = PromptRegistry(
+        runCatching { context.pluginStorageFactory?.createStorage(FlowController.STORAGE_NAMESPACE) }.getOrNull()
+    )
+    private val controller = FlowController(context, coroutineScope, registry)
+    // Bundled starter templates (scrape / agent), enumerated from resources/templates
+    // via its index. Read-only; instantiated into a new tab from the gallery overlay.
+    private val templateCatalog = TemplateCatalog()
     private var runJob: Job? = null
     private var initialized = false
     // "Realistic" mode: pace the run with human-like delays between steps, so it's
@@ -132,6 +150,19 @@ class FlowTabComponent(
     private var visibleTabId: String? = null
 
     init {
+        // Surface the host registry's tools as live palette nodes, re-deriving whenever
+        // the RBAC-filtered tool set changes. A null registry (older/sandboxed host)
+        // degrades cleanly to built-ins only. The collector is tied to [coroutineScope]
+        // and cancelled on destroy.
+        runCatching { syncBossTools(context, registry, coroutineScope) }
+        // Surface external MCP tools (P7) as palette nodes too — flag-gated inside refresh,
+        // so nothing connects until the user enables external MCP and adds a server.
+        externalMcp?.let { runCatching { syncExternalMcpTools(it, registry, coroutineScope) } }
+        // Register the agent + lanager kinds so they appear in the palette and dispatch.
+        runCatching {
+            registry.register(defaultAgentNodeSpec(context, prompts, externalMcp))
+            registry.register(lanagerNodeSpec(controller))
+        }
         lifecycle.subscribe(
             object : Lifecycle.Callbacks {
                 override fun onDestroy() {
@@ -163,7 +194,7 @@ class FlowTabComponent(
                     }
                 }
                 if (state.nodes.isEmpty()) {
-                    state.addNode(NodeType.TRIGGER, Offset(320f, 200f))
+                    state.addNode(NodeType.TRIGGER.name, Offset(320f, 200f))
                     state.selection = null
                 }
                 // Restore the last run's per-node status/output, if any.
@@ -223,7 +254,7 @@ class FlowTabComponent(
             state.clearRun()
             state.notice = null
             state.isRunning = true
-            val plan = state.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
+            val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
             runJob = coroutineScope.launch(Dispatchers.Default) {
                 try {
@@ -236,6 +267,9 @@ class FlowTabComponent(
                         plan, edges,
                         humanize = realistic,
                         onVisibleTab = { id -> visibleTabId = id },
+                        // Seed this flow's own id so a lanager pointing back at it is caught
+                        // as a cycle at depth 0, not only one level deeper (red-team S7).
+                        ancestry = setOf(config.id),
                     ) { id, run -> state.runStates[id] = run }
                 } catch (ce: CancellationException) {
                     // stopped by user
@@ -320,15 +354,28 @@ class FlowTabComponent(
             openImportedInNewTab(snapshotJson, "Imported RPA", "Imported ${result.steps.size} node(s) in a new tab$skipped")
         }
 
-        // Smart import: detect whether the file is an exported flow (a GraphSnapshot —
-        // it has a "nodes" array) or an RPA recording, and route accordingly. One
-        // Import button, no format picker for the user to pick wrong.
+        // Smart import: classify the blob and route accordingly (one Import button, no
+        // format picker to get wrong). A flow graph opens in a new tab; a lanager template
+        // (a graph carrying metadata) opens the same way but labelled as a template; a
+        // graph from a newer schema is refused gracefully; anything else is treated as an
+        // RPA recording. Routing + schema-gating live in the shared, tested [classifyImport].
         fun importAny(text: String) {
-            val isFlow = runCatching {
-                (json.parseToJsonElement(text) as? JsonObject)?.containsKey("nodes") == true
-            }.getOrDefault(false)
-            if (isFlow) openImportedInNewTab(text, "Imported Flow", "Opened the imported flow in a new tab")
-            else applyRecording(text)
+            when (val r = classifyImport(text)) {
+                is TemplateImportResult.Graph -> {
+                    val name = r.snapshot.metadata?.name.orEmpty()
+                    val (title, notice) = if (r.kind == ImportKind.TEMPLATE) {
+                        "Imported Template" to ("Opened template" + (if (name.isNotBlank()) " '$name'" else "") + " in a new tab")
+                    } else {
+                        "Imported Flow" to "Opened the imported flow in a new tab"
+                    }
+                    openImportedInNewTab(text, title, notice)
+                }
+                TemplateImportResult.Recording -> applyRecording(text)
+                is TemplateImportResult.RefusedNewer ->
+                    state.notice = "Can't import: this file needs a newer Flow (schema v${r.schemaVersion}). Update the plugin."
+                is TemplateImportResult.Invalid ->
+                    state.runError = "Import failed: ${r.message}"
+            }
         }
 
         fun importFlow() {
@@ -342,9 +389,21 @@ class FlowTabComponent(
             }
         }
 
+        // Instantiate a bundled template into its own new tab, reusing the same
+        // storage-seated open-in-new-tab path a file import uses.
+        fun useTemplate(entry: TemplateEntry) {
+            openImportedInNewTab(
+                entry.raw,
+                title = entry.name.ifBlank { "Template" },
+                notice = "Created a flow from template '${entry.name}'",
+            )
+        }
+
         val selectedNode = (state.selection as? Selection.Node)?.let { state.nodeById(it.id) }
         var confirmClear by remember { mutableStateOf(false) }
+        var showGallery by remember { mutableStateOf(false) }
 
+        Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().background(CanvasBackground)) {
             Toolbar(
                 scale = state.scale,
@@ -360,6 +419,7 @@ class FlowTabComponent(
                         FlowTabData(id = "flow-${java.util.UUID.randomUUID()}", title = "Flow")
                     )
                 },
+                onTemplates = { showGallery = true },
                 onZoomIn = { state.zoomBy(1.2f, viewCenterScreen()) },
                 onZoomOut = { state.zoomBy(1f / 1.2f, viewCenterScreen()) },
                 onFit = { state.fitToContent(viewportSize) },
@@ -445,6 +505,16 @@ class FlowTabComponent(
                 }
             }
         }
+
+            // Template gallery overlay: instantiate a bundled starter into a new tab.
+            if (showGallery) {
+                TemplateGallery(
+                    catalog = templateCatalog,
+                    onPick = { entry -> showGallery = false; useTemplate(entry) },
+                    onDismiss = { showGallery = false },
+                )
+            }
+        }
     }
 }
 
@@ -459,6 +529,7 @@ private fun Toolbar(
     onRun: () -> Unit,
     onStop: () -> Unit,
     onNewFlow: () -> Unit,
+    onTemplates: () -> Unit,
     onZoomIn: () -> Unit,
     onZoomOut: () -> Unit,
     onFit: () -> Unit,
@@ -569,6 +640,21 @@ private fun Toolbar(
             Icon(Icons.Filled.Add, contentDescription = null, tint = Color.White, modifier = Modifier.size(13.dp))
             Spacer(Modifier.width(4.dp))
             Text("New Flow", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        }
+
+        Spacer(Modifier.width(8.dp))
+        // Template gallery: instantiate a bundled starter (scrape / agent) into a new tab.
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(7.dp))
+                .border(1.dp, ToolbarBorder, RoundedCornerShape(7.dp))
+                .clickable(onClick = onTemplates)
+                .padding(horizontal = 9.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(Icons.Filled.GridView, contentDescription = "Templates", tint = IconTint, modifier = Modifier.size(13.dp))
+            Spacer(Modifier.width(4.dp))
+            Text("Templates", color = IconTint, fontSize = 12.sp, fontWeight = FontWeight.Medium)
         }
 
         Spacer(Modifier.weight(1f))

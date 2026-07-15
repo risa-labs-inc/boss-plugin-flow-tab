@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flow → Workflow Orchestrator — Plan</title>
+<!--
+  visual-plan template. Copy this file, replace the content, KEEP the design system.
+  Component classes are documented inline below. Rules:
+    - One accent (--accent). Severity colors (--danger/--warn/--ok) carry MEANING only.
+    - Mono (--mono) for all data: identifiers, file paths, counts, fields, code.
+    - No emoji icons. Use the .chip / .dot severity system instead.
+    - Every section gets a spine number. Keep prose to bullets; ban filler.
+  Mermaid is loaded from CDN (needs network to render diagrams). Hand-author SVG
+  only for the single signature/hero architecture diagram (see #architecture).
+-->
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({
+    startOnLoad: true,
+    securityLevel: "loose",
+    fontFamily: "ui-monospace, 'SF Mono', Menlo, monospace",
+    themeVariables: {
+      background: "transparent",
+      primaryColor: "#ffffff",
+      primaryTextColor: "#1a1a1a",
+      primaryBorderColor: "#4f46e5",
+      lineColor: "#8a8782",
+      secondaryColor: "#f4f3f0",
+      tertiaryColor: "#fbfbfa",
+      fontSize: "13px",
+      clusterBkg: "#f7f6f3",
+      clusterBorder: "#e6e4df",
+      actorBkg: "#ffffff",
+      actorBorder: "#4f46e5",
+      noteBkgColor: "#fff8e6",
+      noteBorderColor: "#d97706"
+    }
+  });
+</script>
+<style>
+  :root {
+    --bg: #fbfbfa;
+    --surface: #ffffff;
+    --ink: #1a1a1a;
+    --muted: #6b6b6b;
+    --faint: #9a978f;
+    --hair: #e6e4df;
+    --hair-strong: #d8d5ce;
+    --accent: #4f46e5;
+    --accent-soft: #eef0ff;
+    --danger: #dc2626;
+    --warn: #d97706;
+    --ok: #16a34a;
+    --danger-soft: #fdecec;
+    --warn-soft: #fdf3e3;
+    --ok-soft: #e9f6ee;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --serif: ui-serif, Georgia, "Times New Roman", serif;
+    --maxw: 980px;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ---- Layout: sticky mini-TOC rail + content column ---- */
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 32px 160px; }
+  .layout { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 48px; max-width: 1240px; margin: 0 auto; }
+  nav.toc {
+    position: sticky; top: 0; align-self: start; height: 100vh;
+    padding: 88px 0 32px 32px; overflow-y: auto;
+    font-family: var(--mono); font-size: 12px; line-height: 1.9;
+  }
+  nav.toc a {
+    display: block; color: var(--faint); text-decoration: none;
+    border-left: 2px solid transparent; padding-left: 12px; transition: color .12s, border-color .12s;
+  }
+  nav.toc a:hover, nav.toc a.active { color: var(--ink); border-left-color: var(--accent); }
+  nav.toc .toc-num { color: var(--accent); margin-right: 8px; }
+  @media (max-width: 1080px) { .layout { grid-template-columns: 1fr; } nav.toc { display: none; } }
+
+  /* ---- Masthead ---- */
+  .masthead { padding: 88px 0 40px; border-bottom: 1px solid var(--hair); margin-bottom: 8px; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .14em; text-transform: uppercase; color: var(--accent); margin: 0 0 14px; }
+  h1 { font-family: var(--sans); font-weight: 680; font-size: 34px; line-height: 1.15; letter-spacing: -.02em; margin: 0 0 16px; }
+  .goal { font-size: 18px; color: var(--muted); max-width: 64ch; margin: 0 0 22px; }
+  .meta-row { display: flex; flex-wrap: wrap; gap: 8px 18px; font-family: var(--mono); font-size: 12px; color: var(--faint); }
+  .meta-row b { color: var(--muted); font-weight: 500; }
+
+  /* ---- Section + signature left spine number ---- */
+  section.sec { position: relative; padding: 44px 0 8px; border-top: 1px solid var(--hair); margin-top: 36px; }
+  section.sec:first-of-type { border-top: none; }
+  .sec h2 {
+    font-size: 13px; font-family: var(--mono); font-weight: 600; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink); margin: 0 0 20px; display: flex; align-items: baseline; gap: 14px;
+  }
+  .sec h2 .spine {
+    font-size: 12px; color: var(--accent); font-variant-numeric: tabular-nums;
+    border: 1px solid var(--hair-strong); border-radius: 4px; padding: 1px 7px; background: var(--surface);
+  }
+  .sec h3 { font-size: 15px; font-weight: 640; margin: 26px 0 12px; letter-spacing: -.01em; }
+
+  /* ---- Bullets: the default content unit. Tight, no filler. ---- */
+  ul.bul { list-style: none; padding: 0; margin: 0; }
+  ul.bul li { position: relative; padding: 4px 0 4px 22px; }
+  ul.bul li::before { content: ""; position: absolute; left: 4px; top: 13px; width: 5px; height: 5px; border-radius: 50%; background: var(--accent); }
+  ul.bul li code, p code, td code { font-family: var(--mono); font-size: .86em; background: #f4f3f0; padding: 1px 5px; border-radius: 4px; color: #3a3a3a; }
+  ul.bul ul.bul { margin-top: 2px; }
+  ul.bul ul.bul li::before { background: var(--faint); }
+
+  /* ---- TL;DR callout ---- */
+  .tldr { background: var(--surface); border: 1px solid var(--hair); border-left: 3px solid var(--accent); border-radius: 8px; padding: 22px 26px; margin: 8px 0 0; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+  .tldr .lead { font-size: 16px; font-weight: 560; margin: 0 0 14px; }
+
+  /* ---- Callout (decision / note / warning) ---- */
+  .callout { border-radius: 8px; padding: 14px 18px; margin: 16px 0; font-size: 14px; border: 1px solid; }
+  .callout .label { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; display: block; margin-bottom: 6px; }
+  .callout--decision { background: var(--accent-soft); border-color: #d6d9ff; }
+  .callout--decision .label { color: var(--accent); }
+  .callout--warn { background: var(--warn-soft); border-color: #f3dca8; }
+  .callout--warn .label { color: var(--warn); }
+
+  /* ---- Tables (assumptions, components, risks) ---- */
+  table { width: 100%; border-collapse: collapse; font-size: 14px; margin: 6px 0; }
+  th { text-align: left; font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); font-weight: 500; padding: 8px 12px; border-bottom: 1px solid var(--hair-strong); }
+  td { padding: 11px 12px; border-bottom: 1px solid var(--hair); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.mono, .mono { font-family: var(--mono); font-size: 13px; }
+  td .consequence { color: var(--danger); font-size: 13px; }
+
+  /* ---- Severity chips + dots (semantic color, carries meaning) ---- */
+  .chip { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; padding: 2px 9px; border-radius: 99px; border: 1px solid; white-space: nowrap; }
+  .chip--danger { color: var(--danger); background: var(--danger-soft); border-color: #f4c9c9; }
+  .chip--warn { color: var(--warn); background: var(--warn-soft); border-color: #f3dca8; }
+  .chip--ok { color: var(--ok); background: var(--ok-soft); border-color: #bfe4cc; }
+  .chip--info { color: var(--accent); background: var(--accent-soft); border-color: #d6d9ff; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot--danger { background: var(--danger); } .dot--warn { background: var(--warn); } .dot--ok { background: var(--ok); }
+
+  /* ---- Phase steps (implementation plan) ---- */
+  ol.phases { list-style: none; counter-reset: ph; padding: 0; margin: 0; }
+  ol.phases > li { counter-increment: ph; position: relative; padding: 0 0 26px 46px; }
+  ol.phases > li::before { content: counter(ph); position: absolute; left: 0; top: 0; width: 30px; height: 30px; border-radius: 50%; background: var(--surface); border: 1px solid var(--hair-strong); color: var(--accent); font-family: var(--mono); font-weight: 600; font-size: 13px; display: flex; align-items: center; justify-content: center; }
+  ol.phases > li:not(:last-child)::after { content: ""; position: absolute; left: 15px; top: 32px; bottom: 4px; width: 1px; background: var(--hair); }
+  .phase-title { font-weight: 620; font-size: 15px; margin: 4px 0 4px; }
+  .phase-files { font-family: var(--mono); font-size: 12px; color: var(--muted); margin: 6px 0; }
+  .phase-files span { background: #f4f3f0; padding: 1px 6px; border-radius: 4px; margin-right: 6px; display: inline-block; margin-bottom: 4px; }
+
+  /* ---- Diagram frame ---- */
+  .diagram { background: var(--surface); border: 1px solid var(--hair); border-radius: 10px; padding: 26px; margin: 16px 0; overflow-x: auto; box-shadow: 0 1px 2px rgba(0,0,0,.03); }
+  .diagram .cap { font-family: var(--mono); font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--faint); margin-bottom: 16px; }
+  .mermaid { display: flex; justify-content: center; }
+
+  /* ---- Blind spots (red-team output) get a distinct skeptical frame ---- */
+  .redteam { border: 1px solid #f3dca8; background: linear-gradient(180deg, #fffdf8, var(--surface)); border-radius: 10px; padding: 8px 24px 18px; margin-top: 8px; }
+  .redteam .rt-head { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--warn); padding: 16px 0 6px; }
+  .blind { padding: 14px 0; border-top: 1px dashed var(--hair-strong); }
+  .blind:first-of-type { border-top: none; }
+  .blind .bt { font-weight: 620; font-size: 14.5px; margin-bottom: 4px; }
+  .blind .bw { color: var(--muted); font-size: 14px; }
+
+  footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--hair); font-family: var(--mono); font-size: 11px; color: var(--faint); }
+</style>
+</head>
+<body>
+<div class="layout">
+
+  <!-- =================== STICKY MINI-TOC (signature nav) =================== -->
+  <nav class="toc" id="toc">
+    <a href="#tldr"><span class="toc-num">00</span>TL;DR</a>
+    <a href="#goals"><span class="toc-num">01</span>Goals</a>
+    <a href="#architecture"><span class="toc-num">02</span>Architecture</a>
+    <a href="#dataflow"><span class="toc-num">03</span>Data flow</a>
+    <a href="#schema"><span class="toc-num">04</span>Data model</a>
+    <a href="#plan"><span class="toc-num">05</span>Build plan</a>
+    <a href="#assumptions"><span class="toc-num">06</span>Assumptions</a>
+    <a href="#blindspots"><span class="toc-num">07</span>Blind spots</a>
+    <a href="#risks"><span class="toc-num">08</span>Risks</a>
+    <a href="#decisions"><span class="toc-num">09</span>Open Qs</a>
+    <a href="#alts"><span class="toc-num">10</span>Rejected</a>
+  </nav>
+
+  <main class="wrap">
+
+    <!-- =================== MASTHEAD =================== -->
+    <header class="masthead">
+      <p class="eyebrow">Technical Plan</p>
+      <h1>Flow → Workflow Orchestrator &amp; Lanager Runtime</h1>
+      <p class="goal">Turn the flow-tab plugin from a hardcoded browser/RPA driver into a general workflow orchestrator: every BOSS &amp; external tool becomes a node, workflows become agent-driven "lanagers," and Claude Code can author them over MCP.</p>
+      <div class="meta-row">
+        <span><b>Scope</b> L (multi-phase program)</span>
+        <span><b>Touches</b> flow-tab plugin · boss-plugin-api (compileOnly) · terminal-tab (runtime dep)</span>
+        <span><b>Risk</b> med-high</span>
+        <span><b>Date</b> 2026-07-07</span>
+        <span><b>Status</b> Draft for review · red-teamed</span>
+      </div>
+    </header>
+
+    <!-- =================== 00 · TL;DR =================== -->
+    <section class="sec" id="tldr">
+      <h2><span class="spine">00</span>TL;DR</h2>
+      <div class="tldr">
+        <p class="lead">Refactor Flow's closed node <code>enum</code> into an open <code>NodeSpec</code> registry, then feed that registry from a unified tool layer so tools, browsers, and agents all become nodes — and expose a fixed set of MCP tools so Claude Code can build workflows itself.</p>
+        <ul class="bul">
+          <li><b>Consume, don't build.</b> The host already has the "toolkit registry" (<code>PluginContext.mcpToolRegistry</code>: enumerate + <code>invoke()</code> every plugin's tools in-process) and an MCP server (<code>registerMcpToolProvider</code> → <code>mcp__boss__*</code>, attachable to Claude Code). We wrap these, not reinvent them.</li>
+          <li><b>One keystone unlocks four features.</b> <code>NodeType</code> (enum) → <code>NodeSpec</code> (registry entry). After it, tool-nodes, browser-tool-nodes, and agent-nodes are all "register a spec at runtime."</li>
+          <li><b>A "lanager" = an agent-driven workflow</b> = <code>GraphSnapshot v2</code> (nodes+edges + metadata) where agent-node config lives inside <code>node.config</code>; a lanager node = a nested sub-workflow run as an async job.</li>
+          <li><b>Browser is not a stateless tool.</b> It becomes a separate stateful <code>SessionRegistry</code> subsystem; tools thread a <code>session_id</code>. Statefulness is externalized so the tool interface stays clean.</li>
+        </ul>
+        <div class="callout callout--decision" style="margin-bottom:0">
+          <span class="label">Central decision</span>
+          Replace the <code>NodeType</code> enum with a runtime <code>NodeSpec</code> registry fed by a unified <code>ToolSource</code> layer. Everything else (tool-nodes, agent-nodes, MCP authoring, templates) is additive on top of that seam — but its config-schema shape must be proven by a spike <em>before</em> P0 freezes it.
+        </div>
+      </div>
+    </section>
+
+    <!-- =================== 01 · GOALS & NON-GOALS =================== -->
+    <section class="sec" id="goals">
+      <h2><span class="spine">01</span>Goals &amp; Non-goals</h2>
+      <h3>Goals</h3>
+      <ul class="bul">
+        <li>Every tool in the host <code>mcpToolRegistry</code> is usable as a workflow node (dynamic, RBAC-filtered).</li>
+        <li>Flow connects OUT to third-party MCP servers (stdio + HTTP/SSE); their tools also become nodes.</li>
+        <li>Flow registers a fixed set of MCP tools so an attached agent (Claude Code) can create/edit/run workflows, lanagers, and prompts.</li>
+        <li>A node can BE an agent ("lanager node"); a lanager node can nest a sub-workflow (subagent).</li>
+        <li>A prompt registry + builder UI: compose base + rules + glossary + goals + tool-allowlist; authorable by user or agent.</li>
+        <li>Lanager templates (JSON) import/export with a gallery; Flow orchestrates browser + other plugins' tools, not just RPA.</li>
+        <li>Existing 12-node flows keep loading and running unchanged (behavior-preserving migration).</li>
+      </ul>
+      <h3>Non-goals <span class="chip chip--info">scope guard</span></h3>
+      <ul class="bul">
+        <li><b>Not</b> hosting our own MCP server — terminal-tab owns the single <code>boss</code> server; two would collide.</li>
+        <li><b>Not</b> building a generic host-level tool registry — the host already has one; we consume it.</li>
+        <li><b>Not</b> a tool-per-artifact MCP surface — a small <em>fixed</em> generic tool set that takes names/ids as args (the provider is non-reactive).</li>
+        <li><b>Not</b> a full visual prompt-graph / multi-agent-swarm UI (reviving deleted #93 literally) — single agent nodes + nesting only.</li>
+        <li><b>Not</b> replacing the DAG executor — it stays; we make it kind-agnostic and add an async job wrapper.</li>
+        <li><b>Not</b> a stable-node-id expression engine rewrite now — keep title-based <code>{{ }}</code> refs; enforce unique titles on generated graphs (deferred, see D3).</li>
+      </ul>
+    </section>
+
+    <!-- =================== 02 · ARCHITECTURE (signature SVG) =================== -->
+    <section class="sec" id="architecture">
+      <h2><span class="spine">02</span>Architecture</h2>
+      <ul class="bul">
+        <li><b><code>NodeRegistry</code></b> (new) — runtime map <code>kind-id → NodeSpec{ports, configFields, runMode, usesSession, executor}</code>. Replaces the <code>NodeType</code> enum + four <code>when</code> blocks. Palette + dispatch read from it.</li>
+        <li><b><code>ToolSource</code></b> (new) — stateless <code>list()/invoke(name, argsJson)</code>. Impls: <code>BossRegistryToolSource</code> (wraps <code>mcpToolRegistry</code>), <code>ExternalMcpToolSource</code> (new MCP client), <code>FlowBrowserToolSource</code> (thin façade over the stateful SessionRegistry, threads <code>session_id</code>).</li>
+        <li><b><code>SessionRegistry</code></b> (new) — owns long-lived browser sessions (<code>session_id → BrowserIntegration</code> + per-session mutex). A <code>RunContext</code> redesign: N sessions instead of one fenced session.</li>
+        <li><b><code>FlowController</code></b> (new, headless) — authors/patches <code>GraphSnapshot</code> JSON at the <em>storage</em> layer (<code>graph:&lt;tabId&gt;</code>); runs graphs via the UI-free <code>FlowExecutor</code>; exposes an async run-job model (runId + poll).</li>
+        <li><b><code>FlowMcpToolProvider</code></b> (new) — a fixed generic tool set (<code>flow_*</code>, <code>lanager_*</code>, <code>prompt_*</code>) registered into the host's <code>boss</code> MCP server via <code>registerMcpToolProvider</code>.</li>
+        <li><b><code>AgentRuntime</code></b> (new) — provider-agnostic Kotlin tool-loop (port of RISA's runner); agent-node executor; tool-allowlist drawn from <code>ToolSource</code>; subagent = nested lanager async job.</li>
+        <li><b><code>PromptRegistry</code></b> (new) — composable prompts persisted via <code>pluginStorageFactory</code>; builder UI; prompt-authoring MCP tools.</li>
+        <li><b><code>FlowExecutor</code></b> (exists, unchanged core) — parallel topological DAG, coroutine-per-node. Stays kind-agnostic; only its session handling moves to SessionRegistry.</li>
+        <li><b>Host (exists)</b> — <code>mcpToolRegistry</code>, <code>registerMcpToolProvider</code>, <code>McpServerController.attach("CLAUDE_CODE")</code>, <code>BrowserService</code>, <code>secretDataProvider</code>, <code>pluginStorageFactory</code>. terminal-tab hosts the <code>boss</code> server.</li>
+      </ul>
+      <div class="diagram">
+        <div class="cap">System architecture — components &amp; ownership (accent = new/changed)</div>
+        <div class="mermaid">
+graph TD
+  CC[Claude Code CLI]:::ext -->|mcp__boss__flow_*| BOSS[boss MCP server<br/>terminal-tab / BossTerm]:::ext
+  BOSS -->|bridges| REG[(host mcpToolRegistry)]:::ext
+  FMP[FlowMcpToolProvider]:::new -->|registerMcpToolProvider| REG
+  FMP --> FC[FlowController<br/>headless, storage-seated]:::new
+
+  subgraph FLOW[flow-tab plugin]
+    FC -->|patch graph:tabId| ST[(pluginStorage<br/>GraphSnapshot v2)]:::new
+    FC --> EX[FlowExecutor<br/>DAG, unchanged core]:::exist
+    NR[NodeRegistry<br/>NodeSpec map]:::new --> EX
+    EX --> TS{ToolSource}:::new
+    EX --> SR[SessionRegistry<br/>session_id-&gt;browser]:::new
+    AR[AgentRuntime<br/>tool-loop]:::new --> TS
+    AR --> SR
+    AR -.subagent = async sub-run.-> FC
+    PR[PromptRegistry + UI]:::new --> AR
+  end
+
+  TS --> BRT[BossRegistryToolSource]:::new --> REG
+  TS --> EXT[ExternalMcpToolSource<br/>MCP client, flagged]:::new --> X[(3rd-party MCP servers)]:::ext
+  TS --> FBT[FlowBrowserToolSource]:::new --> SR
+  SR --> BS[host BrowserService]:::exist
+
+  classDef new fill:#eef0ff,stroke:#4f46e5,stroke-width:1.5px;
+  classDef exist fill:#ffffff,stroke:#8a8782;
+  classDef ext fill:#f4f3f0,stroke:#8a8782,color:#6b6b6b;
+        </div>
+      </div>
+      <p style="font-size:13px;color:var(--muted)">Highlighted in <span style="color:var(--accent)">accent</span> = new or changed. Boxes with grey stroke exist today; the <code>boss</code> server + host registry are owned by other plugins/the host.</p>
+    </section>
+
+    <!-- =================== 03 · DATA FLOW =================== -->
+    <section class="sec" id="dataflow">
+      <h2><span class="spine">03</span>Data flow</h2>
+      <ul class="bul">
+        <li><b>Authoring is storage-seated:</b> <code>flow_add_node</code> patches the <code>GraphSnapshot</code> JSON at <code>graph:&lt;tabId&gt;</code> — no open tab required. A live tab, if any, re-reads storage on the Main thread.</li>
+        <li><b>Running is async:</b> <code>flow_run</code> returns a <code>runId</code> immediately (the registry <code>invoke</code> is fenced at 60s; a browser DAG can exceed that). The agent polls <code>flow_status</code>/<code>flow_result</code>.</li>
+        <li><b>Tools resolve through <code>ToolSource</code>:</b> a tool-node executor calls <code>invoke(name, argsJson)</code>; <code>isError</code> is thrown as <code>ExecError</code> to feed the DAG's exception-based failure model.</li>
+      </ul>
+      <div class="diagram">
+        <div class="cap">Claude Code authors then runs a lanager — async job path</div>
+        <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant CC as Claude Code
+  participant SV as boss MCP server
+  participant FP as FlowMcpToolProvider
+  participant FC as FlowController
+  participant ST as pluginStorage
+  participant EX as FlowExecutor
+  participant TS as ToolSource / SessionRegistry
+  CC->>SV: mcp__boss__flow_create {name}
+  SV->>FP: invoke(flow_create)
+  FP->>FC: create(snapshot v2)
+  FC->>ST: write graph:tabId
+  FP-->>CC: {tabId}
+  CC->>SV: flow_add_node / flow_connect (xN)
+  SV->>FP: invoke(...)
+  FP->>FC: patch snapshot
+  FC->>ST: write graph:tabId
+  CC->>SV: flow_run {tabId}
+  SV->>FP: invoke(flow_run)
+  FP->>FC: startRun() → runId
+  FC-->>CC: {runId} (returns < 60s)
+  FC->>EX: run(plan) [headless]
+  EX->>TS: invoke(tool) / open session
+  TS-->>EX: result / page state
+  CC->>SV: flow_status {runId} (poll)
+  FP-->>CC: running | done | error + outputs
+        </div>
+      </div>
+    </section>
+
+    <!-- =================== 04 · DATA MODEL =================== -->
+    <section class="sec" id="schema">
+      <h2><span class="spine">04</span>Data model &amp; contracts</h2>
+      <ul class="bul">
+        <li><b><code>GraphSnapshot v2</code></b> — adds <code>schemaVersion: Int</code> (gate old builds) + <code>metadata: FlowMeta?{name, version, description, inputs}</code>. <code>nodes/edges/nextId</code> unchanged. <b>No sidecar <code>agents</code> map</b> — agent config lives in <code>node.config</code> (F6).</li>
+        <li><b><code>NodeModel.type</code>: <code>NodeType</code> → <code>String</code> kind-id.</b> Legacy enum names (<code>"HTTP"</code>) map 1:1 to registry ids; new ids namespaced <code>tool:boss:&lt;name&gt;</code>, <code>tool:ext:&lt;server&gt;/&lt;name&gt;</code>, <code>agent</code>, <code>lanager</code>, <code>browser:&lt;action&gt;</code>.</li>
+        <li><b><code>NodeSpec</code></b> (runtime, not serialized) — <code>{id, label, inputs, outputs, configFields, runMode, usesSession, executor}</code>. Built-ins registered at startup; tool/agent specs registered dynamically.</li>
+        <li><b><code>ConfigField</code> extended</b> — add <code>FieldType.JSON</code> (raw editor) + <code>NUMBER</code>; nested/array tool inputs stored as a JSON blob in <code>config</code> and marshalled to <code>argsJson</code> (F3).</li>
+        <li><b>Tool-node <code>config</code> caches</b> <code>toolRef</code> + a <code>schemaSnapshot</code> at author time, so a saved flow renders/validates even when the tool is absent at load (F4).</li>
+        <li><b><code>Prompt</code></b> — <code>{id, name, base, rules[], glossary[], goals[], toolAllowlist: ToolRef[], version}</code>, persisted at <code>prompt:&lt;id&gt;</code> + <code>prompts:index</code>.</li>
+        <li><b>New storage keys</b> — <code>prompt:*</code>, <code>template:*</code>, <code>mcpservers:config</code> (external servers; secrets held separately in <code>secretDataProvider</code>), <code>settings</code>. Existing: <code>graph:&lt;tabId&gt;</code>, <code>runstate:&lt;tabId&gt;</code>.</li>
+      </ul>
+      <div class="diagram">
+        <div class="cap">Lanager artifact — entities &amp; relations</div>
+        <div class="mermaid">
+erDiagram
+  GRAPHSNAPSHOT ||--o{ NODEMODEL : contains
+  GRAPHSNAPSHOT ||--o{ EDGEMODEL : contains
+  GRAPHSNAPSHOT {
+    int schemaVersion
+    FlowMeta metadata
+    long nextId
+  }
+  NODEMODEL {
+    string id
+    string type "kind-id"
+    JsonObject config "agent cfg + toolRef + schemaSnapshot live here"
+  }
+  NODEMODEL o|--o| PROMPT : "agent node references"
+  NODEMODEL o|--o{ TOOLREF : "tool/agent node references"
+  PROMPT ||--o{ TOOLREF : "toolAllowlist"
+  PROMPT {
+    string id
+    string base
+    list rules
+    list glossary
+    list goals
+  }
+  TOOLREF {
+    string scope "boss|ext|flow|browser"
+    string name
+  }
+        </div>
+      </div>
+    </section>
+
+    <!-- =================== 05 · BUILD PLAN =================== -->
+    <section class="sec" id="plan">
+      <h2><span class="spine">05</span>Build plan</h2>
+      <p style="color:var(--muted);font-size:14px;margin-top:0">Spine: <code>P-spike → P0 → P1 → {P2, P3, P4} → P5 → P6</code>; <code>P7</code> isolated behind a flag. Two spikes precede P0 because they can force the <code>NodeSpec</code>/<code>config</code> shape (red-team F3/F6).</p>
+      <ol class="phases">
+        <li>
+          <div class="phase-title">P-spike — prove the two shapes that P0 will freeze <span class="chip chip--danger">gate</span></div>
+          <ul class="bul">
+            <li>Map ~20 real <code>mcpToolRegistry</code> tool <code>inputSchema</code> strings → <code>ConfigField</code> set; find which need nested/array/JSON handling. Decides <code>FieldType.JSON</code>/<code>NUMBER</code> + arg-marshalling.</li>
+            <li>Prototype agent-node config living inside <code>node.config</code> + a sub-flow-run-as-async-tool contract. Confirms no sidecar <code>agents</code> map is needed.</li>
+            <li>Output: frozen <code>NodeSpec</code>, <code>GraphSnapshot v2</code>, and tool-arg marshalling shape. Throwaway code.</li>
+          </ul>
+          <div class="phase-files"><span>spike/ (throwaway)</span><span>draft NodeSpec.kt</span><span>draft ToolSource.kt</span></div>
+        </li>
+        <li>
+          <div class="phase-title">P0 — Node registry refactor (keystone, behavior-preserving)</div>
+          <ul class="bul">
+            <li>Introduce <code>NodeSpec</code> + <code>NodeRegistry</code>; re-express all 12 built-ins as registered specs. Drive palette off <code>registry.all()</code> not <code>NodeType.entries</code>; dispatch off <code>registry[kind].executor</code>.</li>
+            <li><code>NodeModel.type</code>: enum → <code>String</code> kind-id (legacy names map 1:1 on the wire). Add <code>schemaVersion</code>; unknown kind/absent tool = first-class "unavailable" node state, not <code>ExecError</code>.</li>
+            <li>Extend <code>ConfigField</code> (<code>JSON</code>, <code>NUMBER</code>) + inspector renderer + <code>ConfigReader</code>.</li>
+          </ul>
+          <div class="phase-files"><span>NodeSpec.kt (new)</span><span>NodeRegistry.kt (new)</span><span>FlowModel.kt</span><span>NodeExecutors.kt</span><span>FlowNodePicker.kt</span><span>FlowNodeView.kt</span><span>FlowExecutorTest.kt</span></div>
+        </li>
+        <li>
+          <div class="phase-title">P1 — Tool-nodes from the host registry</div>
+          <ul class="bul">
+            <li><code>ToolSource</code> + <code>BossRegistryToolSource</code> (collects <code>mcpToolRegistry.tools</code>, RBAC-filtered). Generate a <code>NodeSpec</code> per tool; configFields/JSON from <code>inputSchema</code>.</li>
+            <li>Tool-node executor: build <code>argsJson</code> from <code>config</code>, call <code>invoke()</code>, <b>throw <code>ExecError</code> on <code>isError</code></b> (F8), cache <code>schemaSnapshot</code> (F4).</li>
+            <li>Palette gets a live "Tools" section; react to the <code>StateFlow</code> (re-derive specs on change).</li>
+          </ul>
+          <div class="phase-files"><span>ToolSource.kt (new)</span><span>BossRegistryToolSource.kt (new)</span><span>ToolNodeExecutor.kt (new)</span><span>FlowNodePicker.kt</span><span>FlowTabComponent.kt</span></div>
+        </li>
+        <li>
+          <div class="phase-title">P2 — Headless FlowController + async jobs + MCP authoring</div>
+          <ul class="bul">
+            <li><code>FlowController</code>: create/patch <code>GraphSnapshot</code> at the storage layer (reuse <code>openImportedInNewTab</code> pattern); run via headless <code>FlowExecutor(context)</code>; async run-job model (runId + status/result).</li>
+            <li><code>FlowMcpToolProvider</code>: fixed generic tools <code>flow_create/flow_add_node/flow_connect/flow_run/flow_status/flow_result/flow_list/flow_get</code> (+ <code>lanager_*</code> stubs). Register via <code>registerMcpToolProvider</code>; resolve <code>McpServerController</code> lazily; degrade gracefully if terminal-tab absent.</li>
+            <li>Bump <code>apiVersion 1.0.42 → ≥1.0.56</code> + <code>minBossVersion</code>; live tabs re-read storage on Main thread.</li>
+          </ul>
+          <div class="phase-files"><span>FlowController.kt (new)</span><span>FlowMcpToolProvider.kt (new)</span><span>FlowTabDynamicPlugin.kt</span><span>plugin.json</span><span>build.gradle.kts</span></div>
+        </li>
+        <li>
+          <div class="phase-title">P3 — SessionRegistry + browser-as-tools (orchestrator repositioning)</div>
+          <ul class="bul">
+            <li><code>SessionRegistry</code>: N long-lived sessions (<code>session_id → BrowserIntegration</code> + per-session mutex). Refactor <code>RunContext</code> from single-session/single-mutex to draw from it; native browser nodes keep working.</li>
+            <li><code>FlowBrowserToolSource</code>: stateless tools (<code>browser_open/navigate/click/type/extract/close</code>) that thread <code>session_id</code> and delegate to SessionRegistry. Now agents + external callers can drive the browser.</li>
+          </ul>
+          <div class="phase-files"><span>SessionRegistry.kt (new)</span><span>FlowBrowserToolSource.kt (new)</span><span>NodeExecutors.kt</span><span>BrowserIntegrations.kt</span></div>
+        </li>
+        <li>
+          <div class="phase-title">P4 — Prompt registry + builder UI</div>
+          <ul class="bul">
+            <li><code>PromptRegistry</code> + <code>Prompt</code> model persisted via <code>pluginStorageFactory</code>; compose base+rules+glossary+goals+toolAllowlist (port RISA <code>rx/prompts.py</code> composition).</li>
+            <li>Builder UI (panel or tab); prompt-authoring MCP tools <code>prompt_upsert/prompt_get/prompt_list</code>.</li>
+          </ul>
+          <div class="phase-files"><span>PromptRegistry.kt (new)</span><span>PromptModel.kt (new)</span><span>PromptBuilderUI.kt (new)</span><span>FlowMcpToolProvider.kt</span></div>
+        </li>
+        <li>
+          <div class="phase-title">P5 — Agent / lanager nodes</div>
+          <ul class="bul">
+            <li><code>AgentRuntime</code>: provider-agnostic Kotlin tool-loop (Anthropic-first; OpenAI/Custom via <code>llmrpa</code> transport); keys via <code>secretDataProvider</code>; bounded (max-steps, timeout, cost cap).</li>
+            <li>Agent-node executor: prompt (from P4) + tool-allowlist (from <code>ToolSource</code>) + own browser session (from P3). Lanager node = nested sub-flow run as an async job via <code>FlowController</code>; cross-flow depth/cycle limits.</li>
+          </ul>
+          <div class="phase-files"><span>AgentRuntime.kt (new)</span><span>AgentProviders.kt (new)</span><span>AgentNodeExecutor.kt (new)</span><span>FlowController.kt</span></div>
+        </li>
+        <li>
+          <div class="phase-title">P6 — Lanager template gallery + versioning</div>
+          <ul class="bul">
+            <li>Template metadata + <code>schemaVersion</code>-gated import; gallery UI; bundled starter templates; export inlines referenced prompts, <b>strips secrets</b>.</li>
+            <li>Extend <code>importAny</code> to recognise lanager templates alongside GraphSnapshot + RPA recordings.</li>
+          </ul>
+          <div class="phase-files"><span>TemplateGallery.kt (new)</span><span>FlowTabComponent.kt</span><span>resources/templates/*.json (new)</span></div>
+        </li>
+        <li>
+          <div class="phase-title">P7 — External MCP client <span class="chip chip--warn">flagged · last</span></div>
+          <ul class="bul">
+            <li>Bundle MCP Kotlin SDK <em>client</em>; support stdio + HTTP/SSE; connection-manager UI; secrets in <code>secretDataProvider</code>; per-server explicit enable.</li>
+            <li>Handle the macOS GUI-PATH problem (resolve binaries via a login shell), subprocess reaping on <code>dispose()</code>, and third-party secret egress. Tools merge into <code>ToolSource</code> as <code>ext:&lt;server&gt;/*</code> → become nodes + agent-callable.</li>
+          </ul>
+          <div class="phase-files"><span>McpClient.kt (new)</span><span>ExternalMcpToolSource.kt (new)</span><span>McpServerConfigUI.kt (new)</span><span>FlowTabDynamicPlugin.kt</span></div>
+        </li>
+      </ol>
+    </section>
+
+    <!-- =================== 06 · ASSUMPTIONS (with consequences) =================== -->
+    <section class="sec" id="assumptions">
+      <h2><span class="spine">06</span>Assumptions</h2>
+      <p style="color:var(--muted);font-size:14px;margin-top:0">Every assumption the plan rests on, our confidence, and what breaks if it's wrong.</p>
+      <table>
+        <thead><tr><th style="width:42%">Assumption</th><th style="width:14%">Confidence</th><th>If wrong → consequence</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>mcpToolRegistry</code> exposes enumerate (<code>tools</code>) + in-process <code>invoke()</code> to sandboxed plugins (verified in <code>boss-plugin-api</code> 1.0.56 / <code>DefaultPlugin</code>, delegated through Sandboxed/Tracking contexts).</td>
+            <td><span class="chip chip--ok">high</span></td>
+            <td class="consequence">If actually gated/absent at runtime, P1 (tool-nodes) has no source — the whole orchestrator premise fails. Verify against the <em>installed</em> BossConsole build early.</td>
+          </tr>
+          <tr>
+            <td>The <code>FlowExecutor</code> DAG core is UI-independent and headless-runnable (verified: <code>PlanNode</code> snapshot, no Compose refs).</td>
+            <td><span class="chip chip--ok">high</span></td>
+            <td class="consequence">If a hidden UI dependency exists, the headless <code>FlowController</code> (P2) can't run flows for agents/Claude Code.</td>
+          </tr>
+          <tr>
+            <td>A fixed generic <code>flow_*</code> tool set (names-as-args) is sufficient for agent authoring — no per-artifact tools needed.</td>
+            <td><span class="chip chip--warn">medium</span></td>
+            <td class="consequence">The provider is non-reactive (F7); if per-artifact tools ARE needed, re-register churn races the terminal-tab bridge. De-risk: confirm the generic surface with a real Claude Code authoring session in P2.</td>
+          </tr>
+          <tr>
+            <td>Registry tool <code>inputSchema</code> strings are well-formed JSON-Schema that we can render into config fields (with a JSON fallback for nested/array).</td>
+            <td><span class="chip chip--warn">medium</span></td>
+            <td class="consequence">Loose/partial schemas → unrenderable nodes. This is exactly what P-spike measures; the JSON fallback bounds the blast radius.</td>
+          </tr>
+          <tr>
+            <td>terminal-tab (the <code>boss</code> server host) is present in the user's install, so Flow's registered tools actually surface to Claude Code.</td>
+            <td><span class="chip chip--danger">low / unverified</span></td>
+            <td class="consequence">If absent, all outward MCP authoring (P2/P4/P5 tools) is inert — nodes/agents still work in-app. VERIFY: declare a soft dependency + degrade; document the requirement.</td>
+          </tr>
+          <tr>
+            <td>We can bump <code>apiVersion → ≥1.0.56</code> + <code>minBossVersion</code> and users are on a new-enough BossConsole.</td>
+            <td><span class="chip chip--danger">low / unverified</span></td>
+            <td class="consequence">Plugin won't load on older hosts; new <code>type</code> ids crash old builds' <code>NodeType.valueOf</code>. VERIFY installed-host versions; ship <code>schemaVersion</code> gating in P0 (one-way door otherwise).</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- =================== 07 · BLIND SPOTS (red-team subagent) =================== -->
+    <section class="sec" id="blindspots">
+      <h2><span class="spine">07</span>Blind spots <span class="chip chip--warn">red-team</span></h2>
+      <p style="color:var(--muted);font-size:14px;margin-top:0">Found by an independent agent told to break this plan. Structural flaws and things the plan does not see.</p>
+      <div class="redteam">
+        <div class="rt-head">Structural flaws — folded into the plan above (F1-F6)</div>
+        <div class="blind">
+          <div class="bt">F1 · 60s <code>invoke</code> timeout kills synchronous <code>flow_run</code></div>
+          <div class="bw">A browser DAG (per-node waits up to 15-20s) can exceed the registry's 60s fence. <b>Fix applied:</b> async job model — <code>flow_run</code> returns <code>runId</code>, agent polls <code>flow_status</code>/<code>flow_result</code>. The tool contract is async from P2's first line.</div>
+        </div>
+        <div class="blind">
+          <div class="bt">F2 / F12 · stateless <code>ToolSource.invoke</code> doesn't fit stateful browser sessions</div>
+          <div class="bw">A browser action needs a session that outlives a single call and that an external MCP caller (no <code>RunContext</code>) can reach. <b>Fix applied:</b> browser statefulness externalized into a new <code>SessionRegistry</code> (N sessions, per-session mutex) — a real <code>RunContext</code> redesign (P3), not a wrapper. <code>ToolSource</code> stays stateless by threading <code>session_id</code>.</div>
+        </div>
+        <div class="blind">
+          <div class="bt">F3 · flat <code>ConfigField</code> + scalar args can't hold nested JSON-Schema</div>
+          <div class="bw"><code>FieldType</code> is TEXT/TEXTAREA/SELECT/BOOL; <code>ConfigReader</code> reads top-level scalars only. Many tool schemas have nested objects/arrays. <b>Fix applied:</b> extend the config model (<code>JSON</code>/<code>NUMBER</code>) + a JSON fallback, and <em>prove the mapping in P-spike before P0 freezes <code>NodeSpec</code></em>.</div>
+        </div>
+        <div class="blind">
+          <div class="bt">F4 · tool-nodes reference tools that may be absent at load</div>
+          <div class="bw"><code>tools</code> is an async <code>StateFlow</code>; the owning plugin may be unloaded. A saved flow would have no schema and hit <code>ExecError("not runnable")</code>. <b>Fix applied:</b> cache <code>toolRef</code>+<code>schemaSnapshot</code> in <code>config</code>; "tool unavailable" is a first-class node state.</div>
+        </div>
+        <div class="blind">
+          <div class="bt">F5 · headless façade must be storage-seated, not component-reaching</div>
+          <div class="bw"><code>FlowGraphState</code> is a private, UI-thread Compose field of a live tab; authoring may happen with no tab open, and off-thread structural edits race the compositor. <b>Fix applied:</b> <code>FlowController</code> patches <code>GraphSnapshot</code> JSON in storage (the existing <code>openImportedInNewTab</code> path) and runs the UI-free executor.</div>
+        </div>
+        <div class="blind">
+          <div class="bt">F6 · agent config in a sidecar map fights every per-node path</div>
+          <div class="bw"><code>PlanNode</code> carries only <code>config</code>; <code>removeNode</code>/import/export/inspector all key off <code>node.config</code>. A separate <code>agents</code> map orphans on delete and needs threading through the executor. <b>Fix applied:</b> agent config lives inside <code>node.config</code>.</div>
+        </div>
+        <div class="rt-head">Remaining watch-items (mitigated, not eliminated)</div>
+        <div class="blind">
+          <div class="bt">F7 · non-reactive provider vs a growing tool set</div>
+          <div class="bw"><code>McpToolProvider.tools()</code> is queried once; the bridge dedups first-wins and silently skips name collisions. Mitigation: a fixed generic tool set; all Flow tools <code>flow_</code>-prefixed to dodge the 15 reserved names + cross-plugin collisions.</div>
+        </div>
+        <div class="blind">
+          <div class="bt">F9 · external MCP process lifecycle on a packaged app</div>
+          <div class="bw">macOS GUI apps don't inherit shell PATH → <code>npx</code>/<code>uvx</code> stdio servers fail; plus zombie subprocesses + secret egress. Mitigation: P7 is last, flagged, resolves binaries via a login shell, reaps on <code>dispose()</code>.</div>
+        </div>
+        <div class="blind">
+          <div class="bt">F11 · title→id <code>{{ }}</code> migration rewrites substrings inside config</div>
+          <div class="bw">Refs are resolved by title inside arbitrary strings; switching to ids is a content migration, not a rename (and <code>SET</code> already passes <code>emptyMap()</code> for node outputs). Mitigation: <b>defer D3</b> — keep title refs, enforce unique titles on generated graphs.</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- =================== 08 · RISKS =================== -->
+    <section class="sec" id="risks">
+      <h2><span class="spine">08</span>Risks &amp; mitigations</h2>
+      <table>
+        <thead><tr><th style="width:8%">Sev</th><th style="width:42%">Risk</th><th>Mitigation</th></tr></thead>
+        <tbody>
+          <tr><td><span class="dot dot--danger"></span></td><td>P0 freezes <code>NodeSpec</code>/<code>config</code> before its hardest consumers (tool schemas, agent nodes) are proven → registry-wide rework.</td><td>P-spike is a hard gate before P0; JSON fallback field bounds unknown schemas; agent config proven to fit <code>node.config</code>.</td></tr>
+          <tr><td><span class="dot dot--danger"></span></td><td><code>type</code> enum→String is a one-way door: new ids crash older builds on load.</td><td>Ship <code>schemaVersion</code> in the same P0 change; older builds gate + refuse gracefully instead of throwing.</td></tr>
+          <tr><td><span class="dot dot--warn"></span></td><td>Compose main-thread contention: MCP handlers / agent loops mutate graph off-thread.</td><td>Authoring writes storage JSON (not live state); live tabs re-read on Main; runs use the UI-free executor.</td></tr>
+          <tr><td><span class="dot dot--warn"></span></td><td>Recursion/cost blow-up: nested lanagers + agent tool-loops fan out unbounded.</td><td>Per-run step/timeout/cost budgets; cross-flow depth limit + cycle detection in <code>FlowController</code>.</td></tr>
+          <tr><td><span class="dot dot--warn"></span></td><td>Prompt injection: browser-scraped / tool output flows into agent prompts.</td><td>Treat tool/observation output as data, not instructions; keep tool-allowlists tight; no auto-exec of returned code.</td></tr>
+          <tr><td><span class="dot dot--warn"></span></td><td>Secrets leak via exported templates.</td><td>Export strips secrets + session tokens; external-server creds live only in <code>secretDataProvider</code>, never in <code>GraphSnapshot</code>.</td></tr>
+          <tr><td><span class="dot dot--warn"></span></td><td>terminal-tab absent → outward MCP surface inert.</td><td>Soft dependency + graceful degradation; in-app nodes/agents still function; documented requirement.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <!-- =================== 09 · OPEN QUESTIONS =================== -->
+    <section class="sec" id="decisions">
+      <h2><span class="spine">09</span>Open questions <span class="chip chip--danger">needs you</span></h2>
+      <ul class="bul">
+        <li><b>Installed-host versions.</b> What BossConsole version(s) are your users on? This gates the <code>apiVersion</code>/<code>minBossVersion</code> bump and whether P2 can ship without stranding anyone.</li>
+        <li><b>Is terminal-tab a hard requirement?</b> Accept "MCP authoring only works with terminal-tab installed" (soft dep + degrade), or should Flow itself stand up nothing and we document it as required?</li>
+        <li><b>Agent model + budget defaults.</b> Anthropic-first via <code>secretDataProvider</code> keys — OK? What per-run cost/step ceilings do you want as defaults?</li>
+        <li><b>D3 deferral OK?</b> Keep title-based <code>{{ }}</code> refs + enforce unique titles on generated graphs now; defer the stable-id engine change. Confirm.</li>
+        <li><b>Scope of "all phases now."</b> This plan details P-spike→P7. Do you want me to also write the superpowers implementation plan for <em>all</em> phases, or just through the keystone (P-spike+P0+P1) and re-plan later phases as we learn?</li>
+        <li><b>Plan file location.</b> Rendered into the flow-tab submodule (<code>flow-tab/visual-plans/</code>). Keep it there (untracked) or move outside the submodule?</li>
+      </ul>
+    </section>
+
+    <!-- =================== 10 · REJECTED ALTERNATIVES =================== -->
+    <section class="sec" id="alts">
+      <h2><span class="spine">10</span>Alternatives considered &amp; rejected</h2>
+      <table>
+        <thead><tr><th style="width:30%">Alternative</th><th>Why rejected</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">Build our own tool registry + MCP server in Flow</td><td>The host already provides <code>mcpToolRegistry</code> + the <code>boss</code> server; a second server collides, and a parallel registry duplicates + can't see other plugins' tools. Consume, don't rebuild.</td></tr>
+          <tr><td class="mono">Keep the <code>NodeType</code> enum, add a few AI nodes</td><td>Can't surface N dynamic tools or per-tool config as enum members; every feature would re-touch four <code>when</code> blocks. The registry refactor is the whole point.</td></tr>
+          <tr><td class="mono">Browser as a peer stateless <code>ToolSource</code></td><td>Red-team F2: sessions are stateful and must outlive a call + be reachable without a <code>RunContext</code>. Externalized into <code>SessionRegistry</code> instead.</td></tr>
+          <tr><td class="mono">Agent config in a sidecar <code>agents</code> map</td><td>Red-team F6: fights <code>PlanNode</code>/<code>removeNode</code>/import/inspector, all of which key off <code>node.config</code>. Store it in <code>node.config</code>.</td></tr>
+          <tr><td class="mono">Synchronous <code>flow_run</code> returning results inline</td><td>Red-team F1: the 60s registry <code>invoke</code> fence is shorter than a real browser DAG. Async job model instead.</td></tr>
+          <tr><td class="mono">Tool-per-artifact MCP surface (<code>run_&lt;flowname&gt;</code>)</td><td>Red-team F7: the provider is non-reactive; growing the tool set means racy re-registration. Fixed generic tools taking ids as args.</td></tr>
+          <tr><td class="mono">External MCP client first (as a core <code>ToolSource</code> dep)</td><td>Red-team F9: highest-uncertainty work (GUI PATH, subprocess lifecycle). Sequenced last, behind a flag; core holds without it.</td></tr>
+          <tr><td class="mono">Stable-node-id <code>{{ }}</code> refs now (D3)</td><td>Red-team F11: a substring content-migration across all saved configs. Deferred; enforce unique titles on generated graphs instead.</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <footer>visual-plan · generated 2026-07-07 · boss-plugin-flow-tab @ main (1.0.3) · red-teamed</footer>
+  </main>
+</div>
+
+<script>
+  // TOC active-section highlight
+  const links = [...document.querySelectorAll('nav.toc a')];
+  const map = new Map(links.map(a => [a.getAttribute('href').slice(1), a]));
+  const obs = new IntersectionObserver((es) => {
+    es.forEach(e => { if (e.isIntersecting) { links.forEach(l => l.classList.remove('active')); map.get(e.target.id)?.classList.add('active'); } });
+  }, { rootMargin: "-20% 0px -70% 0px" });
+  document.querySelectorAll('section.sec').forEach(s => obs.observe(s));
+</script>
+</body>
+</html>

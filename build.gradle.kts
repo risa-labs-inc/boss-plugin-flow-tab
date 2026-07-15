@@ -32,10 +32,14 @@ repositories {
     maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
 }
 
+// Runtime deps fat-packed into the plugin JAR (P7 external-MCP). Kept separate from the
+// compile classpath so we can pick exactly which artifacts ship inside the JAR.
+val bundled: Configuration by configurations.creating
+
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.42.jar"))
+        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.56.jar"))
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
@@ -59,13 +63,28 @@ dependencies {
     // JSON serialization for graph persistence
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.9.0")
 
+    // External MCP client (P7, feature-flagged OFF by default). The MCP Kotlin SDK
+    // *client* artifact + its ktor transport. Versions pinned to what the SDK 0.7.2
+    // resolves (ktor 3.3.x + SSE) to match what BossConsole bundles. stdio spawns a
+    // process; HTTP/SSE talks to a remote server. Only referenced by the concrete
+    // transports (McpClientTransports.kt) — the testable core is transport-agnostic.
+    implementation("io.modelcontextprotocol:kotlin-sdk-client:0.7.2")
+    implementation("io.ktor:ktor-client-core:3.3.0") // includes the client SSE plugin
+    implementation("io.ktor:ktor-client-cio:3.3.0")  // engine for the SSE transport
+    // The same P7 artifacts are added to a `bundled` configuration (declared below) so
+    // buildPluginJar fat-packs them: the host classpath has no MCP SDK / ktor, and the
+    // feature would ClassNotFound at runtime otherwise. Host-provided groups (kotlin
+    // stdlib, coroutines, serialization, compose) are excluded from the bundle.
+    "bundled"("io.modelcontextprotocol:kotlin-sdk-client:0.7.2")
+    "bundled"("io.ktor:ktor-client-cio:3.3.0")
+
     // --- Tests ---
     testImplementation(kotlin("test-junit5"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
     // The boss-plugin-api is compileOnly for main (host-provided); tests need it
     // on the classpath to build a fake PluginContext / BrowserService / BrowserHandle.
     if (useLocalDependencies) {
-        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.42.jar"))
+        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.56.jar"))
     } else {
         testImplementation(files("build/downloaded-deps/boss-plugin-api.jar"))
     }
@@ -93,6 +112,32 @@ tasks.register<Jar>("buildPluginJar") {
 
     // Include plugin manifest
     from("src/main/resources")
+
+    // Fat-pack the P7 external-MCP runtime deps (MCP Kotlin SDK client + ktor + their
+    // transitive closure) that the host classpath does NOT provide. Host-provided groups
+    // (kotlin stdlib/reflect, coroutines, serialization, compose, decompose, skiko) are
+    // excluded to avoid shadowing the host's own copies.
+    val hostProvided = setOf(
+        "org.jetbrains.kotlin",
+        "org.jetbrains.kotlinx",   // coroutines + serialization (host-provided)
+        "org.jetbrains.compose",
+        "org.jetbrains.skiko",
+        "com.arkivanov.decompose",
+        "com.arkivanov.essenty",
+    )
+    // kotlinx-io (group org.jetbrains.kotlinx) IS required by the SDK and NOT host-provided,
+    // so re-include it explicitly despite the group exclusion above.
+    val forceInclude = setOf("kotlinx-io-core-jvm", "kotlinx-io-bytestring-jvm")
+    from({
+        bundled.resolvedConfiguration.resolvedArtifacts
+            .filter { art ->
+                art.moduleVersion.id.group !in hostProvided || art.name in forceInclude
+            }
+            .map { zipTree(it.file) }
+    }) {
+        // Drop signatures + module metadata from the vendored jars.
+        exclude("META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA", "META-INF/versions/**", "**/module-info.class")
+    }
 }
 
 // Sync version from build.gradle.kts into plugin.json (single source of truth)

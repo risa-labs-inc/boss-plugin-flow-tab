@@ -13,15 +13,25 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-/** A live, mutable node on the canvas. Position + config are reactive. */
+/**
+ * A live, mutable node on the canvas. Position + config are reactive.
+ *
+ * Holds its resolved [spec] (from the graph's [NodeRegistry]) rather than a closed
+ * [NodeType] enum — geometry, rendering, and dispatch all read the spec. [kind] is
+ * the spec's stable id, written back on save. An unknown/absent kind resolves to a
+ * [NodeSpec.unavailable] placeholder so the node still lays out and round-trips.
+ */
 class FlowNode(
     val id: String,
-    val type: NodeType,
+    val spec: NodeSpec,
     title: String,
     x: Float,
     y: Float,
     config: JsonObject = JsonObject(emptyMap())
 ) {
+    /** Stable registry kind-id (persisted as [NodeModel.type]). */
+    val kind: String get() = spec.id
+
     var title by mutableStateOf(title)
     var x by mutableStateOf(x)
     var y by mutableStateOf(y)
@@ -40,6 +50,9 @@ data class PendingConnection(
     val fromPort: Int,
     val current: Offset // world coordinates of the dragging end
 )
+
+/** Registry kind-id of the built-in browser-opening node (used by the headless toggle). */
+private const val OPEN_BROWSER_KIND = "OPEN_BROWSER"
 
 /** What the node picker should do once a type is chosen. */
 sealed interface PickerIntent {
@@ -63,7 +76,11 @@ data class PickerRequest(val screenAnchor: Offset, val intent: PickerIntent)
  *  - **world**: the logical canvas where nodes live (unaffected by pan/zoom).
  *  - **screen**: pixels in the composable, after applying pan/zoom.
  */
-class FlowGraphState {
+class FlowGraphState(
+    /** Kind-id → spec map the canvas draws from. Defaults to the built-ins; the tab
+     *  threads the same instance it gives the executor so palette/geometry/dispatch agree. */
+    val registry: NodeRegistry = builtinNodeRegistry(),
+) {
 
     val nodes = mutableStateListOf<FlowNode>()
     val edges = mutableStateListOf<EdgeModel>()
@@ -105,7 +122,7 @@ class FlowGraphState {
     /** True when there's at least one Open Browser node and all of them are headless.
      *  Drives the toolbar "Headless" toggle so it reflects the actual node config. */
     val allBrowserHeadless: Boolean
-        get() = nodes.filter { it.type == NodeType.OPEN_BROWSER }
+        get() = nodes.filter { it.kind == OPEN_BROWSER_KIND }
             .let { browsers ->
                 browsers.isNotEmpty() && browsers.all {
                     (it.config["headless"] as? JsonPrimitive)?.content == "true"
@@ -115,7 +132,7 @@ class FlowGraphState {
     /** Set `headless` on every Open Browser node, so the toolbar toggle writes the
      *  real per-node config (and it shows correctly in the inspector + persists). */
     fun setAllBrowserHeadless(value: Boolean) {
-        nodes.filter { it.type == NodeType.OPEN_BROWSER }.forEach { node ->
+        nodes.filter { it.kind == OPEN_BROWSER_KIND }.forEach { node ->
             node.config = JsonObject(node.config + ("headless" to JsonPrimitive(value.toString())))
         }
     }
@@ -138,7 +155,7 @@ class FlowGraphState {
         var prevId: String? = null
         var firstId: String? = null
         steps.forEachIndexed { i, step ->
-            val node = FlowNode(newId("n"), step.type, step.title, origin.x + i * stepX, origin.y, step.config)
+            val node = FlowNode(newId("n"), registry.resolve(step.kind), step.title, origin.x + i * stepX, origin.y, step.config)
             nodes.add(node)
             if (firstId == null) firstId = node.id
             prevId?.let { connect(it, 0, node.id, 0) }
@@ -177,7 +194,7 @@ class FlowGraphState {
             minX = min(minX, n.x)
             minY = min(minY, n.y)
             maxX = max(maxX, n.x + nodeOuterWidth())
-            maxY = max(maxY, n.y + nodeHeight(n.type))
+            maxY = max(maxY, n.y + nodeHeight(n.spec))
         }
         val pad = 60f
         val contentW = (maxX - minX) + pad * 2
@@ -195,20 +212,25 @@ class FlowGraphState {
 
     private fun newId(prefix: String): String = "$prefix${idCounter++}"
 
-    /** Add a node of [type] centered on [worldCenter]; returns and selects it. */
-    fun addNode(type: NodeType, worldCenter: Offset): FlowNode {
-        val h = nodeHeight(type)
+    /** Add a node of [spec] centered on [worldCenter]; returns and selects it. */
+    fun addNode(spec: NodeSpec, worldCenter: Offset): FlowNode {
+        val h = nodeHeight(spec)
         val node = FlowNode(
             id = newId("n"),
-            type = type,
-            title = type.label,
+            spec = spec,
+            title = spec.label,
             x = worldCenter.x - nodeOuterWidth() / 2f,
-            y = worldCenter.y - h / 2f
+            y = worldCenter.y - h / 2f,
+            config = spec.defaultConfig,
         )
         nodes.add(node)
         selection = Selection.Node(node.id)
         return node
     }
+
+    /** Convenience: add a node by kind-id, resolving the spec from the registry. */
+    fun addNode(kind: String, worldCenter: Offset): FlowNode =
+        addNode(registry.resolve(kind), worldCenter)
 
     fun nodeById(id: String): FlowNode? = nodes.firstOrNull { it.id == id }
 
@@ -247,19 +269,19 @@ class FlowGraphState {
         return true
     }
 
-    /** Resolve an open picker request by spawning [type] and wiring it per the intent. */
-    fun resolvePicker(type: NodeType) {
+    /** Resolve an open picker request by spawning [spec] and wiring it per the intent. */
+    fun resolvePicker(spec: NodeSpec) {
         val req = pickerRequest ?: return
         when (val intent = req.intent) {
-            is PickerIntent.AddAt -> addNode(type, intent.world)
+            is PickerIntent.AddAt -> addNode(spec, intent.world)
             is PickerIntent.ConnectFrom -> {
-                val node = addNode(type, intent.world)
+                val node = addNode(spec, intent.world)
                 connect(intent.fromNode, intent.fromPort, node.id, 0)
             }
             is PickerIntent.InsertOnEdge -> {
                 val edge = edges.firstOrNull { it.id == intent.edgeId }
-                val node = addNode(type, intent.world)
-                if (edge != null && type.inputs > 0 && type.outputs > 0) {
+                val node = addNode(spec, intent.world)
+                if (edge != null && spec.inputs > 0 && spec.outputs > 0) {
                     connect(edge.fromNode, edge.fromPort, node.id, 0)
                     connect(node.id, 0, edge.toNode, edge.toPort)
                     removeEdge(edge.id)
@@ -282,15 +304,15 @@ class FlowGraphState {
     fun edgeEndpoints(edge: EdgeModel): Pair<Offset, Offset>? {
         val from = nodeById(edge.fromNode) ?: return null
         val to = nodeById(edge.toNode) ?: return null
-        return outputPortPos(from.x, from.y, edge.fromPort, from.type) to
-            inputPortPos(to.x, to.y, edge.toPort, to.type)
+        return outputPortPos(from.x, from.y, edge.fromPort, from.spec) to
+            inputPortPos(to.x, to.y, edge.toPort, to.spec)
     }
 
     /** Find an input port near [world], for dropping a dragged connection. */
     fun findInputPortAt(world: Offset, radius: Float = PORT_RADIUS * 2.5f): Pair<String, Int>? {
         for (node in nodes) {
-            for (i in 0 until node.type.inputs) {
-                val p = inputPortPos(node.x, node.y, i, node.type)
+            for (i in 0 until node.spec.inputs) {
+                val p = inputPortPos(node.x, node.y, i, node.spec)
                 if ((world - p).getDistance() <= radius) return node.id to i
             }
         }
@@ -315,15 +337,30 @@ class FlowGraphState {
     // ---- persistence --------------------------------------------------------
 
     fun toSnapshot(): GraphSnapshot = GraphSnapshot(
-        nodes = nodes.map { NodeModel(it.id, it.type, it.title, it.x, it.y, it.config) },
+        nodes = nodes.map { NodeModel(it.id, it.kind, it.title, it.x, it.y, it.config) },
         edges = edges.toList(),
-        nextId = idCounter
+        nextId = idCounter,
+        schemaVersion = SUPPORTED_SCHEMA_VERSION,
     )
 
-    fun load(snapshot: GraphSnapshot) {
+    /**
+     * Replace the canvas with [snapshot]. A graph whose [GraphSnapshot.schemaVersion]
+     * is newer than this build understands is **refused** (logged + skipped, returns
+     * false) rather than mis-loaded — the current graph is left untouched. Unknown
+     * node kind-ids load as [NodeSpec.unavailable] placeholders (no throw). Returns
+     * true when the graph was loaded.
+     */
+    fun load(snapshot: GraphSnapshot): Boolean {
+        if (!snapshot.isSchemaSupported()) {
+            println(
+                "flow-tab: refusing to load graph schemaVersion=${snapshot.schemaVersion} " +
+                    "(this build supports up to $SUPPORTED_SCHEMA_VERSION); skipping."
+            )
+            return false
+        }
         nodes.clear()
         edges.clear()
-        snapshot.nodes.forEach { nodes.add(FlowNode(it.id, it.type, it.title, it.x, it.y, it.config)) }
+        snapshot.nodes.forEach { nodes.add(FlowNode(it.id, registry.resolve(it.type), it.title, it.x, it.y, it.config)) }
         edges.addAll(snapshot.edges)
         // Keep the counter ahead of any restored id to avoid collisions.
         val maxExisting = (snapshot.nodes.map { it.id } + snapshot.edges.map { it.id })
@@ -332,6 +369,7 @@ class FlowGraphState {
         idCounter = max(snapshot.nextId, maxExisting + 1)
         selection = null
         pendingConnection = null
+        return true
     }
 
     companion object {

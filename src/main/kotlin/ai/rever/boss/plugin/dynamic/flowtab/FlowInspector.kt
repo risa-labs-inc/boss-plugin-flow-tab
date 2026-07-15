@@ -82,7 +82,7 @@ fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Mo
     // Default to the Output tab once a node has run, so its extracted data (or error)
     // is the first thing shown; otherwise start on Parameters.
     var tab by remember(node.id) { mutableStateOf(if (state.runStates[node.id] != null) 2 else 0) } // 0 params, 1 json, 2 output
-    val accent = Color(node.type.accent)
+    val accent = Color(node.spec.accent)
 
     Column(
         modifier = modifier
@@ -98,9 +98,9 @@ fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Mo
             Box(
                 modifier = Modifier.size(24.dp).clip(RoundedCornerShape(FlowTheme.rSm)).background(accent),
                 contentAlignment = Alignment.Center
-            ) { Icon(node.type.icon(), null, tint = Color.White, modifier = Modifier.size(15.dp)) }
+            ) { Icon(node.spec.icon(), null, tint = Color.White, modifier = Modifier.size(15.dp)) }
             Spacer(Modifier.width(8.dp))
-            Text(node.type.label, color = FlowTheme.TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+            Text(node.spec.label, color = FlowTheme.TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.weight(1f))
             // Zoom-independent delete; spaced + hover-highlighted so it isn't a
             // misclick trap next to Close.
@@ -136,7 +136,16 @@ fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Mo
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ParametersTab(node: FlowNode) {
-    val fields = node.type.configFields()
+    val fields = node.spec.configFields
+    if (node.spec.isUnavailable) {
+        Text(
+            "This node kind (\"${node.kind}\") isn't available in this build — its provider " +
+                "isn't loaded. The node is preserved; edit its raw config in the JSON tab.",
+            color = FlowTheme.Error,
+            fontSize = 12.sp,
+        )
+        return
+    }
     if (fields.isEmpty()) {
         Text("This node has no parameters.", color = Muted, fontSize = 12.sp)
         return
@@ -149,6 +158,14 @@ private fun ParametersTab(node: FlowNode) {
                     setConfig(node, field.key, it)
                 }
                 FieldType.TEXTAREA -> TextInput(configValue(node, field), placeholder = field.placeholder, singleLine = false) {
+                    setConfig(node, field.key, it)
+                }
+                // Raw multiline JSON editor for structured/nested config (tool inputs).
+                FieldType.JSON -> TextInput(configValue(node, field), placeholder = field.placeholder, singleLine = false, mono = true) {
+                    setConfig(node, field.key, it)
+                }
+                // Numeric single-line field; stored as its text form (read via ConfigReader.int/double).
+                FieldType.NUMBER -> TextInput(configValue(node, field), placeholder = field.placeholder, singleLine = true) {
                     setConfig(node, field.key, it)
                 }
                 FieldType.SELECT -> FlowRow(

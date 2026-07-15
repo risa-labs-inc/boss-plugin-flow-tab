@@ -120,7 +120,11 @@ private class FakeContext(private val service: BrowserService?) : PluginContext 
 // ---- helpers ---------------------------------------------------------------
 
 private fun n(id: String, type: NodeType, vararg cfg: Pair<String, String>, title: String = id) =
-    PlanNode(id, type, title, buildJsonObject { cfg.forEach { put(it.first, it.second) } })
+    PlanNode(id, type.name, title, buildJsonObject { cfg.forEach { put(it.first, it.second) } })
+
+/** PlanNode with an arbitrary (possibly unregistered) kind-id. */
+private fun nk(id: String, kind: String, vararg cfg: Pair<String, String>, title: String = id) =
+    PlanNode(id, kind, title, buildJsonObject { cfg.forEach { put(it.first, it.second) } })
 
 private fun e(from: String, to: String, fp: Int = 0, tp: Int = 0) =
     EdgeModel("$from-$to-$fp-$tp", from, fp, to, tp)
@@ -243,6 +247,41 @@ class FlowExecutorTest {
         val states = runGraph(listOf(n("c", NodeType.CODE)), emptyList())
         assertEquals(RunStatus.ERROR, states["c"]?.status)
         assertTrue(states["c"]!!.error!!.contains("not runnable", ignoreCase = true))
+    }
+
+    @Test
+    fun `unknown kind-id fails only that node with a clear message`() {
+        // A graph referencing a kind the registry doesn't know (e.g. a tool whose
+        // provider is absent) must not crash the run — the node errors, siblings run.
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            nk("x", "tool:boss:absent"),
+            n("ok", NodeType.SET, "assignments" to """{"y":"1"}""")
+        )
+        val edges = listOf(e("t", "x"), e("t", "ok"))
+        val states = runGraph(nodes, edges)
+        assertEquals(RunStatus.ERROR, states["x"]?.status)
+        assertTrue(states["x"]!!.error!!.contains("Unknown node kind", ignoreCase = true))
+        assertEquals(RunStatus.SUCCESS, states["ok"]?.status)
+    }
+
+    @Test
+    fun `legacy enum-name graph decodes and runs`() {
+        // Graphs saved before the enum→String migration serialized `"type":"TRIGGER"`.
+        // A String `type` field decodes them unchanged; they still run.
+        val legacy = """
+            {"nodes":[
+              {"id":"t","type":"TRIGGER","title":"Trigger","x":0,"y":0},
+              {"id":"s","type":"SET","title":"Set","x":0,"y":0,"config":{"assignments":"{\"a\":\"1\"}"}}
+            ],"edges":[{"id":"e","fromNode":"t","fromPort":0,"toNode":"s","toPort":0}],"nextId":3}
+        """.trimIndent()
+        val snap = kotlinx.serialization.json.Json { ignoreUnknownKeys = true }
+            .decodeFromString(GraphSnapshot.serializer(), legacy)
+        assertEquals("TRIGGER", snap.nodes[0].type)
+        val plan = snap.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
+        val states = runGraph(plan, snap.edges)
+        assertEquals(RunStatus.SUCCESS, states["s"]?.status)
+        assertEquals("1", states["s"]!!.output.single().json.str("a"))
     }
 
     @Test

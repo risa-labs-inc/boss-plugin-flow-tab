@@ -345,13 +345,13 @@ private fun DrawScope.drawEdges(state: FlowGraphState) {
     if (pending != null) {
         val from = state.nodeById(pending.fromNodeId)
         if (from != null) {
-            val startWorld = outputPortPos(from.x, from.y, pending.fromPort, from.type)
+            val startWorld = outputPortPos(from.x, from.y, pending.fromPort, from.spec)
             // Snap the loose end onto the candidate input port, if any.
             val snap = state.connectSnap
             val endWorld = if (snap != null) {
-                state.nodeById(snap.first)?.let { inputPortPos(it.x, it.y, snap.second, it.type) } ?: pending.current
+                state.nodeById(snap.first)?.let { inputPortPos(it.x, it.y, snap.second, it.spec) } ?: pending.current
             } else pending.current
-            val color = if (snap != null) EdgeHighlight else Color(from.type.accent).copy(alpha = 0.9f)
+            val color = if (snap != null) EdgeHighlight else Color(from.spec.accent).copy(alpha = 0.9f)
             drawEdgePath(state, startWorld, endWorld, color, if (snap != null) 3f else 2f)
             drawCircle(color, radius = if (snap != null) 5f else 4f, center = state.toScreen(endWorld))
         }

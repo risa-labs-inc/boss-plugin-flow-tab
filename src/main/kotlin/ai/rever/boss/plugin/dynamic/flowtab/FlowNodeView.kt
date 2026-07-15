@@ -27,6 +27,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CallSplit
 import androidx.compose.material.icons.automirrored.filled.MergeType
 import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Code
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Keyboard
@@ -77,21 +78,27 @@ const val SNAP_RADIUS = PORT_RADIUS * 4f
 @Composable
 private fun Float.wdp(): Dp = (this / LocalDensity.current.density).dp
 
-/** Icon shown in a node's header for each node type. */
-fun NodeType.icon(): ImageVector = when (this) {
-    NodeType.TRIGGER -> Icons.Filled.Bolt
-    NodeType.OPEN_BROWSER -> Icons.Filled.Public
-    NodeType.NAVIGATE -> Icons.Filled.Navigation
-    NodeType.CLICK -> Icons.Filled.TouchApp
-    NodeType.TYPE -> Icons.Filled.Keyboard
-    NodeType.EXTRACT -> Icons.Filled.Download
-    NodeType.INJECT -> Icons.Filled.Upload
-    NodeType.HTTP -> Icons.Filled.Language
-    NodeType.CODE -> Icons.Filled.Code
-    NodeType.IF -> Icons.AutoMirrored.Filled.CallSplit
-    NodeType.SET -> Icons.Filled.Tune
-    NodeType.MERGE -> Icons.AutoMirrored.Filled.MergeType
+/** Icon shown in a node's header, keyed by registry kind-id. Unknown/dynamic kinds
+ *  fall back to a neutral glyph so any spec renders. */
+fun iconForKind(kind: String): ImageVector = when (kind) {
+    "TRIGGER" -> Icons.Filled.Bolt
+    "OPEN_BROWSER" -> Icons.Filled.Public
+    "NAVIGATE" -> Icons.Filled.Navigation
+    "CLICK" -> Icons.Filled.TouchApp
+    "TYPE" -> Icons.Filled.Keyboard
+    "EXTRACT" -> Icons.Filled.Download
+    "INJECT" -> Icons.Filled.Upload
+    "HTTP" -> Icons.Filled.Language
+    "CODE" -> Icons.Filled.Code
+    "IF" -> Icons.AutoMirrored.Filled.CallSplit
+    "SET" -> Icons.Filled.Tune
+    "MERGE" -> Icons.AutoMirrored.Filled.MergeType
+    // Dynamic tool nodes (host/external registry) share a wrench glyph.
+    else -> if (kind.startsWith("tool:")) Icons.Filled.Build else Icons.Filled.Tune
 }
+
+/** Icon for a node spec (by its kind-id). */
+fun NodeSpec.icon(): ImageVector = iconForKind(id)
 
 /** Border/badge color for a node's current run status (null = idle). */
 fun runStatusColor(status: RunStatus?): Color? = when (status) {
@@ -104,14 +111,14 @@ fun runStatusColor(status: RunStatus?): Color? = when (status) {
 /** One-line summary of a node's key config, shown under its title. */
 fun nodeSummary(node: FlowNode): String {
     fun c(k: String) = (node.config[k] as? JsonPrimitive)?.content ?: ""
-    val raw = when (node.type) {
-        NodeType.OPEN_BROWSER -> c("url").ifBlank { "ephemeral session" }
-        NodeType.NAVIGATE -> c("url")
+    val raw = when (node.kind) {
+        "OPEN_BROWSER" -> c("url").ifBlank { "ephemeral session" }
+        "NAVIGATE" -> c("url")
         // selector kind / method / mode move to the meta chip row below.
-        NodeType.CLICK, NodeType.TYPE, NodeType.EXTRACT -> c("selector")
-        NodeType.HTTP -> c("url")
-        NodeType.SET -> c("assignments")
-        NodeType.INJECT -> c("script")
+        "CLICK", "TYPE", "EXTRACT" -> c("selector")
+        "HTTP" -> c("url")
+        "SET" -> c("assignments")
+        "INJECT" -> c("script")
         else -> ""
     }.trim()
     // Let the Text's maxLines=1 + ellipsis own truncation (no manual double-cut).
@@ -121,11 +128,11 @@ fun nodeSummary(node: FlowNode): String {
 /** Small at-a-glance metadata chips for a node (selector kind, method, …). */
 fun nodeMetaChips(node: FlowNode): List<String> {
     fun c(k: String) = (node.config[k] as? JsonPrimitive)?.content ?: ""
-    return when (node.type) {
-        NodeType.OPEN_BROWSER -> listOf(if (c("headless").equals("true", true)) "headless" else "visible")
-        NodeType.HTTP -> listOf(c("method").ifBlank { "GET" })
-        NodeType.CLICK, NodeType.TYPE -> listOf(c("selectorType").ifBlank { "css" })
-        NodeType.EXTRACT -> buildList {
+    return when (node.kind) {
+        "OPEN_BROWSER" -> listOf(if (c("headless").equals("true", true)) "headless" else "visible")
+        "HTTP" -> listOf(c("method").ifBlank { "GET" })
+        "CLICK", "TYPE" -> listOf(c("selectorType").ifBlank { "css" })
+        "EXTRACT" -> buildList {
             add(c("selectorType").ifBlank { "css" })
             add(c("mode").ifBlank { "text" })
             if (c("multiple").equals("true", true)) add("all matches")
@@ -146,8 +153,8 @@ fun nodeMetaChips(node: FlowNode): List<String> {
 @Composable
 fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
     val selected = state.selection == Selection.Node(node.id)
-    val accent = Color(node.type.accent)
-    val h = nodeHeight(node.type)
+    val accent = Color(node.spec.accent)
+    val h = nodeHeight(node.spec)
     val corner = NODE_CORNER.wdp()
 
     val interaction = remember { MutableInteractionSource() }
@@ -228,7 +235,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
                         .background(accent),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(node.type.icon(), null, tint = Color.White, modifier = Modifier.size(21f.wdp()))
+                    Icon(node.spec.icon(), null, tint = Color.White, modifier = Modifier.size(21f.wdp()))
                 }
                 Spacer(Modifier.width(11f.wdp()))
                 Column(Modifier.weight(1f)) {
@@ -242,7 +249,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
                     )
                     // Config preview, falling back to the type's description so the
                     // second line is never empty (no lonely-title look).
-                    val subtitle = nodeSummary(node).ifBlank { node.type.description }
+                    val subtitle = nodeSummary(node).ifBlank { node.spec.description }
                     Text(
                         text = subtitle,
                         color = FlowTheme.TextMuted,
@@ -252,7 +259,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
                         modifier = Modifier.offset(y = 1f.wdp())
                     )
                     // Metadata chips (selector kind, HTTP method, headless, …).
-                    if (node.type.hasMetaRow()) {
+                    if (node.spec.hasMetaRow) {
                         Row(
                             modifier = Modifier.offset(y = 5f.wdp()),
                             horizontalArrangement = Arrangement.spacedBy(5f.wdp())
@@ -268,8 +275,8 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
             }
 
             // Port-row labels for multi-port nodes (If → true/false, Merge → a/b).
-            for (i in 0 until node.type.inputs) {
-                val label = node.type.inputLabel(i)
+            for (i in 0 until node.spec.inputs) {
+                val label = node.spec.inputLabel(i)
                 if (label.isNotEmpty()) {
                     Text(
                         text = label,
@@ -277,13 +284,13 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
                         fontSize = 10.sp,
                         modifier = Modifier.offset(
                             x = 14f.wdp(),
-                            y = (portRowY(i, node.type.inputs, h) - 7f).wdp()
+                            y = (portRowY(i, node.spec.inputs, h) - 7f).wdp()
                         )
                     )
                 }
             }
-            for (i in 0 until node.type.outputs) {
-                val label = node.type.outputLabel(i)
+            for (i in 0 until node.spec.outputs) {
+                val label = node.spec.outputLabel(i)
                 if (label.isNotEmpty()) {
                     Text(
                         text = label,
@@ -291,7 +298,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
                         fontSize = 10.sp,
                         modifier = Modifier.offset(
                             x = (NODE_WIDTH - 46f).wdp(),
-                            y = (portRowY(i, node.type.outputs, h) - 7f).wdp()
+                            y = (portRowY(i, node.spec.outputs, h) - 7f).wdp()
                         )
                     )
                 }
@@ -299,23 +306,23 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
         }
 
         // Input ports (drop targets) on the left card edge.
-        for (i in 0 until node.type.inputs) {
+        for (i in 0 until node.spec.inputs) {
             val snapped = state.connectSnap == (node.id to i)
             PortDot(
                 accent = accent,
                 centerX = NODE_PAD,
-                centerY = portRowY(i, node.type.inputs, h),
+                centerY = portRowY(i, node.spec.inputs, h),
                 active = state.connecting || hovered,
                 snapped = snapped
             )
         }
 
         // Output ports (drag sources) on the right card edge.
-        for (i in 0 until node.type.outputs) {
+        for (i in 0 until node.spec.outputs) {
             PortDot(
                 accent = accent,
                 centerX = NODE_PAD + NODE_WIDTH,
-                centerY = portRowY(i, node.type.outputs, h),
+                centerY = portRowY(i, node.spec.outputs, h),
                 active = hovered,
                 snapped = false,
                 dragHandler = Modifier
@@ -327,7 +334,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
                             state.connecting = true
                             state.connectSnap = null
                             state.pendingConnection =
-                                PendingConnection(node.id, i, outputPortPos(node.x, node.y, i, node.type))
+                                PendingConnection(node.id, i, outputPortPos(node.x, node.y, i, node.spec))
                             while (true) {
                                 val event = awaitPointerEvent()
                                 val change = event.changes.firstOrNull { it.id == down.id } ?: break
