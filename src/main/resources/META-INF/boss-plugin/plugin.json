@@ -20,5 +20,13 @@
   },
   "description": "Node-based flow canvas — spawn nodes and connect them with edges, n8n style.",
   "author": "Risa Labs",
-  "url": "https://github.com/risa-labs-inc/boss-plugin-flow-tab"
+  "url": "https://github.com/risa-labs-inc/boss-plugin-flow-tab",
+  "sandbox": {
+    "maxThreads": 4,
+    "maxRestartAttempts": 3,
+    "heartbeatIntervalMs": 5000
+  },
+  "isolationMode": "out-of-process",
+  "fallback": "in-process",
+  "stateHolderClass": "ai.rever.boss.plugin.runtime.stateholders.FlowStateHolder"
 }
