@@ -4,12 +4,12 @@
 
 **Flow** (`ai.rever.boss.plugin.dynamic.flowtab`) is a dynamic plugin for the BOSS desktop application.
 
-A node-based flow canvas — spawn nodes and connect them with edges, n8n style. Lightweight,
+A node-based flow canvas - spawn nodes and connect them with edges, n8n style. Lightweight,
 self-contained Compose UI with a pan/zoom canvas, draggable nodes, and bezier edges.
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.flowtab`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.flowtab.FlowTabDynamicPlugin`
-- **API Version**: 1.0.56 (minBossVersion 9.2.20 — needs the host MCP tool framework)
+- **API Version**: 1.0.56 (minBossVersion 9.2.20 - needs the host MCP tool framework)
 
 ## Essential Commands
 
@@ -35,13 +35,13 @@ build.gradle.kts   → Build config + version (single source of truth)
 ```
 
 ### Source files
-- `FlowTabDynamicPlugin.kt` — entry point, registers the tab type.
-- `FlowTabType.kt` / `FlowTabData.kt` — tab type + tab config.
-- `FlowModel.kt` — serializable graph model (NodeType, NodeModel, EdgeModel, GraphSnapshot) + port geometry.
-- `FlowGraphState.kt` — runtime state: nodes/edges, pan/zoom transform, selection, pending connection.
-- `FlowCanvas.kt` — grid + edge rendering (Canvas) and pan/zoom/tap gestures.
-- `FlowNodeView.kt` — node card + ports, drag-to-move, drag-port-to-connect.
-- `FlowTabComponent.kt` — TabComponentWithUI: toolbar, palette, persistence wiring.
+- `FlowTabDynamicPlugin.kt` - entry point, registers the tab type.
+- `FlowTabType.kt` / `FlowTabData.kt` - tab type + tab config.
+- `FlowModel.kt` - serializable graph model (NodeType, NodeModel, EdgeModel, GraphSnapshot) + port geometry.
+- `FlowGraphState.kt` - runtime state: nodes/edges, pan/zoom transform, selection, pending connection.
+- `FlowCanvas.kt` - grid + edge rendering (Canvas) and pan/zoom/tap gestures.
+- `FlowNodeView.kt` - node card + ports, drag-to-move, drag-port-to-connect.
+- `FlowTabComponent.kt` - TabComponentWithUI: toolbar, palette, persistence wiring.
 
 ### Performance notes
 - Grid and all edges are drawn in single `Canvas` draw passes (cheap, GPU-backed).
@@ -66,7 +66,7 @@ The `processResources` task syncs the version into `plugin.json` at build time.
 
 - Use Compose Multiplatform APIs (not Android-specific).
 - All Kotlin files must end with a newline.
-- Handle null providers gracefully — show fallback UI, never crash.
+- Handle null providers gracefully - show fallback UI, never crash.
 
 ## CI/CD
 
