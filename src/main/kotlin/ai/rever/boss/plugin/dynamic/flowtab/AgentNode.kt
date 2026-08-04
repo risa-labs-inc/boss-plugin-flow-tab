@@ -147,10 +147,11 @@ fun agentNodeSpec(
 )
 
 /**
- * Production `agent` spec: an [AnthropicProvider] keyed from the host secret vault, over
- * a [MergedToolSource] of the host registry ([BossRegistryToolSource]) plus a
- * per-run browser lane ([FlowBrowserToolSource] on the run's own [SessionRegistry]).
- * The [AgentRuntime]'s allowlist then narrows that merged set to what the node permits.
+ * Production `agent` spec: an [AnthropicProvider] keyed from the shared AI provider config
+ * (Settings → AI Providers, owned by the secret-manager plugin), over a [MergedToolSource] of
+ * the host registry ([BossRegistryToolSource]) plus a per-run browser lane
+ * ([FlowBrowserToolSource] on the run's own [SessionRegistry]). The [AgentRuntime]'s allowlist
+ * then narrows that merged set to what the node permits.
  */
 fun defaultAgentNodeSpec(
     context: PluginContext,
@@ -161,9 +162,13 @@ fun defaultAgentNodeSpec(
     external: ExternalMcpManager? = null,
 ): NodeSpec {
     val secrets = SecretResolver.fromSecrets(context)
+    val llm = context.llmProvider
     return agentNodeSpec(
         prompts = prompts,
-        providerFor = { settings -> AnthropicProvider(secrets, model = settings.model) },
+        // Resolved per run, not once here: LlmProvider exposes no change signal, so a key or
+        // provider changed in Settings has to be picked up by the next run rather than needing
+        // the tab reopened.
+        providerFor = { settings -> anthropicProviderFor(llm, secrets, settings.model) },
         toolSourceFor = { ctx ->
             val lanes = buildList {
                 context.mcpToolRegistry?.let { add(BossRegistryToolSource(it)) }
