@@ -1,6 +1,6 @@
 # BOSS Flow Tab
 
-A node-based flow canvas tab for the BOSS desktop application — spawn nodes and wire them
+A node-based flow canvas tab for the BOSS desktop application - spawn nodes and wire them
 together with edges, n8n style.
 
 ## Features

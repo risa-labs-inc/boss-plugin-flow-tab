@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Flow → Workflow Orchestrator — Plan</title>
+<title>Flow → Workflow Orchestrator - Plan</title>
 <!--
   visual-plan template. Copy this file, replace the content, KEEP the design system.
   Component classes are documented inline below. Rules:
@@ -209,7 +209,7 @@
     <section class="sec" id="tldr">
       <h2><span class="spine">00</span>TL;DR</h2>
       <div class="tldr">
-        <p class="lead">Refactor Flow's closed node <code>enum</code> into an open <code>NodeSpec</code> registry, then feed that registry from a unified tool layer so tools, browsers, and agents all become nodes — and expose a fixed set of MCP tools so Claude Code can build workflows itself.</p>
+        <p class="lead">Refactor Flow's closed node <code>enum</code> into an open <code>NodeSpec</code> registry, then feed that registry from a unified tool layer so tools, browsers, and agents all become nodes - and expose a fixed set of MCP tools so Claude Code can build workflows itself.</p>
         <ul class="bul">
           <li><b>Consume, don't build.</b> The host already has the "toolkit registry" (<code>PluginContext.mcpToolRegistry</code>: enumerate + <code>invoke()</code> every plugin's tools in-process) and an MCP server (<code>registerMcpToolProvider</code> → <code>mcp__boss__*</code>, attachable to Claude Code). We wrap these, not reinvent them.</li>
           <li><b>One keystone unlocks four features.</b> <code>NodeType</code> (enum) → <code>NodeSpec</code> (registry entry). After it, tool-nodes, browser-tool-nodes, and agent-nodes are all "register a spec at runtime."</li>
@@ -218,7 +218,7 @@
         </ul>
         <div class="callout callout--decision" style="margin-bottom:0">
           <span class="label">Central decision</span>
-          Replace the <code>NodeType</code> enum with a runtime <code>NodeSpec</code> registry fed by a unified <code>ToolSource</code> layer. Everything else (tool-nodes, agent-nodes, MCP authoring, templates) is additive on top of that seam — but its config-schema shape must be proven by a spike <em>before</em> P0 freezes it.
+          Replace the <code>NodeType</code> enum with a runtime <code>NodeSpec</code> registry fed by a unified <code>ToolSource</code> layer. Everything else (tool-nodes, agent-nodes, MCP authoring, templates) is additive on top of that seam - but its config-schema shape must be proven by a spike <em>before</em> P0 freezes it.
         </div>
       </div>
     </section>
@@ -238,12 +238,12 @@
       </ul>
       <h3>Non-goals <span class="chip chip--info">scope guard</span></h3>
       <ul class="bul">
-        <li><b>Not</b> hosting our own MCP server — terminal-tab owns the single <code>boss</code> server; two would collide.</li>
-        <li><b>Not</b> building a generic host-level tool registry — the host already has one; we consume it.</li>
-        <li><b>Not</b> a tool-per-artifact MCP surface — a small <em>fixed</em> generic tool set that takes names/ids as args (the provider is non-reactive).</li>
-        <li><b>Not</b> a full visual prompt-graph / multi-agent-swarm UI (reviving deleted #93 literally) — single agent nodes + nesting only.</li>
-        <li><b>Not</b> replacing the DAG executor — it stays; we make it kind-agnostic and add an async job wrapper.</li>
-        <li><b>Not</b> a stable-node-id expression engine rewrite now — keep title-based <code>{{ }}</code> refs; enforce unique titles on generated graphs (deferred, see D3).</li>
+        <li><b>Not</b> hosting our own MCP server - terminal-tab owns the single <code>boss</code> server; two would collide.</li>
+        <li><b>Not</b> building a generic host-level tool registry - the host already has one; we consume it.</li>
+        <li><b>Not</b> a tool-per-artifact MCP surface - a small <em>fixed</em> generic tool set that takes names/ids as args (the provider is non-reactive).</li>
+        <li><b>Not</b> a full visual prompt-graph / multi-agent-swarm UI (reviving deleted #93 literally) - single agent nodes + nesting only.</li>
+        <li><b>Not</b> replacing the DAG executor - it stays; we make it kind-agnostic and add an async job wrapper.</li>
+        <li><b>Not</b> a stable-node-id expression engine rewrite now - keep title-based <code>{{ }}</code> refs; enforce unique titles on generated graphs (deferred, see D3).</li>
       </ul>
     </section>
 
@@ -251,18 +251,18 @@
     <section class="sec" id="architecture">
       <h2><span class="spine">02</span>Architecture</h2>
       <ul class="bul">
-        <li><b><code>NodeRegistry</code></b> (new) — runtime map <code>kind-id → NodeSpec{ports, configFields, runMode, usesSession, executor}</code>. Replaces the <code>NodeType</code> enum + four <code>when</code> blocks. Palette + dispatch read from it.</li>
-        <li><b><code>ToolSource</code></b> (new) — stateless <code>list()/invoke(name, argsJson)</code>. Impls: <code>BossRegistryToolSource</code> (wraps <code>mcpToolRegistry</code>), <code>ExternalMcpToolSource</code> (new MCP client), <code>FlowBrowserToolSource</code> (thin façade over the stateful SessionRegistry, threads <code>session_id</code>).</li>
-        <li><b><code>SessionRegistry</code></b> (new) — owns long-lived browser sessions (<code>session_id → BrowserIntegration</code> + per-session mutex). A <code>RunContext</code> redesign: N sessions instead of one fenced session.</li>
-        <li><b><code>FlowController</code></b> (new, headless) — authors/patches <code>GraphSnapshot</code> JSON at the <em>storage</em> layer (<code>graph:&lt;tabId&gt;</code>); runs graphs via the UI-free <code>FlowExecutor</code>; exposes an async run-job model (runId + poll).</li>
-        <li><b><code>FlowMcpToolProvider</code></b> (new) — a fixed generic tool set (<code>flow_*</code>, <code>lanager_*</code>, <code>prompt_*</code>) registered into the host's <code>boss</code> MCP server via <code>registerMcpToolProvider</code>.</li>
-        <li><b><code>AgentRuntime</code></b> (new) — provider-agnostic Kotlin tool-loop (port of RISA's runner); agent-node executor; tool-allowlist drawn from <code>ToolSource</code>; subagent = nested lanager async job.</li>
-        <li><b><code>PromptRegistry</code></b> (new) — composable prompts persisted via <code>pluginStorageFactory</code>; builder UI; prompt-authoring MCP tools.</li>
-        <li><b><code>FlowExecutor</code></b> (exists, unchanged core) — parallel topological DAG, coroutine-per-node. Stays kind-agnostic; only its session handling moves to SessionRegistry.</li>
-        <li><b>Host (exists)</b> — <code>mcpToolRegistry</code>, <code>registerMcpToolProvider</code>, <code>McpServerController.attach("CLAUDE_CODE")</code>, <code>BrowserService</code>, <code>secretDataProvider</code>, <code>pluginStorageFactory</code>. terminal-tab hosts the <code>boss</code> server.</li>
+        <li><b><code>NodeRegistry</code></b> (new) - runtime map <code>kind-id → NodeSpec{ports, configFields, runMode, usesSession, executor}</code>. Replaces the <code>NodeType</code> enum + four <code>when</code> blocks. Palette + dispatch read from it.</li>
+        <li><b><code>ToolSource</code></b> (new) - stateless <code>list()/invoke(name, argsJson)</code>. Impls: <code>BossRegistryToolSource</code> (wraps <code>mcpToolRegistry</code>), <code>ExternalMcpToolSource</code> (new MCP client), <code>FlowBrowserToolSource</code> (thin façade over the stateful SessionRegistry, threads <code>session_id</code>).</li>
+        <li><b><code>SessionRegistry</code></b> (new) - owns long-lived browser sessions (<code>session_id → BrowserIntegration</code> + per-session mutex). A <code>RunContext</code> redesign: N sessions instead of one fenced session.</li>
+        <li><b><code>FlowController</code></b> (new, headless) - authors/patches <code>GraphSnapshot</code> JSON at the <em>storage</em> layer (<code>graph:&lt;tabId&gt;</code>); runs graphs via the UI-free <code>FlowExecutor</code>; exposes an async run-job model (runId + poll).</li>
+        <li><b><code>FlowMcpToolProvider</code></b> (new) - a fixed generic tool set (<code>flow_*</code>, <code>lanager_*</code>, <code>prompt_*</code>) registered into the host's <code>boss</code> MCP server via <code>registerMcpToolProvider</code>.</li>
+        <li><b><code>AgentRuntime</code></b> (new) - provider-agnostic Kotlin tool-loop (port of RISA's runner); agent-node executor; tool-allowlist drawn from <code>ToolSource</code>; subagent = nested lanager async job.</li>
+        <li><b><code>PromptRegistry</code></b> (new) - composable prompts persisted via <code>pluginStorageFactory</code>; builder UI; prompt-authoring MCP tools.</li>
+        <li><b><code>FlowExecutor</code></b> (exists, unchanged core) - parallel topological DAG, coroutine-per-node. Stays kind-agnostic; only its session handling moves to SessionRegistry.</li>
+        <li><b>Host (exists)</b> - <code>mcpToolRegistry</code>, <code>registerMcpToolProvider</code>, <code>McpServerController.attach("CLAUDE_CODE")</code>, <code>BrowserService</code>, <code>secretDataProvider</code>, <code>pluginStorageFactory</code>. terminal-tab hosts the <code>boss</code> server.</li>
       </ul>
       <div class="diagram">
-        <div class="cap">System architecture — components &amp; ownership (accent = new/changed)</div>
+        <div class="cap">System architecture - components &amp; ownership (accent = new/changed)</div>
         <div class="mermaid">
 graph TD
   CC[Claude Code CLI]:::ext -->|mcp__boss__flow_*| BOSS[boss MCP server<br/>terminal-tab / BossTerm]:::ext
@@ -299,12 +299,12 @@ graph TD
     <section class="sec" id="dataflow">
       <h2><span class="spine">03</span>Data flow</h2>
       <ul class="bul">
-        <li><b>Authoring is storage-seated:</b> <code>flow_add_node</code> patches the <code>GraphSnapshot</code> JSON at <code>graph:&lt;tabId&gt;</code> — no open tab required. A live tab, if any, re-reads storage on the Main thread.</li>
+        <li><b>Authoring is storage-seated:</b> <code>flow_add_node</code> patches the <code>GraphSnapshot</code> JSON at <code>graph:&lt;tabId&gt;</code> - no open tab required. A live tab, if any, re-reads storage on the Main thread.</li>
         <li><b>Running is async:</b> <code>flow_run</code> returns a <code>runId</code> immediately (the registry <code>invoke</code> is fenced at 60s; a browser DAG can exceed that). The agent polls <code>flow_status</code>/<code>flow_result</code>.</li>
         <li><b>Tools resolve through <code>ToolSource</code>:</b> a tool-node executor calls <code>invoke(name, argsJson)</code>; <code>isError</code> is thrown as <code>ExecError</code> to feed the DAG's exception-based failure model.</li>
       </ul>
       <div class="diagram">
-        <div class="cap">Claude Code authors then runs a lanager — async job path</div>
+        <div class="cap">Claude Code authors then runs a lanager - async job path</div>
         <div class="mermaid">
 sequenceDiagram
   autonumber
@@ -341,16 +341,16 @@ sequenceDiagram
     <section class="sec" id="schema">
       <h2><span class="spine">04</span>Data model &amp; contracts</h2>
       <ul class="bul">
-        <li><b><code>GraphSnapshot v2</code></b> — adds <code>schemaVersion: Int</code> (gate old builds) + <code>metadata: FlowMeta?{name, version, description, inputs}</code>. <code>nodes/edges/nextId</code> unchanged. <b>No sidecar <code>agents</code> map</b> — agent config lives in <code>node.config</code> (F6).</li>
+        <li><b><code>GraphSnapshot v2</code></b> - adds <code>schemaVersion: Int</code> (gate old builds) + <code>metadata: FlowMeta?{name, version, description, inputs}</code>. <code>nodes/edges/nextId</code> unchanged. <b>No sidecar <code>agents</code> map</b> - agent config lives in <code>node.config</code> (F6).</li>
         <li><b><code>NodeModel.type</code>: <code>NodeType</code> → <code>String</code> kind-id.</b> Legacy enum names (<code>"HTTP"</code>) map 1:1 to registry ids; new ids namespaced <code>tool:boss:&lt;name&gt;</code>, <code>tool:ext:&lt;server&gt;/&lt;name&gt;</code>, <code>agent</code>, <code>lanager</code>, <code>browser:&lt;action&gt;</code>.</li>
-        <li><b><code>NodeSpec</code></b> (runtime, not serialized) — <code>{id, label, inputs, outputs, configFields, runMode, usesSession, executor}</code>. Built-ins registered at startup; tool/agent specs registered dynamically.</li>
-        <li><b><code>ConfigField</code> extended</b> — add <code>FieldType.JSON</code> (raw editor) + <code>NUMBER</code>; nested/array tool inputs stored as a JSON blob in <code>config</code> and marshalled to <code>argsJson</code> (F3).</li>
+        <li><b><code>NodeSpec</code></b> (runtime, not serialized) - <code>{id, label, inputs, outputs, configFields, runMode, usesSession, executor}</code>. Built-ins registered at startup; tool/agent specs registered dynamically.</li>
+        <li><b><code>ConfigField</code> extended</b> - add <code>FieldType.JSON</code> (raw editor) + <code>NUMBER</code>; nested/array tool inputs stored as a JSON blob in <code>config</code> and marshalled to <code>argsJson</code> (F3).</li>
         <li><b>Tool-node <code>config</code> caches</b> <code>toolRef</code> + a <code>schemaSnapshot</code> at author time, so a saved flow renders/validates even when the tool is absent at load (F4).</li>
-        <li><b><code>Prompt</code></b> — <code>{id, name, base, rules[], glossary[], goals[], toolAllowlist: ToolRef[], version}</code>, persisted at <code>prompt:&lt;id&gt;</code> + <code>prompts:index</code>.</li>
-        <li><b>New storage keys</b> — <code>prompt:*</code>, <code>template:*</code>, <code>mcpservers:config</code> (external servers; secrets held separately in <code>secretDataProvider</code>), <code>settings</code>. Existing: <code>graph:&lt;tabId&gt;</code>, <code>runstate:&lt;tabId&gt;</code>.</li>
+        <li><b><code>Prompt</code></b> - <code>{id, name, base, rules[], glossary[], goals[], toolAllowlist: ToolRef[], version}</code>, persisted at <code>prompt:&lt;id&gt;</code> + <code>prompts:index</code>.</li>
+        <li><b>New storage keys</b> - <code>prompt:*</code>, <code>template:*</code>, <code>mcpservers:config</code> (external servers; secrets held separately in <code>secretDataProvider</code>), <code>settings</code>. Existing: <code>graph:&lt;tabId&gt;</code>, <code>runstate:&lt;tabId&gt;</code>.</li>
       </ul>
       <div class="diagram">
-        <div class="cap">Lanager artifact — entities &amp; relations</div>
+        <div class="cap">Lanager artifact - entities &amp; relations</div>
         <div class="mermaid">
 erDiagram
   GRAPHSNAPSHOT ||--o{ NODEMODEL : contains
@@ -389,7 +389,7 @@ erDiagram
       <p style="color:var(--muted);font-size:14px;margin-top:0">Spine: <code>P-spike → P0 → P1 → {P2, P3, P4} → P5 → P6</code>; <code>P7</code> isolated behind a flag. Two spikes precede P0 because they can force the <code>NodeSpec</code>/<code>config</code> shape (red-team F3/F6).</p>
       <ol class="phases">
         <li>
-          <div class="phase-title">P-spike — prove the two shapes that P0 will freeze <span class="chip chip--danger">gate</span></div>
+          <div class="phase-title">P-spike - prove the two shapes that P0 will freeze <span class="chip chip--danger">gate</span></div>
           <ul class="bul">
             <li>Map ~20 real <code>mcpToolRegistry</code> tool <code>inputSchema</code> strings → <code>ConfigField</code> set; find which need nested/array/JSON handling. Decides <code>FieldType.JSON</code>/<code>NUMBER</code> + arg-marshalling.</li>
             <li>Prototype agent-node config living inside <code>node.config</code> + a sub-flow-run-as-async-tool contract. Confirms no sidecar <code>agents</code> map is needed.</li>
@@ -398,7 +398,7 @@ erDiagram
           <div class="phase-files"><span>spike/ (throwaway)</span><span>draft NodeSpec.kt</span><span>draft ToolSource.kt</span></div>
         </li>
         <li>
-          <div class="phase-title">P0 — Node registry refactor (keystone, behavior-preserving)</div>
+          <div class="phase-title">P0 - Node registry refactor (keystone, behavior-preserving)</div>
           <ul class="bul">
             <li>Introduce <code>NodeSpec</code> + <code>NodeRegistry</code>; re-express all 12 built-ins as registered specs. Drive palette off <code>registry.all()</code> not <code>NodeType.entries</code>; dispatch off <code>registry[kind].executor</code>.</li>
             <li><code>NodeModel.type</code>: enum → <code>String</code> kind-id (legacy names map 1:1 on the wire). Add <code>schemaVersion</code>; unknown kind/absent tool = first-class "unavailable" node state, not <code>ExecError</code>.</li>
@@ -407,7 +407,7 @@ erDiagram
           <div class="phase-files"><span>NodeSpec.kt (new)</span><span>NodeRegistry.kt (new)</span><span>FlowModel.kt</span><span>NodeExecutors.kt</span><span>FlowNodePicker.kt</span><span>FlowNodeView.kt</span><span>FlowExecutorTest.kt</span></div>
         </li>
         <li>
-          <div class="phase-title">P1 — Tool-nodes from the host registry</div>
+          <div class="phase-title">P1 - Tool-nodes from the host registry</div>
           <ul class="bul">
             <li><code>ToolSource</code> + <code>BossRegistryToolSource</code> (collects <code>mcpToolRegistry.tools</code>, RBAC-filtered). Generate a <code>NodeSpec</code> per tool; configFields/JSON from <code>inputSchema</code>.</li>
             <li>Tool-node executor: build <code>argsJson</code> from <code>config</code>, call <code>invoke()</code>, <b>throw <code>ExecError</code> on <code>isError</code></b> (F8), cache <code>schemaSnapshot</code> (F4).</li>
@@ -416,7 +416,7 @@ erDiagram
           <div class="phase-files"><span>ToolSource.kt (new)</span><span>BossRegistryToolSource.kt (new)</span><span>ToolNodeExecutor.kt (new)</span><span>FlowNodePicker.kt</span><span>FlowTabComponent.kt</span></div>
         </li>
         <li>
-          <div class="phase-title">P2 — Headless FlowController + async jobs + MCP authoring</div>
+          <div class="phase-title">P2 - Headless FlowController + async jobs + MCP authoring</div>
           <ul class="bul">
             <li><code>FlowController</code>: create/patch <code>GraphSnapshot</code> at the storage layer (reuse <code>openImportedInNewTab</code> pattern); run via headless <code>FlowExecutor(context)</code>; async run-job model (runId + status/result).</li>
             <li><code>FlowMcpToolProvider</code>: fixed generic tools <code>flow_create/flow_add_node/flow_connect/flow_run/flow_status/flow_result/flow_list/flow_get</code> (+ <code>lanager_*</code> stubs). Register via <code>registerMcpToolProvider</code>; resolve <code>McpServerController</code> lazily; degrade gracefully if terminal-tab absent.</li>
@@ -425,7 +425,7 @@ erDiagram
           <div class="phase-files"><span>FlowController.kt (new)</span><span>FlowMcpToolProvider.kt (new)</span><span>FlowTabDynamicPlugin.kt</span><span>plugin.json</span><span>build.gradle.kts</span></div>
         </li>
         <li>
-          <div class="phase-title">P3 — SessionRegistry + browser-as-tools (orchestrator repositioning)</div>
+          <div class="phase-title">P3 - SessionRegistry + browser-as-tools (orchestrator repositioning)</div>
           <ul class="bul">
             <li><code>SessionRegistry</code>: N long-lived sessions (<code>session_id → BrowserIntegration</code> + per-session mutex). Refactor <code>RunContext</code> from single-session/single-mutex to draw from it; native browser nodes keep working.</li>
             <li><code>FlowBrowserToolSource</code>: stateless tools (<code>browser_open/navigate/click/type/extract/close</code>) that thread <code>session_id</code> and delegate to SessionRegistry. Now agents + external callers can drive the browser.</li>
@@ -433,7 +433,7 @@ erDiagram
           <div class="phase-files"><span>SessionRegistry.kt (new)</span><span>FlowBrowserToolSource.kt (new)</span><span>NodeExecutors.kt</span><span>BrowserIntegrations.kt</span></div>
         </li>
         <li>
-          <div class="phase-title">P4 — Prompt registry + builder UI</div>
+          <div class="phase-title">P4 - Prompt registry + builder UI</div>
           <ul class="bul">
             <li><code>PromptRegistry</code> + <code>Prompt</code> model persisted via <code>pluginStorageFactory</code>; compose base+rules+glossary+goals+toolAllowlist (port RISA <code>rx/prompts.py</code> composition).</li>
             <li>Builder UI (panel or tab); prompt-authoring MCP tools <code>prompt_upsert/prompt_get/prompt_list</code>.</li>
@@ -441,7 +441,7 @@ erDiagram
           <div class="phase-files"><span>PromptRegistry.kt (new)</span><span>PromptModel.kt (new)</span><span>PromptBuilderUI.kt (new)</span><span>FlowMcpToolProvider.kt</span></div>
         </li>
         <li>
-          <div class="phase-title">P5 — Agent / lanager nodes</div>
+          <div class="phase-title">P5 - Agent / lanager nodes</div>
           <ul class="bul">
             <li><code>AgentRuntime</code>: provider-agnostic Kotlin tool-loop (Anthropic-first; OpenAI/Custom via <code>llmrpa</code> transport); keys via <code>secretDataProvider</code>; bounded (max-steps, timeout, cost cap).</li>
             <li>Agent-node executor: prompt (from P4) + tool-allowlist (from <code>ToolSource</code>) + own browser session (from P3). Lanager node = nested sub-flow run as an async job via <code>FlowController</code>; cross-flow depth/cycle limits.</li>
@@ -449,7 +449,7 @@ erDiagram
           <div class="phase-files"><span>AgentRuntime.kt (new)</span><span>AgentProviders.kt (new)</span><span>AgentNodeExecutor.kt (new)</span><span>FlowController.kt</span></div>
         </li>
         <li>
-          <div class="phase-title">P6 — Lanager template gallery + versioning</div>
+          <div class="phase-title">P6 - Lanager template gallery + versioning</div>
           <ul class="bul">
             <li>Template metadata + <code>schemaVersion</code>-gated import; gallery UI; bundled starter templates; export inlines referenced prompts, <b>strips secrets</b>.</li>
             <li>Extend <code>importAny</code> to recognise lanager templates alongside GraphSnapshot + RPA recordings.</li>
@@ -457,7 +457,7 @@ erDiagram
           <div class="phase-files"><span>TemplateGallery.kt (new)</span><span>FlowTabComponent.kt</span><span>resources/templates/*.json (new)</span></div>
         </li>
         <li>
-          <div class="phase-title">P7 — External MCP client <span class="chip chip--warn">flagged · last</span></div>
+          <div class="phase-title">P7 - External MCP client <span class="chip chip--warn">flagged · last</span></div>
           <ul class="bul">
             <li>Bundle MCP Kotlin SDK <em>client</em>; support stdio + HTTP/SSE; connection-manager UI; secrets in <code>secretDataProvider</code>; per-server explicit enable.</li>
             <li>Handle the macOS GUI-PATH problem (resolve binaries via a login shell), subprocess reaping on <code>dispose()</code>, and third-party secret egress. Tools merge into <code>ToolSource</code> as <code>ext:&lt;server&gt;/*</code> → become nodes + agent-callable.</li>
@@ -477,7 +477,7 @@ erDiagram
           <tr>
             <td><code>mcpToolRegistry</code> exposes enumerate (<code>tools</code>) + in-process <code>invoke()</code> to sandboxed plugins (verified in <code>boss-plugin-api</code> 1.0.56 / <code>DefaultPlugin</code>, delegated through Sandboxed/Tracking contexts).</td>
             <td><span class="chip chip--ok">high</span></td>
-            <td class="consequence">If actually gated/absent at runtime, P1 (tool-nodes) has no source — the whole orchestrator premise fails. Verify against the <em>installed</em> BossConsole build early.</td>
+            <td class="consequence">If actually gated/absent at runtime, P1 (tool-nodes) has no source - the whole orchestrator premise fails. Verify against the <em>installed</em> BossConsole build early.</td>
           </tr>
           <tr>
             <td>The <code>FlowExecutor</code> DAG core is UI-independent and headless-runnable (verified: <code>PlanNode</code> snapshot, no Compose refs).</td>
@@ -485,7 +485,7 @@ erDiagram
             <td class="consequence">If a hidden UI dependency exists, the headless <code>FlowController</code> (P2) can't run flows for agents/Claude Code.</td>
           </tr>
           <tr>
-            <td>A fixed generic <code>flow_*</code> tool set (names-as-args) is sufficient for agent authoring — no per-artifact tools needed.</td>
+            <td>A fixed generic <code>flow_*</code> tool set (names-as-args) is sufficient for agent authoring - no per-artifact tools needed.</td>
             <td><span class="chip chip--warn">medium</span></td>
             <td class="consequence">The provider is non-reactive (F7); if per-artifact tools ARE needed, re-register churn races the terminal-tab bridge. De-risk: confirm the generic surface with a real Claude Code authoring session in P2.</td>
           </tr>
@@ -497,7 +497,7 @@ erDiagram
           <tr>
             <td>terminal-tab (the <code>boss</code> server host) is present in the user's install, so Flow's registered tools actually surface to Claude Code.</td>
             <td><span class="chip chip--danger">low / unverified</span></td>
-            <td class="consequence">If absent, all outward MCP authoring (P2/P4/P5 tools) is inert — nodes/agents still work in-app. VERIFY: declare a soft dependency + degrade; document the requirement.</td>
+            <td class="consequence">If absent, all outward MCP authoring (P2/P4/P5 tools) is inert - nodes/agents still work in-app. VERIFY: declare a soft dependency + degrade; document the requirement.</td>
           </tr>
           <tr>
             <td>We can bump <code>apiVersion → ≥1.0.56</code> + <code>minBossVersion</code> and users are on a new-enough BossConsole.</td>
@@ -513,14 +513,14 @@ erDiagram
       <h2><span class="spine">07</span>Blind spots <span class="chip chip--warn">red-team</span></h2>
       <p style="color:var(--muted);font-size:14px;margin-top:0">Found by an independent agent told to break this plan. Structural flaws and things the plan does not see.</p>
       <div class="redteam">
-        <div class="rt-head">Structural flaws — folded into the plan above (F1-F6)</div>
+        <div class="rt-head">Structural flaws - folded into the plan above (F1-F6)</div>
         <div class="blind">
           <div class="bt">F1 · 60s <code>invoke</code> timeout kills synchronous <code>flow_run</code></div>
-          <div class="bw">A browser DAG (per-node waits up to 15-20s) can exceed the registry's 60s fence. <b>Fix applied:</b> async job model — <code>flow_run</code> returns <code>runId</code>, agent polls <code>flow_status</code>/<code>flow_result</code>. The tool contract is async from P2's first line.</div>
+          <div class="bw">A browser DAG (per-node waits up to 15-20s) can exceed the registry's 60s fence. <b>Fix applied:</b> async job model - <code>flow_run</code> returns <code>runId</code>, agent polls <code>flow_status</code>/<code>flow_result</code>. The tool contract is async from P2's first line.</div>
         </div>
         <div class="blind">
           <div class="bt">F2 / F12 · stateless <code>ToolSource.invoke</code> doesn't fit stateful browser sessions</div>
-          <div class="bw">A browser action needs a session that outlives a single call and that an external MCP caller (no <code>RunContext</code>) can reach. <b>Fix applied:</b> browser statefulness externalized into a new <code>SessionRegistry</code> (N sessions, per-session mutex) — a real <code>RunContext</code> redesign (P3), not a wrapper. <code>ToolSource</code> stays stateless by threading <code>session_id</code>.</div>
+          <div class="bw">A browser action needs a session that outlives a single call and that an external MCP caller (no <code>RunContext</code>) can reach. <b>Fix applied:</b> browser statefulness externalized into a new <code>SessionRegistry</code> (N sessions, per-session mutex) - a real <code>RunContext</code> redesign (P3), not a wrapper. <code>ToolSource</code> stays stateless by threading <code>session_id</code>.</div>
         </div>
         <div class="blind">
           <div class="bt">F3 · flat <code>ConfigField</code> + scalar args can't hold nested JSON-Schema</div>
@@ -549,7 +549,7 @@ erDiagram
         </div>
         <div class="blind">
           <div class="bt">F11 · title→id <code>{{ }}</code> migration rewrites substrings inside config</div>
-          <div class="bw">Refs are resolved by title inside arbitrary strings; switching to ids is a content migration, not a rename (and <code>SET</code> already passes <code>emptyMap()</code> for node outputs). Mitigation: <b>defer D3</b> — keep title refs, enforce unique titles on generated graphs.</div>
+          <div class="bw">Refs are resolved by title inside arbitrary strings; switching to ids is a content migration, not a rename (and <code>SET</code> already passes <code>emptyMap()</code> for node outputs). Mitigation: <b>defer D3</b> - keep title refs, enforce unique titles on generated graphs.</div>
         </div>
       </div>
     </section>
@@ -577,7 +577,7 @@ erDiagram
       <ul class="bul">
         <li><b>Installed-host versions.</b> What BossConsole version(s) are your users on? This gates the <code>apiVersion</code>/<code>minBossVersion</code> bump and whether P2 can ship without stranding anyone.</li>
         <li><b>Is terminal-tab a hard requirement?</b> Accept "MCP authoring only works with terminal-tab installed" (soft dep + degrade), or should Flow itself stand up nothing and we document it as required?</li>
-        <li><b>Agent model + budget defaults.</b> Anthropic-first via <code>secretDataProvider</code> keys — OK? What per-run cost/step ceilings do you want as defaults?</li>
+        <li><b>Agent model + budget defaults.</b> Anthropic-first via <code>secretDataProvider</code> keys - OK? What per-run cost/step ceilings do you want as defaults?</li>
         <li><b>D3 deferral OK?</b> Keep title-based <code>{{ }}</code> refs + enforce unique titles on generated graphs now; defer the stable-id engine change. Confirm.</li>
         <li><b>Scope of "all phases now."</b> This plan details P-spike→P7. Do you want me to also write the superpowers implementation plan for <em>all</em> phases, or just through the keystone (P-spike+P0+P1) and re-plan later phases as we learn?</li>
         <li><b>Plan file location.</b> Rendered into the flow-tab submodule (<code>flow-tab/visual-plans/</code>). Keep it there (untracked) or move outside the submodule?</li>
