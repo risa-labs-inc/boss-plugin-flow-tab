@@ -1,5 +1,8 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import ai.rever.boss.plugin.api.LlmApiFormat
+import ai.rever.boss.plugin.api.LlmConfig
+import ai.rever.boss.plugin.api.LlmProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -48,9 +51,12 @@ class FakeProvider(
 
 /**
  * Resolves an API key by logical name. Kept as a seam so the runtime never touches the
- * host directly and tests can inject a constant. [fromSecrets] backs it with the host's
- * [ai.rever.boss.plugin.api.SecretDataProvider]: a secret whose website/username matches
- * the name, returning its password field.
+ * host directly and tests can inject a constant.
+ *
+ * Production agents do not build one of these directly — [anthropicProviderFor] takes the key
+ * from the shared AI provider config the user set up in Settings → AI Providers, which is
+ * where every BOSS plugin's AI keys now live. [fromSecrets] remains as its last resort, for a
+ * user who stored an `ANTHROPIC_API_KEY` secret by hand and never opened that panel.
  */
 fun interface SecretResolver {
     suspend fun get(name: String): String?
@@ -67,6 +73,53 @@ fun interface SecretResolver {
             }.getOrNull()
         }
     }
+}
+
+/**
+ * The Anthropic credential + endpoint to run an agent with, resolved from the shared AI
+ * provider config the secret-manager plugin owns.
+ *
+ * The agent node speaks Anthropic's tool-use format only, so an OpenAI-format provider is no
+ * use to it even when that is what the user has *active* — hence the two-step search: the
+ * active provider first, then any other configured Anthropic one.
+ *
+ * Returns null when nothing suitable is configured, which is not the same as "the user has
+ * nothing": `configuredProviders()` has a default body returning an empty list, so an
+ * implementation that does not override it is indistinguishable from an unconfigured one.
+ * That is why the caller falls back to the secret store rather than failing here.
+ */
+internal fun anthropicConfigFrom(llm: LlmProvider?): LlmConfig? {
+    if (llm == null) return null
+    fun usable(c: LlmConfig?) =
+        c?.takeIf { it.apiFormat == LlmApiFormat.ANTHROPIC_MESSAGES && it.apiKey.isNotBlank() }
+
+    return usable(llm.activeConfig())
+        ?: llm.configuredProviders().firstNotNullOfOrNull { usable(it) }
+}
+
+/**
+ * Build the agent's provider: key and endpoint from the shared AI provider config when one is
+ * configured, else the old secret-store lookup.
+ *
+ * The **model stays the node's** ([AgentSettings.model], a visible per-node config field with
+ * its own default). Taking `LlmConfig.modelId` instead would silently change which model
+ * existing flows run on, decided in a settings panel the flow author may never have opened.
+ *
+ * `LlmConfig.maxTokens` is likewise ignored: it is a chat-completion default (2000) chosen for
+ * one-shot replies, while a bounded tool-use loop needs the 4096 headroom
+ * [AnthropicProvider] defaults to. The runtime's own [AgentBudget] is what bounds a run.
+ */
+internal fun anthropicProviderFor(
+    llm: LlmProvider?,
+    fallbackKeys: SecretResolver,
+    model: String,
+): AgentProvider {
+    val cfg = anthropicConfigFrom(llm) ?: return AnthropicProvider(fallbackKeys, model = model)
+    return AnthropicProvider(
+        keys = SecretResolver.constant(cfg.apiKey),
+        model = model,
+        endpoint = cfg.baseUrl,
+    )
 }
 
 /**
@@ -93,7 +146,10 @@ class AnthropicProvider(
 
     override suspend fun step(system: String, messages: List<AgentMessage>, tools: List<ToolDescriptor>): AssistantTurn {
         val apiKey = keys.get(keyName)
-            ?: throw ExecError("No Anthropic API key — store one named '$keyName' in the secret vault")
+            ?: throw ExecError(
+                "No Anthropic API key — configure an Anthropic provider in " +
+                    "Settings → AI Providers, or store a secret named '$keyName'."
+            )
 
         val body = buildJsonObject {
             put("model", model)

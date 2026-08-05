@@ -26,6 +26,35 @@ kotlin {
 val useLocalDependencies = System.getenv("CI") != "true"
 val bossPluginApiPath = "../boss-plugin-api"
 
+// Newest boss-plugin-api jar from the sibling repo (local dev), resolved lazily in a provider so
+// it runs at dependency-RESOLUTION time, not configuration time: clean/help/tasks still work on
+// a fresh checkout without the sibling jar built, and compilation fails with this actionable
+// message instead of unresolved-reference noise. Shared by `compileOnly` (main) and
+// `testImplementation` so the two can never drift.
+//
+// This replaces a filename-pinned jar that no longer existed in the sibling checkout.
+// `compileOnly(files(...))` on a missing path contributes *nothing* silently, so every api
+// symbol came back "unresolved reference" with no hint that a stale filename was the cause.
+// Never name a version here.
+val newestApiJar = provider {
+    val apiJarPattern = Regex("""boss-plugin-api-(\d+)\.(\d+)\.(\d+)\.jar""")
+    file("$bossPluginApiPath/build/libs").listFiles()
+        ?.mapNotNull { jar -> apiJarPattern.matchEntire(jar.name)?.let { m -> jar to m } }
+        // Lexicographic (major, minor, patch) — no packing arithmetic that would mis-order
+        // components >= 1000.
+        ?.maxWithOrNull(
+            compareBy(
+                { it.second.groupValues[1].toInt() },
+                { it.second.groupValues[2].toInt() },
+                { it.second.groupValues[3].toInt() }
+            )
+        )?.first
+        ?: error(
+            "No boss-plugin-api jar found in $bossPluginApiPath/build/libs — " +
+                "run ./gradlew buildPluginJar in the sibling boss-plugin-api checkout first."
+        )
+}
+
 repositories {
     google()
     mavenCentral()
@@ -39,7 +68,7 @@ val bundled: Configuration by configurations.creating
 dependencies {
     if (useLocalDependencies) {
         // Local development: use boss-plugin-api JAR from sibling repo
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.56.jar"))
+        compileOnly(files(newestApiJar))
     } else {
         // CI: use downloaded JAR
         compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
@@ -84,7 +113,7 @@ dependencies {
     // The boss-plugin-api is compileOnly for main (host-provided); tests need it
     // on the classpath to build a fake PluginContext / BrowserService / BrowserHandle.
     if (useLocalDependencies) {
-        testImplementation(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.56.jar"))
+        testImplementation(files(newestApiJar))
     } else {
         testImplementation(files("build/downloaded-deps/boss-plugin-api.jar"))
     }
