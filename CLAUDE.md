@@ -9,39 +9,52 @@ self-contained Compose UI with a pan/zoom canvas, draggable nodes, and bezier ed
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.flowtab`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.flowtab.FlowTabDynamicPlugin`
-- **API Version**: 1.0.56 · **minApiVersion**: 1.0.71 · **minBossVersion**: 9.2.63
-  (the MCP tool framework needs 9.2.20; `PluginContext.llmProvider` needs 9.2.63)
+- **API Version**: 1.0.56 · **minApiVersion**: 1.0.74 · **minBossVersion**: 9.2.63
+  (the MCP tool framework needs 9.2.20; `PluginContext.llmProvider` needs 9.2.63; `AiGatewayAPI`
+  is a new type and needs `minApiVersion` only)
 
-## Agent credentials
+## Agent AI
 
-The `agent` node's Anthropic key and endpoint come from the shared AI provider config the
-**secret-manager** plugin owns (Settings → AI Providers), read via `PluginContext.llmProvider`.
-`anthropicConfigFrom` searches in this order, and the order is the point:
+The `agent` node runs through the shared **AI Gateway** plugin (`AiGatewayAPI`), via
+`GatewayAgentProvider`. It works with **whatever provider is active** in Settings, AI Providers.
 
-1. the **active** provider, if it speaks `ANTHROPIC_MESSAGES`;
-2. any other **configured** provider that does - the node only speaks Anthropic's tool-use
-   format, so an active OpenAI provider is no use to it, and using its key anyway would send an
-   `sk-…` key to `api.anthropic.com`;
-3. `SecretResolver.fromSecrets` - the old direct secret-store lookup, kept as a last resort for
-   a user who stored an `ANTHROPIC_API_KEY` secret by hand and never opened the provider panel.
+That is a behaviour change worth knowing about. The node used to speak Anthropic's tool-use
+format directly, so `anthropicConfigFrom` had to search for an Anthropic provider - the active
+one if it happened to be Anthropic, else any other configured one, else a raw secret-store
+lookup for `ANTHROPIC_API_KEY`. A user whose active provider was OpenAI got an agent that either
+ran on a stale hand-stored key or did not run at all. All of that is gone: the gateway resolves
+the credential, and every provider it supports can drive an agent node.
 
-Two deliberate non-adoptions: **the model stays the node's** `Model` config field (taking
-`LlmConfig.modelId` would silently change which model existing flows run on, decided in a panel
-the flow author may never have opened), and `LlmConfig.maxTokens` is ignored because it is a
-chat-completion default (2000) while a bounded tool-use loop wants `AnthropicProvider`'s 4096 -
-a run is bounded by `AgentBudget`, not by that.
+`GatewayAgentProvider` is only a translation layer between the runtime's transcript types and
+the gateway's. The `AgentProvider` seam itself is unchanged, so `FakeProvider` and every runtime
+test work exactly as before.
 
-An empty `configuredProviders()` means **unknown**, not "nothing configured": the api declares a
-default body returning an empty list, so an implementation that never overrides it is
-indistinguishable from an unconfigured one. That is why step 3 exists.
+**The tool round trip is the part that can break quietly.** A provider will not accept a tool
+result on its own: Anthropic rejects a `tool_result` whose `tool_use` was not replayed, and the
+Responses API needs the `function_call` item alongside its output. The runtime hands back a
+`ToolResultsMsg` with no assistant turn attached, so `GatewayAgentProvider` remembers the turn it
+last produced and replays it. It cannot be reconstructed from the transcript, where the tool-call
+ids are no longer attached. `GatewayAgentProviderTest` pins this and is mutation-verified:
+passing `priorTurn = null` fails *a tool result is sent with the call that produced it*.
 
-The provider is resolved per run (inside `providerFor`), not once at spec construction, because
-`LlmProvider` exposes no change signal - a key changed in Settings is picked up by the next run
-instead of needing the tab reopened.
+A `ToolResultsMsg` is also deliberately **not** sent as transcript text. Sending it twice would
+show the model the same observation as both data and a fresh instruction, which is the
+prompt-injection shape the runtime's separate message type exists to avoid. A test asserts the
+outcome text appears in `toolOutcomes` and nowhere in `messages`.
 
-`AgentCredentialResolutionTest` covers the order and asserts on the actual wire (key + endpoint
-from the config, model from the node) against a local server. Mutation-verified: dropping the
-`ANTHROPIC_MESSAGES` check fails two cases by name.
+**The model stays the node's** `Model` config field, but it is now advisory: the gateway uses
+whatever model the active provider has selected. Taking a node config the flow author may never
+have opened and using it to override a user's chosen model would be the worse behaviour, and the
+field is kept because saved flows carry a value for it. `AgentNode.DEFAULT_MODEL` holds the
+default that used to live on `AnthropicProvider`.
+
+`maxTokens` is still overridden per request (4096, not the provider's chat-completion default of
+2000) because a bounded tool-use loop needs the headroom. A run is bounded by `AgentBudget`.
+
+The provider is built per run, not once at spec construction, because neither the gateway nor the
+active provider exposes a change signal - a provider changed in Settings is picked up by the next
+run instead of needing the tab reopened. A per-run instance also keeps each run's replayed tool
+turn to itself.
 
 ### The api jar must never be pinned by filename
 

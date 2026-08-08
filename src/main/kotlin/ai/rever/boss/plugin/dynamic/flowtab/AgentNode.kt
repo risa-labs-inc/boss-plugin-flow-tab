@@ -26,12 +26,22 @@ object AgentNode {
 
     const val ACCENT = 0xFF6D4AFF
 
+    /**
+     * Default for the node's model field.
+     *
+     * Kept as a visible field because saved flows carry a value for it, but the agent runs
+     * on whatever model the active provider has selected in Settings, AI Providers - the
+     * gateway resolves that per call. Overriding a user's chosen model from a node config
+     * they may never have opened would be the worse behaviour.
+     */
+    const val DEFAULT_MODEL = "claude-sonnet-5"
+
     val CONFIG_FIELDS: List<ConfigField> = listOf(
         ConfigField(PROMPT_ID_KEY, "Prompt id (optional)", FieldType.TEXT, placeholder = "a saved prompt's id"),
         ConfigField(SYSTEM_KEY, "System prompt (inline)", FieldType.TEXTAREA, placeholder = "You are…"),
         ConfigField(INPUT_KEY, "Input", FieldType.TEXTAREA, placeholder = "task, or {{ \$json.text }}"),
         ConfigField(ALLOWLIST_KEY, "Tool allowlist", FieldType.JSON, placeholder = """["tool_a","tool_b"]"""),
-        ConfigField(MODEL_KEY, "Model", FieldType.TEXT, default = AnthropicProvider.DEFAULT_MODEL),
+        ConfigField(MODEL_KEY, "Model", FieldType.TEXT, default = DEFAULT_MODEL),
         ConfigField(MAX_STEPS_KEY, "Max steps", FieldType.NUMBER, default = "8"),
         ConfigField(TIMEOUT_KEY, "Timeout (ms)", FieldType.NUMBER, default = "120000"),
         ConfigField(MAX_TOKENS_KEY, "Max tokens", FieldType.NUMBER, placeholder = "unbounded if blank"),
@@ -105,7 +115,7 @@ class AgentNodeExecutor(
             system = cfg.str(AgentNode.SYSTEM_KEY),
             input = input,
             allowlist = parseAllowlist(cfg),
-            model = cfg.str(AgentNode.MODEL_KEY).ifBlank { AnthropicProvider.DEFAULT_MODEL },
+            model = cfg.str(AgentNode.MODEL_KEY).ifBlank { AgentNode.DEFAULT_MODEL },
             budget = AgentBudget(
                 maxSteps = cfg.int(AgentNode.MAX_STEPS_KEY, 8),
                 timeoutMs = cfg.str(AgentNode.TIMEOUT_KEY).trim().toLongOrNull() ?: 120_000,
@@ -161,14 +171,17 @@ fun defaultAgentNodeSpec(
     // agent on the in-app tool set only.
     external: ExternalMcpManager? = null,
 ): NodeSpec {
-    val secrets = SecretResolver.fromSecrets(context)
-    val llm = context.llmProvider
     return agentNodeSpec(
         prompts = prompts,
-        // Resolved per run, not once here: LlmProvider exposes no change signal, so a key or
-        // provider changed in Settings has to be picked up by the next run rather than needing
-        // the tab reopened.
-        providerFor = { settings -> anthropicProviderFor(llm, secrets, settings.model) },
+        // A fresh provider per run, and the gateway resolved per call inside it: neither the
+        // gateway nor the active provider exposes a change signal, so a provider changed in
+        // Settings has to be picked up by the next run rather than needing the tab reopened.
+        // A per-run instance also keeps each run's replayed tool turn to itself.
+        providerFor = {
+            GatewayAgentProvider(
+                gateway = { context.getPluginAPI(ai.rever.boss.plugin.api.AiGatewayAPI::class.java) },
+            )
+        },
         toolSourceFor = { ctx ->
             val lanes = buildList {
                 context.mcpToolRegistry?.let { add(BossRegistryToolSource(it)) }
