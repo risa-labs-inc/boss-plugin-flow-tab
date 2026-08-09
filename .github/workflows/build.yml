@@ -9,6 +9,12 @@ jobs:
   release:
     uses: risa-labs-inc/BossConsole-Releases/.github/workflows/plugin-release.yml@main
     with:
-      boss_plugin_api_version: '1.0.56'
+      # 'latest', as every other plugin repo does. This was pinned to '1.0.56' and that
+      # pin is what broke the release after the AI Gateway migration: the workflow
+      # downloaded an api jar from before AiGatewayAPI existed, so :compileKotlin failed
+      # with "Unresolved reference" on symbols that are plainly in the source. The api is
+      # additive-only (apiCheck gates it), so 'latest' is always >= what this compiles
+      # against, and a pin here only goes stale silently.
+      boss_plugin_api_version: 'latest'
     secrets:
       BOSS_STORE_PLUGIN_PUBLISH_KEY: ${{ secrets.BOSS_STORE_PLUGIN_PUBLISH_KEY }}
