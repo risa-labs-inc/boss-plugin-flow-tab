@@ -5,6 +5,7 @@ import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.AiModelInfo
 import ai.rever.boss.plugin.api.AiReply
 import ai.rever.boss.plugin.api.AiRequest
+import ai.rever.boss.plugin.api.AiRound
 import ai.rever.boss.plugin.api.AiToolCall
 import ai.rever.boss.plugin.api.AiToolOutcome
 import ai.rever.boss.plugin.api.AiToolSpec
@@ -31,7 +32,7 @@ class GatewayAgentProviderTest {
     private class RecordingGateway(
         private val turns: List<AiTurn>,
     ) : AiGatewayAPI {
-        val steps = mutableListOf<Triple<AiRequest, AiTurn?, List<AiToolOutcome>>>()
+        val steps = mutableListOf<Pair<AiRequest, List<AiRound>>>()
         val toolsSeen = mutableListOf<List<AiToolSpec>>()
         private var index = 0
 
@@ -51,10 +52,9 @@ class GatewayAgentProviderTest {
         override suspend fun step(
             request: AiRequest,
             tools: List<AiToolSpec>,
-            priorTurn: AiTurn?,
-            toolOutcomes: List<AiToolOutcome>,
+            rounds: List<AiRound>,
         ): Result<AiTurn> {
-            steps += Triple(request, priorTurn, toolOutcomes)
+            steps += request to rounds
             toolsSeen += tools
             return Result.success(turns.getOrElse(index++) { AiTurn(text = "done") })
         }
@@ -118,10 +118,54 @@ class GatewayAgentProviderTest {
                 )
 
             assertEquals("two files", second.text)
-            val (_, priorTurn, outcomes) = gateway.steps[1]
-            assertEquals(listOf("c1"), outcomes.map { it.id })
-            assertEquals("a.txt", outcomes.single().content)
-            assertEquals(listOf("c1"), priorTurn?.toolCalls?.map { it.id })
+            val (_, rounds) = gateway.steps[1]
+            val round = rounds.single()
+            assertEquals(listOf("c1"), round.outcomes.map { it.id })
+            assertEquals("a.txt", round.outcomes.single().content)
+            assertEquals(listOf("c1"), round.turn.toolCalls.map { it.id })
+        }
+
+    @Test
+    fun `round one's observation is still visible on step three`() =
+        runBlocking {
+            // The regression the review caught. The runtime accumulates the transcript and the
+            // default budget is maxSteps = 8, so a three-step run is ordinary - and with only
+            // the latest round sent, what round 1's tool returned reached the model nowhere.
+            // Nothing errors; the model just re-calls tools or answers without the evidence.
+            val ask1 = AiTurn(toolCalls = listOf(AiToolCall("c1", "ls", "{}")))
+            val ask2 = AiTurn(toolCalls = listOf(AiToolCall("c2", "cat", "{}")))
+            val gateway = RecordingGateway(listOf(ask1, ask2, AiTurn(text = "final")))
+            val provider = GatewayAgentProvider({ gateway })
+            val calls1 = ask1.toolCalls.map { ToolCall(it.id, it.name, it.argumentsJson) }
+            val calls2 = ask2.toolCalls.map { ToolCall(it.id, it.name, it.argumentsJson) }
+
+            provider.step("s", listOf(UserMsg("q")), listOf(tool))
+            provider.step(
+                "s",
+                listOf(UserMsg("q"), AssistantMsg(null, calls1), ToolResultsMsg(listOf(ToolOutcome("c1", "ls", "ROUND-ONE", false)))),
+                listOf(tool),
+            )
+            val third =
+                provider.step(
+                    "s",
+                    listOf(
+                        UserMsg("q"),
+                        AssistantMsg(null, calls1),
+                        ToolResultsMsg(listOf(ToolOutcome("c1", "ls", "ROUND-ONE", false))),
+                        AssistantMsg(null, calls2),
+                        ToolResultsMsg(listOf(ToolOutcome("c2", "cat", "ROUND-TWO", false))),
+                    ),
+                    listOf(tool),
+                )
+
+            assertEquals("final", third.text)
+            val rounds = gateway.steps[2].second
+            assertEquals(listOf("c1", "c2"), rounds.map { it.turn.toolCalls.single().id })
+            assertEquals(
+                listOf("ROUND-ONE", "ROUND-TWO"),
+                rounds.map { it.outcomes.single().content },
+                "round one's observation must still be visible on step three",
+            )
         }
 
     @Test
@@ -139,9 +183,11 @@ class GatewayAgentProviderTest {
                 listOf(tool),
             )
 
-            val (request, _, outcomes) = gateway.steps.single()
+            val (request, rounds) = gateway.steps.single()
             assertTrue(request.messages.none { it.text.contains("SECRET-OBSERVATION") })
-            assertEquals("SECRET-OBSERVATION", outcomes.single().content)
+            // With no pending turn there is no round to close, so the outcome is dropped
+            // rather than sent without the call that produced it - which no provider accepts.
+            assertTrue(rounds.isEmpty())
         }
 
     @Test
@@ -153,7 +199,7 @@ class GatewayAgentProviderTest {
             provider.step("s", listOf(UserMsg("q")), emptyList())
             provider.step("s", listOf(UserMsg("q"), AssistantMsg("a", emptyList()), UserMsg("more")), emptyList())
 
-            assertNull(gateway.steps[1].second, "replaying a turn with nothing to correlate is noise")
+            assertTrue(gateway.steps[1].second.isEmpty(), "a turn with nothing to correlate is not a round")
         }
 
     @Test
@@ -214,8 +260,7 @@ class GatewayAgentProviderTest {
                 override suspend fun step(
                     request: AiRequest,
                     tools: List<AiToolSpec>,
-                    priorTurn: AiTurn?,
-                    toolOutcomes: List<AiToolOutcome>,
+                    rounds: List<AiRound>,
                 ) = Result.failure<AiTurn>(IllegalStateException("provider is down"))
             }
 

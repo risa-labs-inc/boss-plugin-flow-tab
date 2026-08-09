@@ -32,10 +32,17 @@ test work exactly as before.
 **The tool round trip is the part that can break quietly.** A provider will not accept a tool
 result on its own: Anthropic rejects a `tool_result` whose `tool_use` was not replayed, and the
 Responses API needs the `function_call` item alongside its output. The runtime hands back a
-`ToolResultsMsg` with no assistant turn attached, so `GatewayAgentProvider` remembers the turn it
-last produced and replays it. It cannot be reconstructed from the transcript, where the tool-call
-ids are no longer attached. `GatewayAgentProviderTest` pins this and is mutation-verified:
-passing `priorTurn = null` fails *a tool result is sent with the call that produced it*.
+`ToolResultsMsg` with no assistant turn attached, so `GatewayAgentProvider` remembers the turns
+itself - they cannot be rebuilt from the transcript, where the call ids are no longer attached.
+
+**It keeps every round, not just the last**, and that distinction only shows up from the third
+step. With one slot, a three-step run showed the model nothing of what its first round's tools
+returned, so it re-called them or answered without the evidence and burned the step budget; and
+the resulting transcript had adjacent assistant turns, which Anthropic and Google reject
+outright. The default budget is `maxSteps = 8`, so three steps is ordinary, and a two-step test
+sees neither problem - which is how it got past review. `GatewayAgentProviderTest` now runs to a
+third step and is mutation-verified: `rounds.takeLast(1)` fails *round one's observation is still
+visible on step three*.
 
 A `ToolResultsMsg` is also deliberately **not** sent as transcript text. Sending it twice would
 show the model the same observation as both data and a fresh instruction, which is the

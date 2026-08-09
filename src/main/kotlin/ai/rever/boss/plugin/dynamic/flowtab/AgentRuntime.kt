@@ -45,7 +45,7 @@ data class ToolResultsMsg(val outcomes: List<ToolOutcome>) : AgentMessage
 /**
  * Provider-agnostic seam. One [step] takes the system prompt, the full transcript, and
  * the advertised [tools], and returns the next [AssistantTurn]. Concrete impls talk to
- * a real model ([AnthropicProvider]); [FakeProvider] scripts turns for tests. Keeping
+ * a real model ([GatewayAgentProvider]); [FakeProvider] scripts turns for tests. Keeping
  * this a `fun interface` lets a test pass a lambda.
  */
 fun interface AgentProvider {

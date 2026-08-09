@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.PluginContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonPrimitive
@@ -41,7 +42,13 @@ object AgentNode {
         ConfigField(SYSTEM_KEY, "System prompt (inline)", FieldType.TEXTAREA, placeholder = "You are…"),
         ConfigField(INPUT_KEY, "Input", FieldType.TEXTAREA, placeholder = "task, or {{ \$json.text }}"),
         ConfigField(ALLOWLIST_KEY, "Tool allowlist", FieldType.JSON, placeholder = """["tool_a","tool_b"]"""),
-        ConfigField(MODEL_KEY, "Model", FieldType.TEXT, default = DEFAULT_MODEL),
+        ConfigField(
+            MODEL_KEY,
+            "Model (from Settings, AI Providers)",
+            FieldType.TEXT,
+            default = DEFAULT_MODEL,
+            placeholder = "Set by the active AI provider; kept for existing flows",
+        ),
         ConfigField(MAX_STEPS_KEY, "Max steps", FieldType.NUMBER, default = "8"),
         ConfigField(TIMEOUT_KEY, "Timeout (ms)", FieldType.NUMBER, default = "120000"),
         ConfigField(MAX_TOKENS_KEY, "Max tokens", FieldType.NUMBER, placeholder = "unbounded if blank"),
@@ -69,7 +76,7 @@ data class AgentSettings(
  * and allowlist are read straight from `node.config` (F6).
  *
  * [providerFor]/[toolSourceFor] are injected so tests drive a [FakeProvider] + a fake
- * source, while production wires an [AnthropicProvider] + a merged, session-backed source.
+ * source, while production wires a [GatewayAgentProvider] + a merged, session-backed source.
  */
 class AgentNodeExecutor(
     private val prompts: PromptRegistry?,
@@ -157,7 +164,7 @@ fun agentNodeSpec(
 )
 
 /**
- * Production `agent` spec: an [AnthropicProvider] keyed from the shared AI provider config
+ * Production `agent` spec: an [GatewayAgentProvider] keyed from the shared AI provider config
  * (Settings → AI Providers, owned by the secret-manager plugin), over a [MergedToolSource] of
  * the host registry ([BossRegistryToolSource]) plus a per-run browser lane
  * ([FlowBrowserToolSource] on the run's own [SessionRegistry]). The [AgentRuntime]'s allowlist
@@ -179,7 +186,11 @@ fun defaultAgentNodeSpec(
         // A per-run instance also keeps each run's replayed tool turn to itself.
         providerFor = {
             GatewayAgentProvider(
-                gateway = { context.getPluginAPI(ai.rever.boss.plugin.api.AiGatewayAPI::class.java) },
+                // Wrapped, like every other getPluginAPI call in this plugin: if a host
+                // without the gateway throws rather than returning null, the carefully
+                // worded NO_GATEWAY_MESSAGE never runs and the node fails with whatever the
+                // host threw instead.
+                gateway = { runCatching { context.getPluginAPI(AiGatewayAPI::class.java) }.getOrNull() },
             )
         },
         toolSourceFor = { ctx ->
