@@ -58,6 +58,13 @@ default that used to live on `AnthropicProvider`.
 `maxTokens` is still overridden per request (4096, not the provider's chat-completion default of
 2000) because a bounded tool-use loop needs the headroom. A run is bounded by `AgentBudget`.
 
+`plugin.json` declares `ai.rever.boss.plugin.dynamic.aigateway` as an **optional** dependency.
+Declaring it makes the host's one existing check work - `DynamicPluginManager.checkCanUnload`
+refuses to uninstall a plugin a loaded plugin depends on. Nothing reads `dependencies` at *install*
+time (no resolver, no prompt), so installing Flow without the gateway just means agent nodes fail
+with `NO_GATEWAY_MESSAGE` while every other node type works - which is exactly why the dependency
+is optional rather than hard.
+
 The provider is built per run, not once at spec construction, because neither the gateway nor the
 active provider exposes a change signal - a provider changed in Settings is picked up by the next
 run instead of needing the tab reopened. A per-run instance also keeps each run's replayed tool
