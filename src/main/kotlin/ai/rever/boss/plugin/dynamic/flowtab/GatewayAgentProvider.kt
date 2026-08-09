@@ -33,6 +33,12 @@ import ai.rever.boss.plugin.api.AiTurn
 internal class GatewayAgentProvider(
     private val gateway: () -> AiGatewayAPI?,
     private val maxTokens: Int = DEFAULT_MAX_TOKENS,
+    /**
+     * Explains why AI is unavailable and offers the fix. Fire-and-forget: the node still
+     * fails, because a DAG step cannot wait on a dialog and a run that silently paused
+     * would be worse than one that failed with a reason.
+     */
+    private val promptAiFix: suspend (feature: String) -> Unit = {},
 ) : AgentProvider {
 
     /**
@@ -63,7 +69,13 @@ internal class GatewayAgentProvider(
         messages: List<AgentMessage>,
         tools: List<ToolDescriptor>,
     ): AssistantTurn {
-        val api = gateway() ?: error(NO_GATEWAY_MESSAGE)
+        val api =
+            gateway() ?: run {
+                // Tell the user what is missing and offer the fix, then fail the node. The
+                // message alone was a dead end: it named the gateway but led nowhere.
+                promptAiFix("This agent node")
+                error(NO_GATEWAY_MESSAGE)
+            }
 
         // Close the previous round: the runtime has just executed the tools the last turn
         // asked for, and this is where its results arrive.

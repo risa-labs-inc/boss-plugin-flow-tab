@@ -191,6 +191,11 @@ fun defaultAgentNodeSpec(
                 // worded NO_GATEWAY_MESSAGE never runs and the node fails with whatever the
                 // host threw instead.
                 gateway = { runCatching { context.getPluginAPI(AiGatewayAPI::class.java) }.getOrNull() },
+                // Shows the dialog naming whichever thing is missing and opens the fix.
+                promptAiFix = { feature ->
+                    ai.rever.boss.plugin.api.AiAvailability.promptToFix(context, feature)
+                    Unit
+                },
             )
         },
         toolSourceFor = { ctx ->
