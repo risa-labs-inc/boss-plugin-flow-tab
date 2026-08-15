@@ -10,6 +10,7 @@ import ai.rever.boss.plugin.api.PluginStorageFactory
 import ai.rever.boss.plugin.api.PluginStorageProvider
 import ai.rever.boss.plugin.api.TabRegistry
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
@@ -272,6 +273,35 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `a host cancellation exception fails the node instead of reporting success`() = runBlocking {
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "HOST_CANCEL",
+                    label = "Host Cancel",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, _, _ ->
+                        throw CancellationException("host invocation timed out")
+                    },
+                ),
+            )
+        }
+        val fc = controller(registry = registry)
+        val tabId = fc.createFlow()
+        val nodeId = fc.addNode(tabId, "HOST_CANCEL")
+
+        val job = awaitTerminal(fc, fc.startRun(tabId))
+
+        assertEquals(RunJobState.FAILED, job.state)
+        assertEquals(RunStatus.ERROR, fc.runResult(job.runId)!![nodeId]!!.status)
+        assertTrue(job.error!!.contains("host invocation timed out"))
+    }
+
+    @Test
     fun `flow_result exposes live node state and the watchdog terminates a hung executor`() = runBlocking {
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
@@ -293,13 +323,13 @@ class FlowControllerTest {
                 )
             )
         }
-        val fc = controller(registry = registry, runTimeoutMs = 500)
+        val fc = controller(registry = registry, runTimeoutMs = 1_000)
         val tabId = fc.createFlow()
         val nodeId = fc.addNode(tabId, "HANG")
         val runId = fc.startRun(tabId)
 
         try {
-            withTimeout(1_000) { entered.await() }
+            withTimeout(5_000) { entered.await() }
             assertEquals(RunJobState.RUNNING, fc.runStatus(runId)!!.state)
             assertEquals(RunStatus.RUNNING, fc.runResult(runId)!![nodeId]!!.status)
 

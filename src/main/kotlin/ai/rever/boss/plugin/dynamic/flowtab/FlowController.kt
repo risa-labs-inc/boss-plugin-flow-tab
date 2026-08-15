@@ -266,7 +266,7 @@ class FlowController(
         states: ConcurrentHashMap<String, NodeRun>,
         message: String,
     ): RunJob {
-        states.replaceAll { _, node ->
+        val terminalNodes = states.toRunSnapshot().states.mapValues { (_, node) ->
             if (node.status == RunStatus.RUNNING) {
                 node.copy(status = RunStatus.ERROR, error = message)
             } else {
@@ -278,7 +278,7 @@ class FlowController(
             tabId = tabId,
             state = RunJobState.FAILED,
             error = message,
-            nodes = states.toRunSnapshot().states,
+            nodes = terminalNodes,
         )
     }
 

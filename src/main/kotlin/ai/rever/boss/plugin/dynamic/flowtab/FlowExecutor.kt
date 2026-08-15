@@ -11,6 +11,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -155,10 +157,24 @@ class FlowExecutor(
                                     ),
                                 )
                             } catch (ce: CancellationException) {
-                                // Propagate cancellation through the dependency signal instead
-                                // of letting a dependant misreport missing output as SKIPPED.
-                                done[node.id]?.cancel(ce)
-                                throw ce
+                                if (!currentCoroutineContext().isActive) {
+                                    // Propagate cancellation through the dependency signal instead
+                                    // of letting a dependant misreport missing output as SKIPPED.
+                                    done[node.id]?.cancel(ce)
+                                    throw ce
+                                }
+                                // A host call may use CancellationException for its own timeout
+                                // while this run is still active. That is a node failure, not a
+                                // request to silently cancel this child coroutine.
+                                failed.add(node.id)
+                                onStatus(
+                                    node.id,
+                                    NodeRun(
+                                        RunStatus.ERROR,
+                                        error = ce.message ?: "Cancelled by host",
+                                        logs = logs,
+                                    ),
+                                )
                             } catch (e: Exception) {
                                 failed.add(node.id)
                                 onStatus(node.id, NodeRun(RunStatus.ERROR, emptyList(), e.message ?: e.toString(), logs))
@@ -173,9 +189,11 @@ class FlowExecutor(
             }
         } finally {
             // Run cleanup independently so a non-cooperative host disposer cannot keep
-            // this execution alive past the best-effort cleanup window.
+            // this execution alive past the best-effort cleanup window. If a node itself
+            // is stuck in a host call, cleanup cannot begin until that call eventually
+            // returns; the controller watchdog can bound reporting, not reclaim that call.
             withContext(NonCancellable) {
-                val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+                val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
                 val cleanup = cleanupScope.launch { ctx.close() }
                 try {
                     withTimeoutOrNull(CLEANUP_TIMEOUT_MS) { cleanup.join() }
