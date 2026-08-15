@@ -16,7 +16,9 @@ import kotlinx.serialization.json.JsonPrimitive
  * Paths use `.key`, `["key"]`, and `[index]`. Anything unresolved renders empty.
  * [interpolateJson] recursively resolves JSON templates: a string containing exactly
  * one expression preserves the resolved JSON type, while expressions mixed with text
- * render into a string.
+ * render into a string. `$node["Title"]` uses the node's flattened output ordered by
+ * port number; when a control node emits on multiple ports, the first item is from the
+ * lowest populated port.
  * This is deliberately NOT full JavaScript (GraalJS can't be plugin-bundled —
  * the host's binary-compat validator rejects the fat jar). Full JS would require
  * the host to ship GraalJS. See docs/AI_PIPELINE.md.

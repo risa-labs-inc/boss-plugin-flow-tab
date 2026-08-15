@@ -81,7 +81,9 @@ Getting data **out** requires `RpaBrowserSession.executeJavaScript(): Any?` (it 
 - **Phase 1 - Wedge: session-driven executor + Browser nodes + scaffold.** DAG executor, items, `RunContext`, session lifecycle; Open Browser / Navigate / Click / Type / Extract / Inject; inspector (Params + JSON + Output + Logs); Run/Stop + per-node status. Proves end-to-end: open a page, click, type, **extract data, see it**.
 - **Phase 2 - Data + AI + expressions.** HTTP Request, AI/LLM, Set/If/Merge, the `{{ }}` evaluator. Now it's a real AI pipeline.
 - **Phase 3 - rpaengine polish mode + profiles/auth.** Compile-segment-to-run with live per-action status; cookies/headers/profiles via `RpaAuthSpec`; headless toggle.
-- **Phase 4 - Nested workflows + Code node + per-item RPA + run history.** SubWorkflow node, Code/Function (embedded JS), per-item browser iteration, persisted run history.
+- **Phase 4 - Per-item RPA + run history.** Typed JSON-template Code and nested flows
+  shipped earlier; full embedded JavaScript remains deferred until the host provides a
+  plugin-safe JS runtime.
 
 ## Risks / open questions
 - Item-iteration semantics for browser nodes (perItem vs once) - start `once`, revisit at per-item RPA.
@@ -139,7 +141,7 @@ Add `kotlin("test")` + JUnit5 + `kotlinx-coroutines-test` + a `src/test/kotlin` 
 - rpaengine per-action `RpaActionExecutor` API - **dropped**, not deferred (host `rpaBrowserProvider` covers it).
 - rpaengine's whole-run "polished segment" mode (human-like timing, hardened selectors, retries, profiles/auth) - Phase 3.
 - Persisted run history - ephemeral in-memory results in v1.
-- Nested workflows + Code node - Phase 4.
+- Full JavaScript Code execution - deferred until the host provides a plugin-safe runtime.
 
 ## Failure modes (each new path: failure / test / handling / visibility)
 - **Element not found** (Click/Type/Extract): executor returns `ok=false` → node Error, downstream branch stops. Tested. User sees node ✕ + error in inspector.
@@ -159,4 +161,3 @@ Add `kotlin("test")` + JUnit5 + `kotlinx-coroutines-test` + a `src/test/kotlin` 
 | E | flow-tab: inspector panel + raw-JSON + Output/Logs; run/stop toolbar + status viz | B |
 
 Launch A, B, C in parallel. D waits on A+B. E waits on B. Engine tests ride with B; expression tests with C.
-

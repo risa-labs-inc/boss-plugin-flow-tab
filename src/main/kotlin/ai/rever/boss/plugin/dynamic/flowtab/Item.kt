@@ -29,14 +29,14 @@ data class NodeOutput(val ports: Map<Int, PortData>) {
 
     companion object {
         val EMPTY = NodeOutput(emptyMap())
-        fun single(items: PortData): NodeOutput = NodeOutput(mapOf(0 to items))
-        fun onPort(index: Int, items: PortData): NodeOutput = NodeOutput(mapOf(index to items))
+        fun single(items: PortData): NodeOutput = if (items.isEmpty()) EMPTY else NodeOutput(mapOf(0 to items))
+        fun onPort(index: Int, items: PortData): NodeOutput = if (items.isEmpty()) EMPTY else NodeOutput(mapOf(index to items))
     }
 }
 
 /** Per-node execution status (drives the canvas badge + inspector). */
 @Serializable
-enum class RunStatus { IDLE, RUNNING, SUCCESS, ERROR }
+enum class RunStatus { IDLE, RUNNING, SUCCESS, SKIPPED, ERROR }
 
 /** Live execution state for one node. */
 data class NodeRun(

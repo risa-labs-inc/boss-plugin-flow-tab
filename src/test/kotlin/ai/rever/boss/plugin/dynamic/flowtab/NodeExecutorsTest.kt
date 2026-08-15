@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlin.test.Test
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -30,5 +31,30 @@ class NodeExecutorsTest {
         }
         assertTrue(NodeCatalog.evaluateCondition("true"))
         assertTrue(NodeCatalog.evaluateCondition("1"))
+    }
+
+    @Test
+    fun `condition grammar is parsed before multiline data is interpolated`() {
+        val result = NodeCatalog.evaluateCondition("{{ value }} == \"done\"") { fragment ->
+            fragment.replace("{{ value }}", "not\ndone")
+        }
+
+        assertFalse(result)
+    }
+
+    @Test
+    fun `operator-like text remains data in a truthiness condition`() {
+        val result = NodeCatalog.evaluateCondition("{{ value }}") { fragment ->
+            fragment.replace("{{ value }}", "Home > Docs > API")
+        }
+
+        assertTrue(result)
+    }
+
+    @Test
+    fun `ordering rejects non-numeric operands`() {
+        assertFailsWith<ExecError> {
+            NodeCatalog.evaluateCondition("abc >= 5")
+        }
     }
 }

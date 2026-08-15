@@ -22,7 +22,6 @@ import kotlin.math.max
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
-import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 // ---- fakes -----------------------------------------------------------------
@@ -202,7 +201,7 @@ class FlowExecutorTest {
         val states = runGraph(nodes, edges, FakeService(handle))
 
         assertEquals(RunStatus.ERROR, states["ex"]?.status)
-        assertNull(states["after"]?.status) // skipped (never ran)
+        assertEquals(RunStatus.SKIPPED, states["after"]?.status)
         assertEquals(RunStatus.SUCCESS, states["indep"]?.status) // unaffected
     }
 
@@ -330,8 +329,8 @@ class FlowExecutorTest {
         val edges = listOf(
             e("t", "a"),
             e("t", "b"),
-            e("a", "m", tp = 0),
             e("b", "m", tp = 1),
+            e("a", "m", tp = 0),
         )
         val states = runGraph(nodes, edges)
 
@@ -373,9 +372,33 @@ class FlowExecutorTest {
 
         assertEquals(RunStatus.SUCCESS, states["ex"]?.status)
         assertTrue(states["ex"]!!.output.isEmpty())
-        assertEquals(RunStatus.SUCCESS, states["set"]?.status)
+        assertEquals(RunStatus.SKIPPED, states["set"]?.status)
         assertTrue(states["set"]!!.output.isEmpty())
         assertTrue(states["set"]!!.logs.any { it.contains("skipped", ignoreCase = true) })
+    }
+
+    @Test
+    fun `unavailable kind errors even when its input port is empty`() {
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            n("if", NodeType.IF, "condition" to "false"),
+            nk("missing", "tool:boss:absent"),
+        )
+        val edges = listOf(e("t", "if"), e("if", "missing", fp = 0))
+        val states = runGraph(nodes, edges)
+
+        assertEquals(RunStatus.ERROR, states["missing"]?.status)
+        assertTrue(states["missing"]!!.error!!.contains("Unknown node kind"))
+    }
+
+    @Test
+    fun `node output normalizes empty ports and flattens in port order`() {
+        val low = Item(buildJsonObject { put("port", 0) })
+        val high = Item(buildJsonObject { put("port", 2) })
+
+        assertEquals(NodeOutput.EMPTY, NodeOutput.single(emptyList()))
+        assertEquals(NodeOutput.EMPTY, NodeOutput.onPort(4, emptyList()))
+        assertEquals(listOf(low, high), NodeOutput(mapOf(2 to listOf(high), 0 to listOf(low))).allItems())
     }
 
     @Test

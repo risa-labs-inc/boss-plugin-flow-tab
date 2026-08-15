@@ -104,6 +104,7 @@ fun NodeSpec.icon(): ImageVector = iconForKind(id)
 fun runStatusColor(status: RunStatus?): Color? = when (status) {
     RunStatus.RUNNING -> FlowTheme.Accent
     RunStatus.SUCCESS -> FlowTheme.Success
+    RunStatus.SKIPPED -> FlowTheme.TextMuted
     RunStatus.ERROR -> FlowTheme.Error
     else -> null
 }
@@ -169,6 +170,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
         RunStatus.ERROR -> FlowTheme.Error
         RunStatus.RUNNING -> FlowTheme.Accent
         RunStatus.SUCCESS -> FlowTheme.Success
+        RunStatus.SKIPPED -> FlowTheme.TextMuted
         else -> when {
             selected -> accent
             hovered -> NodeBorderHover
@@ -381,6 +383,7 @@ private fun StatusPill(status: RunStatus, run: NodeRun?) {
     val text = when (status) {
         RunStatus.RUNNING -> "running"
         RunStatus.SUCCESS -> "✓ ${run?.output?.size ?: 0}"
+        RunStatus.SKIPPED -> "skipped"
         RunStatus.ERROR -> "✕ error"
         else -> return
     }

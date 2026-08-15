@@ -34,7 +34,10 @@ private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 // still loading its content. Generic across every browser node.
 private const val ELEMENT_WAIT_MS = 20_000
 private const val ELEMENT_POLL_MS = 200
-private val CONDITION_COMPARISON = Regex("""^\s*(.+?)\s+(==|!=|>=|<=|>|<)\s+(.+?)\s*$""")
+private val CONDITION_COMPARISON = Regex(
+    """\s*(.+?)\s+(==|!=|>=|<=|>|<)\s+(.+?)\s*""",
+    RegexOption.DOT_MATCHES_ALL,
+)
 
 /**
  * Polls (up to [timeoutMs]) for [selector] to match an element, returning whether
@@ -131,6 +134,13 @@ class ConfigReader(
 ) {
     private fun raw(key: String): String = (config[key] as? JsonPrimitive)?.content ?: ""
 
+    /** Raw scalar template, before current-item expressions are resolved. */
+    internal fun template(key: String): String = raw(key)
+
+    /** Resolve expressions in an arbitrary fragment against this reader's current item. */
+    internal fun interpolate(template: String): String =
+        ExpressionEval.interpolate(template, item.json, outputsByTitle)
+
     /** Field value with `{{ }}` resolved. */
     fun str(key: String, default: String = ""): String {
         val template = raw(key).ifEmpty { return default }
@@ -195,7 +205,7 @@ fun interface NodeExecutor {
  */
 object NodeCatalog {
 
-    fun executor(type: NodeType): NodeExecutor? = when (type) {
+    fun executor(type: NodeType): NodeExecutor = when (type) {
         NodeType.TRIGGER -> NodeExecutor { _, _, _, _ -> NodeOutput.single(SEED_ITEMS) }
 
         NodeType.OPEN_BROWSER -> NodeExecutor { ctx, cfg, inputs, log ->
@@ -323,8 +333,7 @@ object NodeCatalog {
             NodeOutput.single(listOf(Item(merged)))
         }
 
-        NodeType.CODE -> NodeExecutor { _, cfg, inputs, log ->
-            val current = inputs.firstOrNull() ?: SEED_ITEMS.first()
+        NodeType.CODE -> NodeExecutor { _, cfg, _, log ->
             val rendered = runCatching { cfg.jsonTemplate("code") }
                 .getOrElse { throw ExecError("Code: 'code' must be valid JSON: ${it.message}") }
                 ?: throw ExecError("Code needs an output JSON template")
@@ -335,9 +344,9 @@ object NodeCatalog {
         }
 
         NodeType.IF -> NodeExecutor { _, cfg, inputs, log ->
-            val condition = cfg.str("condition")
-            if (condition.isBlank()) throw ExecError("If needs a condition")
-            val matched = evaluateCondition(condition)
+            val conditionTemplate = cfg.template("condition")
+            if (conditionTemplate.isBlank()) throw ExecError("If needs a condition")
+            val matched = evaluateCondition(conditionTemplate, cfg::interpolate)
             log("Condition → ${if (matched) "true" else "false"}")
             NodeOutput.onPort(if (matched) 0 else 1, inputs)
         }
@@ -358,36 +367,42 @@ object NodeCatalog {
     }
 
     /**
-     * Small, deterministic predicate language for If after `{{ }}` interpolation.
-     * Binary operators require surrounding whitespace, which keeps `<`/`>` inside
-     * interpolated HTML or text from being mistaken for the operator. If both operands
-     * parse as numbers they are compared as [Double]s; otherwise comparison is lexical.
-     * Without an operator, blank/false/null/undefined/0/no/off are falsy.
+     * Small, deterministic predicate language for If. The raw condition template is
+     * split before [interpolate] resolves either operand, so newlines and operator-like
+     * text in item data cannot alter the predicate grammar. Binary operators require
+     * surrounding whitespace. Equality supports strings or numbers; ordering requires
+     * two numbers. Without an operator, blank/false/null/undefined/0/no/off are falsy.
      */
-    internal fun evaluateCondition(raw: String): Boolean {
+    internal fun evaluateCondition(
+        raw: String,
+        interpolate: (String) -> String = { it },
+    ): Boolean {
         val comparison = CONDITION_COMPARISON.matchEntire(raw)
         if (comparison != null) {
-            val left = comparison.groupValues[1].unquote()
+            val left = interpolate(comparison.groupValues[1]).unquote()
             val op = comparison.groupValues[2]
-            val right = comparison.groupValues[3].unquote()
+            val right = interpolate(comparison.groupValues[3]).unquote()
             val leftNumber = left.toDoubleOrNull()
             val rightNumber = right.toDoubleOrNull()
-            val order = if (leftNumber != null && rightNumber != null) {
-                leftNumber.compareTo(rightNumber)
-            } else {
-                left.compareTo(right)
-            }
             return when (op) {
-                "==" -> if (leftNumber != null && rightNumber != null) order == 0 else left == right
-                "!=" -> if (leftNumber != null && rightNumber != null) order != 0 else left != right
-                ">" -> order > 0
-                ">=" -> order >= 0
-                "<" -> order < 0
-                "<=" -> order <= 0
+                "==" -> if (leftNumber != null && rightNumber != null) leftNumber == rightNumber else left == right
+                "!=" -> if (leftNumber != null && rightNumber != null) leftNumber != rightNumber else left != right
+                ">", ">=", "<", "<=" -> {
+                    if (leftNumber == null || rightNumber == null) {
+                        throw ExecError("If: cannot order-compare non-numeric values '$left' and '$right'")
+                    }
+                    val order = leftNumber.compareTo(rightNumber)
+                    when (op) {
+                        ">" -> order > 0
+                        ">=" -> order >= 0
+                        "<" -> order < 0
+                        else -> order <= 0
+                    }
+                }
                 else -> false
             }
         }
-        return when (val value = raw.trim().unquote().lowercase()) {
+        return when (val value = interpolate(raw).trim().unquote().lowercase()) {
             "", "false", "null", "undefined", "0", "no", "off" -> false
             else -> value.toDoubleOrNull()?.let { it != 0.0 } ?: true
         }

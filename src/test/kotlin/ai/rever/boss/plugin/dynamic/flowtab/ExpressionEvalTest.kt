@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -77,5 +78,19 @@ class ExpressionEvalTest {
         val result = ExpressionEval.interpolateJson(template, json, emptyMap()) as JsonObject
 
         assertEquals("\"Ada Lovelace\"", result["name"].toString())
+    }
+
+    @Test
+    fun `json interpolation recurses through arrays and nested objects`() {
+        val json = buildJsonObject { put("count", 3); put("name", "Ada") }
+        val template = buildJsonObject {
+            put("nested", buildJsonObject { put("count", "{{ \$json.count }}") })
+            put("values", buildJsonArray { add("{{ \$json.name }}"); add("count={{ \$json.count }}") })
+        }
+
+        val result = ExpressionEval.interpolateJson(template, json, emptyMap()) as JsonObject
+
+        assertEquals("3", (result["nested"] as JsonObject)["count"].toString())
+        assertEquals("[\"Ada\",\"count=3\"]", (result["values"] as JsonArray).toString())
     }
 }

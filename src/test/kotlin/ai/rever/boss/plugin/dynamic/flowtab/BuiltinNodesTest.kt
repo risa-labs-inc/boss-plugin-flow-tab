@@ -47,7 +47,6 @@ class BuiltinNodesTest {
     fun `all builtin kinds are runnable`() {
         for (t in NodeType.entries) {
             val s = reg[t.name]!!
-            assertNotNull(NodeCatalog.executor(t), "${t.name} catalog executor")
             assertNotNull(s.executor, "${t.name} registry executor")
         }
     }

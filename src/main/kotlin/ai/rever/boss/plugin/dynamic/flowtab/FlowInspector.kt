@@ -318,6 +318,7 @@ private fun StatusBanner(run: NodeRun?) {
     val label = when (status) {
         RunStatus.RUNNING -> "Running…"
         RunStatus.SUCCESS -> "Success · ${run.output.size} item${if (run.output.size == 1) "" else "s"}"
+        RunStatus.SKIPPED -> "Skipped · no input items"
         RunStatus.ERROR -> "Error"
         RunStatus.IDLE -> "Pending…"
         null -> "Not run yet"
