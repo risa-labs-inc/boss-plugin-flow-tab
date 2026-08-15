@@ -105,6 +105,7 @@ class FlowExecutor(
                             val out = if (incoming.isNotEmpty() && inputs.isEmpty()) {
                                 // An upstream control port emitted no items. Do not seed
                                 // and accidentally execute the unselected branch.
+                                logs.add("Skipped — no input items")
                                 NodeOutput.EMPTY
                             } else if (registry[node.kind]?.usesSession == true) {
                                 ctx.sessionMutex.withLock { runNode(ctx, node, inputs) { logs.add(it) } }
@@ -139,10 +140,22 @@ class FlowExecutor(
         val spec = registry[node.kind]
             ?: throw ExecError("Unknown node kind '${node.kind}' — its provider isn't available")
         val exec = spec.executor
-            ?: throw ExecError("Node kind '${node.kind}' is unavailable")
+            ?: throw ExecError("${spec.label} is unavailable — its provider isn't loaded")
         return when (spec.runMode) {
-            RunMode.PER_ITEM -> inputs.ifEmpty { SEED_ITEMS }.fold(NodeOutput.EMPTY) { output, item ->
-                output + exec.run(ctx, ConfigReader(node.config, item, ctx.outputsByTitle), listOf(item), log)
+            RunMode.PER_ITEM -> {
+                val accumulated = HashMap<Int, MutableList<Item>>()
+                for (item in inputs.ifEmpty { SEED_ITEMS }) {
+                    val output = exec.run(
+                        ctx,
+                        ConfigReader(node.config, item, ctx.outputsByTitle),
+                        listOf(item),
+                        log,
+                    )
+                    output.ports.forEach { (port, items) ->
+                        accumulated.getOrPut(port) { mutableListOf() }.addAll(items)
+                    }
+                }
+                NodeOutput(accumulated.mapValues { (_, items) -> items.toList() })
             }
             RunMode.ONCE -> {
                 val item = inputs.firstOrNull() ?: SEED_ITEMS.first()

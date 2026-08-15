@@ -27,12 +27,6 @@ data class NodeOutput(val ports: Map<Int, PortData>) {
     /** Flattened view used by the inspector, persisted run state, and node refs. */
     fun allItems(): List<Item> = ports.toSortedMap().values.flatten()
 
-    /** Combine per-item executions without losing their selected output ports. */
-    operator fun plus(other: NodeOutput): NodeOutput {
-        val keys = ports.keys + other.ports.keys
-        return NodeOutput(keys.associateWith { port(it) + other.port(it) })
-    }
-
     companion object {
         val EMPTY = NodeOutput(emptyMap())
         fun single(items: PortData): NodeOutput = NodeOutput(mapOf(0 to items))

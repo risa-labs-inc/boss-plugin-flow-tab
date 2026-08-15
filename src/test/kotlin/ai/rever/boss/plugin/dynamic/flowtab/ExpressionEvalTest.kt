@@ -66,4 +66,16 @@ class ExpressionEvalTest {
         assertEquals("{\"name\":\"Ada\"}", result["profile"].toString())
         assertEquals("\"count=3\"", result["label"].toString())
     }
+
+    @Test
+    fun `json interpolation keeps two expressions as one rendered string`() {
+        val json = buildJsonObject { put("first", "Ada"); put("last", "Lovelace") }
+        val template = buildJsonObject {
+            put("name", "{{ \$json.first }} {{ \$json.last }}")
+        }
+
+        val result = ExpressionEval.interpolateJson(template, json, emptyMap()) as JsonObject
+
+        assertEquals("\"Ada Lovelace\"", result["name"].toString())
+    }
 }

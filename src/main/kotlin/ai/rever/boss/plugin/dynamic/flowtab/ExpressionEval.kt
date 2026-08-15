@@ -14,6 +14,9 @@ import kotlinx.serialization.json.JsonPrimitive
  *  - `$node["Title"].json` — the first output item of the node titled "Title"
  *
  * Paths use `.key`, `["key"]`, and `[index]`. Anything unresolved renders empty.
+ * [interpolateJson] recursively resolves JSON templates: a string containing exactly
+ * one expression preserves the resolved JSON type, while expressions mixed with text
+ * render into a string.
  * This is deliberately NOT full JavaScript (GraalJS can't be plugin-bundled —
  * the host's binary-compat validator rejects the fat jar). Full JS would require
  * the host to ship GraalJS. See docs/AI_PIPELINE.md.
@@ -21,7 +24,6 @@ import kotlinx.serialization.json.JsonPrimitive
 object ExpressionEval {
 
     private val EXPR = Regex("""\{\{(.*?)}}""")
-    private val WHOLE_EXPR = Regex("""^\s*\{\{(.*?)}}\s*$""")
 
     /** Replace each `{{ expr }}` in [template] with its resolved value. */
     fun interpolate(
@@ -75,7 +77,10 @@ object ExpressionEval {
         is JsonPrimitive -> {
             if (!template.isString) template
             else {
-                val whole = WHOLE_EXPR.matchEntire(template.content)
+                val trimmed = template.content.trim()
+                // Reuse EXPR so a value containing two expressions cannot backtrack
+                // into one false "whole expression" spanning the first {{ to last }}.
+                val whole = EXPR.find(trimmed)?.takeIf { it.range.first == 0 && it.value.length == trimmed.length }
                 if (whole != null) {
                     eval(whole.groupValues[1].trim(), json, nodeOutputsByTitle) ?: JsonNull
                 } else {

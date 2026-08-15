@@ -34,6 +34,7 @@ private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 // still loading its content. Generic across every browser node.
 private const val ELEMENT_WAIT_MS = 20_000
 private const val ELEMENT_POLL_MS = 200
+private val CONDITION_COMPARISON = Regex("""^\s*(.+?)\s+(==|!=|>=|<=|>|<)\s+(.+?)\s*$""")
 
 /**
  * Polls (up to [timeoutMs]) for [selector] to match an element, returning whether
@@ -326,7 +327,7 @@ object NodeCatalog {
             val current = inputs.firstOrNull() ?: SEED_ITEMS.first()
             val rendered = runCatching { cfg.jsonTemplate("code") }
                 .getOrElse { throw ExecError("Code: 'code' must be valid JSON: ${it.message}") }
-                ?: current.json
+                ?: throw ExecError("Code needs an output JSON template")
             val obj = rendered as? JsonObject
                 ?: throw ExecError("Code: the JSON template must produce an object")
             log("Transformed item with JSON template")
@@ -356,9 +357,15 @@ object NodeCatalog {
         }.getOrDefault(emptyMap())
     }
 
-    /** Small, deterministic predicate language for If after `{{ }}` interpolation. */
+    /**
+     * Small, deterministic predicate language for If after `{{ }}` interpolation.
+     * Binary operators require surrounding whitespace, which keeps `<`/`>` inside
+     * interpolated HTML or text from being mistaken for the operator. If both operands
+     * parse as numbers they are compared as [Double]s; otherwise comparison is lexical.
+     * Without an operator, blank/false/null/undefined/0/no/off are falsy.
+     */
     internal fun evaluateCondition(raw: String): Boolean {
-        val comparison = Regex("""^\s*(.*?)\s*(==|!=|>=|<=|>|<)\s*(.*?)\s*$""").matchEntire(raw)
+        val comparison = CONDITION_COMPARISON.matchEntire(raw)
         if (comparison != null) {
             val left = comparison.groupValues[1].unquote()
             val op = comparison.groupValues[2]

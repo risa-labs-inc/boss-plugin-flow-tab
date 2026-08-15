@@ -264,6 +264,21 @@ class FlowExecutorTest {
     }
 
     @Test
+    fun `code rejects blank malformed and non-object templates`() {
+        val blank = runGraph(listOf(n("c", NodeType.CODE)), emptyList())
+        assertEquals(RunStatus.ERROR, blank["c"]?.status)
+        assertTrue(blank["c"]!!.error!!.contains("needs an output JSON template"))
+
+        val malformed = runGraph(listOf(n("c", NodeType.CODE, "code" to "{")), emptyList())
+        assertEquals(RunStatus.ERROR, malformed["c"]?.status)
+        assertTrue(malformed["c"]!!.error!!.contains("valid JSON"))
+
+        val array = runGraph(listOf(n("c", NodeType.CODE, "code" to "[1,2]")), emptyList())
+        assertEquals(RunStatus.ERROR, array["c"]?.status)
+        assertTrue(array["c"]!!.error!!.contains("produce an object"))
+    }
+
+    @Test
     fun `if independently routes multiple items through both output ports`() {
         val registry = builtinNodeRegistry().also { reg ->
             reg.register(
@@ -322,6 +337,45 @@ class FlowExecutorTest {
 
         assertEquals(RunStatus.SUCCESS, states["m"]?.status)
         assertEquals(listOf("a", "b"), states["m"]!!.output.map { it.json.str("side") })
+    }
+
+    @Test
+    fun `merge accepts one empty input port`() {
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            n("if", NodeType.IF, "condition" to "true"),
+            n("m", NodeType.MERGE),
+        )
+        val edges = listOf(
+            e("t", "if"),
+            e("if", "m", fp = 0, tp = 0),
+            e("if", "m", fp = 1, tp = 1),
+        )
+        val states = runGraph(nodes, edges)
+
+        assertEquals(RunStatus.SUCCESS, states["m"]?.status)
+        assertEquals(1, states["m"]!!.output.size)
+    }
+
+    @Test
+    fun `empty non-control output skips downstream with an explanatory log`() {
+        val handle = FakeHandle(responder = { script ->
+            if (script.contains("JSON.stringify")) """{"ok":true,"value":[]}""" else true
+        })
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            n("open", NodeType.OPEN_BROWSER),
+            n("ex", NodeType.EXTRACT, "selector" to ".missing", "multiple" to "true"),
+            n("set", NodeType.SET, "assignments" to """{"ran":true}"""),
+        )
+        val edges = listOf(e("t", "open"), e("open", "ex"), e("ex", "set"))
+        val states = runGraph(nodes, edges, FakeService(handle))
+
+        assertEquals(RunStatus.SUCCESS, states["ex"]?.status)
+        assertTrue(states["ex"]!!.output.isEmpty())
+        assertEquals(RunStatus.SUCCESS, states["set"]?.status)
+        assertTrue(states["set"]!!.output.isEmpty())
+        assertTrue(states["set"]!!.logs.any { it.contains("skipped", ignoreCase = true) })
     }
 
     @Test

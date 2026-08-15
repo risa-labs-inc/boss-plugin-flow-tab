@@ -7,6 +7,8 @@ together with edges, n8n style.
 
 - **Canvas** with smooth pan (drag empty space) and zoom (scroll wheel, toward cursor).
 - **Nodes** you can spawn from the toolbar palette (Trigger, HTTP, Code, If, Set, Merge).
+- **Code node** applies a typed JSON output template per item; it does not execute
+  JavaScript because the host does not currently provide a plugin-safe JS runtime.
 - **Edges**: drag from an output port to an input port to connect nodes; bezier curves.
 - **Move / select / delete**: drag nodes to reposition, click to select, `Delete` to remove
   the selected node (and its edges) or a selected edge.
@@ -20,7 +22,7 @@ together with edges, n8n style.
 ./gradlew buildPluginJar
 ```
 
-The JAR is generated at `build/libs/boss-plugin-flow-tab-1.0.0.jar`.
+The JAR is generated at `build/libs/boss-plugin-flow-tab-<version>.jar`.
 
 ## Installation (local development)
 
