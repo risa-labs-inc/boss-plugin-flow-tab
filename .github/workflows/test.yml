@@ -1,0 +1,162 @@
+name: Tests
+
+# build.yml fires only on push to main and delegates straight to the release
+# workflow, so nothing in this repo compiled before a merge landed. This runs on
+# every pull request, which is what makes it usable as a required status check.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Only the checkout is read; the api jar comes from a public release.
+permissions:
+  contents: read
+
+concurrency:
+  # head_ref is set only on pull_request and is stable across a force-push, so a
+  # new push supersedes the in-flight PR run. On push to main it is empty and
+  # run_id makes the group unique instead, so two merges in quick succession do
+  # not cancel each other and every commit on main keeps a result of its own.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          # This workflow runs on pull_request and executes the committed
+          # gradle-wrapper.jar, so a PR that swaps that jar would run arbitrary
+          # code here. Checks it against the known-good checksums.
+          validate-wrappers: true
+
+      # The api is compileOnly because the host classloader provides it at
+      # runtime, but compiling and testing happen outside the host, so the jar
+      # has to be on the classpath here.
+      #
+      # Tracks the latest release rather than a pin, matching build.yml. The api
+      # is additive-only (apiCheck gates it), so latest is always >= what this
+      # compiles against, whereas the 1.0.56 pin that used to live here is what
+      # broke the release after the AI Gateway migration: it fetched a jar from
+      # before AiGatewayAPI existed and :compileKotlin failed on symbols that
+      # are plainly in the source.
+      #
+      # boss-plugin-api is a public repo, so the default GITHUB_TOKEN — scoped to
+      # this repo — is enough for both the release lookup and the asset
+      # download. If it is ever made private this step 404s on every PR and will
+      # need a PAT instead.
+      - name: Download boss-plugin-api
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version=$(gh api repos/risa-labs-inc/boss-plugin-api/releases/latest --jq '.tag_name' | sed 's/^v//')
+          # --jq prints an empty line rather than failing when tag_name is
+          # absent, and set -e does not catch that. Without this guard the curl
+          # below requests .../download/v/boss-plugin-api-.jar and the 404 reads
+          # like a missing release instead of a bad API response.
+          [ -n "$version" ] || { echo "::error::could not resolve the latest boss-plugin-api release"; exit 1; }
+          echo "Resolved boss-plugin-api: $version"
+          mkdir -p build/downloaded-deps
+          # -f so an HTTP error fails the step rather than writing an error page
+          # to the jar path and surfacing later as unresolved-reference noise.
+          curl -fsSL -o build/downloaded-deps/boss-plugin-api.jar \
+            "https://github.com/risa-labs-inc/boss-plugin-api/releases/download/v${version}/boss-plugin-api-${version}.jar"
+          ls -l build/downloaded-deps/
+
+      # CI=true switches build.gradle.kts off the sibling-checkout jar and onto
+      # the one downloaded above (see useLocalDependencies). Actions sets it
+      # anyway; set explicitly so the dependency is visible rather than
+      # inherited.
+      #
+      # build, not test: tasks.build dependsOn buildPluginJar, which is where
+      # the bundled configuration resolves and the MCP SDK + ktor closure gets
+      # fat-packed with hostProvided/forceInclude filtering. test alone never
+      # exercises that, and it is the part the release actually ships.
+      #
+      # buildPluginJar is re-run last on purpose. Both it and the base `jar`
+      # task write build/libs/boss-plugin-flow-tab-<version>.jar — same name,
+      # same directory — and nothing orders them, so whichever runs last owns
+      # the path. Today buildPluginJar wins, but if that ever flipped the check
+      # below would inspect the thin jar (945K, no vendored deps) and report the
+      # fat-pack filter as broken when it is fine. The re-run is up-to-date and
+      # near-free unless `jar` actually clobbered it.
+      - name: Compile, test, and build the plugin jar
+        run: ./gradlew build && ./gradlew buildPluginJar
+        env:
+          CI: 'true'
+
+      # :buildPluginJar succeeding only proves the bundled configuration
+      # resolved — not that hostProvided/forceInclude produced a shippable jar.
+      # Both halves of that filter fail silently and only at runtime inside
+      # BOSS: drop the kotlinx-io carve-out and the MCP SDK breaks, or stop
+      # excluding a host-provided group and the vendored copy shadows the
+      # host's. These assert the outcome of each half.
+      - name: Sanity-check the fat jar
+        run: |
+          set -euo pipefail
+          # nullglob: an unmatched glob otherwise expands to itself, giving the
+          # array one element and sliding past the arity guard, so the zero-jar
+          # case would surface as unzip's "cannot find or open" instead of the
+          # message written to explain it.
+          shopt -s nullglob
+          jars=(build/libs/boss-plugin-flow-tab-*.jar)
+          [ ${#jars[@]} -eq 1 ] || { echo "::error::expected exactly one plugin jar, found ${#jars[@]}: ${jars[*]-none}"; exit 1; }
+          jar="${jars[0]}"
+          echo "Checking $jar"
+
+          # Listed once into a file: piping unzip into grep -q closes the pipe
+          # early, which trips pipefail on an otherwise passing check.
+          listing=$(mktemp)
+          unzip -l "$jar" > "$listing"
+
+          present() {
+            grep -q "$1" "$listing" || { echo "::error::$2 is missing from the plugin jar ($1)"; exit 1; }
+            echo "  ok: $2 bundled"
+          }
+          absent() {
+            if grep -q "$1" "$listing"; then
+              echo "::error::$2 leaked into the plugin jar ($1) and would shadow the host's copy"
+              exit 1
+            fi
+            echo "  ok: $2 not shadowed"
+          }
+
+          # Without the manifest the host will not load the plugin at all, and
+          # processResources rewriting the version into it is a documented
+          # invariant nothing else checks. Present in the thin jar too, so this
+          # pair asserts loadability rather than fat-packing.
+          present 'META-INF/boss-plugin/plugin.json' 'plugin manifest'
+          present 'ai/rever/boss/plugin/dynamic/flowtab/FlowTabDynamicPlugin.class' 'plugin entry point'
+
+          # Bundled: the host classpath does not provide these.
+          present 'io/modelcontextprotocol/' 'MCP Kotlin SDK'
+          present 'io/ktor/'                 'ktor'
+          # The forceInclude carve-out, re-added despite the org.jetbrains.kotlinx
+          # group exclusion because the SDK needs it.
+          present 'kotlinx/io/Buffer'        'kotlinx-io-core'
+          present 'kotlinx/io/bytestring/'   'kotlinx-io-bytestring'
+
+          # Host-provided: excluded by group, must not be vendored.
+          absent 'kotlin/jvm/internal/'      'kotlin stdlib'
+          absent 'kotlinx/coroutines/'       'kotlinx-coroutines'
+          absent 'kotlinx/serialization/'    'kotlinx-serialization'
+
+      # Gradle's console output truncates aggressively; with ~25 test classes
+      # the HTML report is what you actually want when the suite goes red.
+      - name: Upload test report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-report
+          path: build/reports/tests/test/
+          if-no-files-found: ignore
