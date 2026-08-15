@@ -153,6 +153,13 @@ class FlowExecutorTest {
     }
 
     @Test
+    fun `self edge is rejected instead of waiting on itself`() {
+        val nodes = listOf(n("a", NodeType.SET))
+
+        assertFailsWith<ExecError> { runGraph(nodes, listOf(e("a", "a"))) }
+    }
+
+    @Test
     fun `linear chain threads data and resolves expressions`() {
         val nodes = listOf(
             n("t", NodeType.TRIGGER),

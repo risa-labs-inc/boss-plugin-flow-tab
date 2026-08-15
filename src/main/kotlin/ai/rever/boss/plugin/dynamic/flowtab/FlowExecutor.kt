@@ -10,6 +10,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.ConcurrentHashMap
 
@@ -62,7 +63,6 @@ class FlowExecutor(
         ancestry: Set<String> = emptySet(),
         onStatus: (nodeId: String, NodeRun) -> Unit
     ) {
-        val byId = nodes.associateBy { it.id }
         topoSort(nodes, edges) // validate: throws on cycle (else awaits would deadlock)
 
         val edgesByTarget = edges.groupBy { it.toNode }
@@ -86,78 +86,90 @@ class FlowExecutor(
             coroutineScope {
                 for (node in nodes) {
                     launch {
-                        // Wait for every upstream node to finish.
-                        depsOf[node.id]?.forEach { dep -> done[dep]?.await() }
-
-                        // If anything upstream failed, skip this node (and thus its branch).
-                        if (depsOf[node.id]?.any { failed.contains(it) } == true) {
-                            failed.add(node.id)
-                            onStatus(
-                                node.id,
-                                NodeRun(
-                                    RunStatus.SKIPPED,
-                                    logs = listOf(SKIP_UPSTREAM_FAILED),
-                                    skipReason = SKIP_UPSTREAM_FAILED,
-                                ),
-                            )
-                            done[node.id]?.complete(Unit)
-                            return@launch
-                        }
-
-                        onStatus(node.id, NodeRun(RunStatus.RUNNING))
-                        // Realistic mode: pause a random, human-like beat before acting —
-                        // paces the run so it's watchable and mimics a person at the keyboard.
-                        if (humanize) delay(Random.nextLong(HUMANIZE_MIN_MS, HUMANIZE_MAX_MS))
-                        val logs = mutableListOf<String>()
                         try {
-                            val incoming = incomingOf[node.id].orEmpty()
-                            val inputs = incoming
-                                .sortedBy { it.toPort }
-                                .flatMap { outputsById[it.fromNode]?.port(it.fromPort).orEmpty() }
-                            val skipped = incoming.isNotEmpty() && inputs.isEmpty()
-                            val out = if (skipped) {
-                                // An upstream control port emitted no items. Do not seed
-                                // and accidentally execute the unselected branch.
-                                logs.add(SKIP_NO_INPUT)
-                                NodeOutput.EMPTY
-                            } else {
-                                // Provider availability is a runtime property of the selected
-                                // branch. A dead branch must not fail an otherwise valid run.
-                                val spec = registry[node.kind]
-                                    ?: throw ExecError("Unknown node kind '${node.kind}' — its provider isn't available")
-                                val exec = spec.executor
-                                    ?: throw ExecError("${spec.label} is unavailable — its provider isn't loaded")
-                                if (spec.usesSession) {
-                                    ctx.sessionMutex.withLock { runNode(ctx, node, inputs, spec, exec) { logs.add(it) } }
-                                } else {
-                                    runNode(ctx, node, inputs, spec, exec) { logs.add(it) }
-                                }
+                            // Wait for every upstream node to finish.
+                            depsOf[node.id]?.forEach { dep -> done[dep]?.await() }
+
+                            // If anything upstream failed, skip this node (and thus its branch).
+                            if (depsOf[node.id]?.any { failed.contains(it) } == true) {
+                                failed.add(node.id)
+                                onStatus(
+                                    node.id,
+                                    NodeRun(
+                                        RunStatus.SKIPPED,
+                                        logs = listOf(SKIP_UPSTREAM_FAILED),
+                                        skipReason = SKIP_UPSTREAM_FAILED,
+                                    ),
+                                )
+                                return@launch
                             }
-                            outputsById[node.id] = out
-                            val flattened = out.allItems()
-                            ctx.outputsByTitle[node.title] = flattened
-                            val status = if (skipped) RunStatus.SKIPPED else RunStatus.SUCCESS
-                            onStatus(
-                                node.id,
-                                NodeRun(
-                                    status = status,
-                                    output = flattened,
-                                    logs = logs,
-                                    skipReason = SKIP_NO_INPUT.takeIf { skipped },
-                                ),
-                            )
-                        } catch (ce: CancellationException) {
-                            throw ce
-                        } catch (e: Exception) {
-                            failed.add(node.id)
-                            onStatus(node.id, NodeRun(RunStatus.ERROR, emptyList(), e.message ?: e.toString(), logs))
+
+                            onStatus(node.id, NodeRun(RunStatus.RUNNING))
+                            // Realistic mode: pause a random, human-like beat before acting —
+                            // paces the run so it's watchable and mimics a person at the keyboard.
+                            if (humanize) delay(Random.nextLong(HUMANIZE_MIN_MS, HUMANIZE_MAX_MS))
+                            val logs = mutableListOf<String>()
+                            try {
+                                val incoming = incomingOf[node.id].orEmpty()
+                                val inputs = incoming
+                                    .sortedBy { it.toPort }
+                                    .flatMap { outputsById[it.fromNode]?.port(it.fromPort).orEmpty() }
+                                val skipped = incoming.isNotEmpty() && inputs.isEmpty()
+                                val out = if (skipped) {
+                                    // An upstream control port emitted no items. Do not seed
+                                    // and accidentally execute the unselected branch.
+                                    logs.add(SKIP_NO_INPUT)
+                                    NodeOutput.EMPTY
+                                } else {
+                                    // Provider availability is a runtime property of the selected
+                                    // branch. A dead branch must not fail an otherwise valid run.
+                                    val spec = registry[node.kind]
+                                        ?: throw ExecError(
+                                            "Unknown node kind '${node.kind}' — its provider isn't available",
+                                        )
+                                    val exec = spec.executor
+                                        ?: throw ExecError("${spec.label} is unavailable — its provider isn't loaded")
+                                    if (spec.usesSession) {
+                                        ctx.sessionMutex.withLock {
+                                            runNode(ctx, node, inputs, spec, exec) { logs.add(it) }
+                                        }
+                                    } else {
+                                        runNode(ctx, node, inputs, spec, exec) { logs.add(it) }
+                                    }
+                                }
+                                outputsById[node.id] = out
+                                val flattened = out.allItems()
+                                ctx.outputsByTitle[node.title] = flattened
+                                val status = if (skipped) RunStatus.SKIPPED else RunStatus.SUCCESS
+                                onStatus(
+                                    node.id,
+                                    NodeRun(
+                                        status = status,
+                                        output = flattened,
+                                        logs = logs,
+                                        skipReason = SKIP_NO_INPUT.takeIf { skipped },
+                                    ),
+                                )
+                            } catch (ce: CancellationException) {
+                                throw ce
+                            } catch (e: Exception) {
+                                failed.add(node.id)
+                                onStatus(node.id, NodeRun(RunStatus.ERROR, emptyList(), e.message ?: e.toString(), logs))
+                            }
+                        } finally {
+                            // Every exit path signals dependants. Without this, an exception
+                            // in status publication or setup can leave them awaiting forever.
+                            done[node.id]?.complete(Unit)
                         }
-                        done[node.id]?.complete(Unit)
                     }
                 }
             }
         } finally {
-            withContext(NonCancellable) { ctx.close() }
+            // Cleanup must not defeat the run watchdog. A host browser disposer that
+            // stalls is abandoned after a short best-effort window.
+            withContext(NonCancellable) {
+                withTimeoutOrNull(CLEANUP_TIMEOUT_MS) { ctx.close() }
+            }
         }
     }
 
@@ -204,7 +216,7 @@ class FlowExecutor(
         val indeg = ids.associateWith { 0 }.toMutableMap()
         val adj = ids.associateWith { mutableListOf<String>() }.toMutableMap()
         for (e in edges) {
-            if (e.fromNode in ids && e.toNode in ids && e.fromNode != e.toNode) {
+            if (e.fromNode in ids && e.toNode in ids) {
                 adj[e.fromNode]?.add(e.toNode)
                 indeg[e.toNode] = (indeg[e.toNode] ?: 0) + 1
             }
@@ -227,5 +239,6 @@ class FlowExecutor(
         // Human-like pause range (ms) inserted before each step in realistic mode.
         const val HUMANIZE_MIN_MS = 600L
         const val HUMANIZE_MAX_MS = 2000L
+        const val CLEANUP_TIMEOUT_MS = 5_000L
     }
 }

@@ -12,6 +12,8 @@ import ai.rever.boss.plugin.api.TabRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -74,8 +76,11 @@ class FlowControllerTest {
         }
     }
 
-    private fun controller(storage: PluginStorageProvider = FakeStorage()) =
-        FlowController(context(storage), scope)
+    private fun controller(
+        storage: PluginStorageProvider = FakeStorage(),
+        registry: NodeRegistry = builtinNodeRegistry(),
+        runTimeoutMs: Long = FlowController.DEFAULT_RUN_TIMEOUT_MS,
+    ) = FlowController(context(storage), scope, registry, runTimeoutMs)
 
     // ---- authoring ----------------------------------------------------------
 
@@ -236,6 +241,101 @@ class FlowControllerTest {
         val job = awaitTerminal(fc, fc.startRun(tabId))
         assertEquals(RunJobState.FAILED, job.state)
         assertEquals(RunStatus.ERROR, fc.runResult(job.runId)!![gone]!!.status)
+    }
+
+    @Test
+    fun `a registered kind with a null executor fails immediately`() = runBlocking {
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "NULL_EXECUTOR",
+                    label = "Null Executor",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    executor = null,
+                )
+            )
+        }
+        val fc = controller(registry = registry)
+        val tabId = fc.createFlow()
+        val nodeId = fc.addNode(tabId, "NULL_EXECUTOR")
+
+        val job = awaitTerminal(fc, fc.startRun(tabId))
+
+        assertEquals(RunJobState.FAILED, job.state)
+        assertEquals(RunStatus.ERROR, fc.runResult(job.runId)!![nodeId]!!.status)
+        assertTrue(job.error!!.contains("provider isn't loaded", ignoreCase = true))
+    }
+
+    @Test
+    fun `flow_result exposes live node state and the watchdog terminates a hung executor`() = runBlocking {
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "HANG",
+                    label = "Hang",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, _, _ -> awaitCancellation() },
+                )
+            )
+        }
+        val fc = controller(registry = registry, runTimeoutMs = 150)
+        val tabId = fc.createFlow()
+        val nodeId = fc.addNode(tabId, "HANG")
+        val runId = fc.startRun(tabId)
+
+        withTimeout(1_000) {
+            while (fc.runResult(runId)?.get(nodeId)?.status != RunStatus.RUNNING) delay(5)
+        }
+        assertEquals(RunJobState.RUNNING, fc.runStatus(runId)!!.state)
+        assertEquals(RunStatus.RUNNING, fc.runResult(runId)!![nodeId]!!.status)
+
+        val job = awaitTerminal(fc, runId)
+        assertEquals(RunJobState.FAILED, job.state)
+        assertTrue(job.error!!.contains("timeout", ignoreCase = true))
+        assertEquals(RunStatus.ERROR, fc.runResult(runId)!![nodeId]!!.status)
+    }
+
+    @Test
+    fun `headless runs use the replacement sandbox scope after watchdog restart`() = runBlocking {
+        val storage = FakeStorage()
+        var sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val ctx = object : PluginContext {
+            override val panelRegistry = PanelRegistry()
+            override val tabRegistry = TabRegistry()
+            override val pluginScope: CoroutineScope get() = sandboxScope
+            override val pluginStorageFactory = object : PluginStorageFactory {
+                override fun createStorage(pluginId: String): PluginStorageProvider = storage
+            }
+        }
+        val fc = buildHeadlessController(ctx, PromptRegistry(storage), external = null)
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "TRIGGER")
+
+        sandboxScope.cancel()
+        sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+        val job = awaitTerminal(fc, fc.startRun(tabId))
+        assertEquals(RunJobState.SUCCEEDED, job.state)
+    }
+
+    @Test
+    fun `dispatch into an already cancelled scope fails instead of staying running`() = runBlocking {
+        val cancelledScope = CoroutineScope(Dispatchers.Default + SupervisorJob()).also { it.cancel() }
+        val storage = FakeStorage()
+        val fc = FlowController(context(storage), cancelledScope)
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "TRIGGER")
+
+        val job = awaitTerminal(fc, fc.startRun(tabId))
+        assertEquals(RunJobState.FAILED, job.state)
+        assertTrue(job.error!!.contains("cancel", ignoreCase = true))
     }
 
     @Test

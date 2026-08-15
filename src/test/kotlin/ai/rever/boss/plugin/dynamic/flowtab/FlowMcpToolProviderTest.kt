@@ -70,9 +70,12 @@ class FlowMcpToolProviderTest {
         }
     }
 
-    private fun provider(storage: PluginStorageProvider = FakeStorage()): FlowMcpToolProvider {
+    private fun provider(
+        storage: PluginStorageProvider = FakeStorage(),
+        registry: NodeRegistry = builtinNodeRegistry(),
+    ): FlowMcpToolProvider {
         val ctx = context(storage)
-        return FlowMcpToolProvider(FlowController(ctx, scope), PromptRegistry(storage))
+        return FlowMcpToolProvider(FlowController(ctx, scope, registry), PromptRegistry(storage))
     }
 
     private fun FlowMcpToolProvider.tool(name: String): McpToolDefinition =
@@ -148,6 +151,48 @@ class FlowMcpToolProviderTest {
         assertEquals("SUCCEEDED", state)
         val result = obj(call(p, "flow_result", """{"runId":"$runId"}"""))
         assertTrue(result.getValue("nodes").jsonObject.containsKey(set))
+    }
+
+    @Test
+    fun `null executor flow reaches failed and flow_result returns node state`() = runBlocking {
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "NULL_EXECUTOR",
+                    label = "Null Executor",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    executor = null,
+                )
+            )
+        }
+        val p = provider(registry = registry)
+        val tabId = obj(call(p, "flow_create")).getValue("tabId").jsonPrimitive.content
+        val nullNode = obj(
+            call(p, "flow_add_node", """{"tabId":"$tabId","kind":"NULL_EXECUTOR"}""")
+        ).getValue("nodeId").jsonPrimitive.content
+        val runId = obj(
+            call(p, "flow_run", """{"tabId":"$tabId"}""")
+        ).getValue("runId").jsonPrimitive.content
+
+        val state = withTimeout(2_000) {
+            var current: String
+            while (true) {
+                current = obj(
+                    call(p, "flow_status", """{"runId":"$runId"}""")
+                ).getValue("state").jsonPrimitive.content
+                if (current != "RUNNING") break
+                delay(10)
+            }
+            current
+        }
+        assertEquals("FAILED", state)
+
+        val result = obj(call(p, "flow_result", """{"runId":"$runId"}"""))
+        val node = result.getValue("nodes").jsonObject.getValue(nullNode).jsonObject
+        assertEquals("ERROR", node.getValue("status").jsonPrimitive.content)
     }
 
     // ---- prompt tools -------------------------------------------------------
