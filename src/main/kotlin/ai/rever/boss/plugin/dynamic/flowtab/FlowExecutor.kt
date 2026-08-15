@@ -65,8 +65,12 @@ class FlowExecutor(
         val byId = nodes.associateBy { it.id }
         topoSort(nodes, edges) // validate: throws on cycle (else awaits would deadlock)
 
-        val depsOf: Map<String, List<String>> = nodes.associate { n ->
-            n.id to edges.filter { it.toNode == n.id }.map { it.fromNode }.distinct()
+        val edgesByTarget = edges.groupBy { it.toNode }
+        val incomingOf: Map<String, List<EdgeModel>> = nodes.associate { n ->
+            n.id to edgesByTarget[n.id].orEmpty()
+        }
+        val depsOf: Map<String, List<String>> = incomingOf.mapValues { (_, incoming) ->
+            incoming.map { it.fromNode }.distinct()
         }
         val outputsById = ConcurrentHashMap<String, NodeOutput>()
         val failed = ConcurrentHashMap.newKeySet<String>()
@@ -88,6 +92,14 @@ class FlowExecutor(
                         // If anything upstream failed, skip this node (and thus its branch).
                         if (depsOf[node.id]?.any { failed.contains(it) } == true) {
                             failed.add(node.id)
+                            onStatus(
+                                node.id,
+                                NodeRun(
+                                    RunStatus.SKIPPED,
+                                    logs = listOf(SKIP_UPSTREAM_FAILED),
+                                    skipReason = SKIP_UPSTREAM_FAILED,
+                                ),
+                            )
                             done[node.id]?.complete(Unit)
                             return@launch
                         }
@@ -98,24 +110,42 @@ class FlowExecutor(
                         if (humanize) delay(Random.nextLong(HUMANIZE_MIN_MS, HUMANIZE_MAX_MS))
                         val logs = mutableListOf<String>()
                         try {
-                            val incoming = edges.filter { it.toNode == node.id }
+                            val incoming = incomingOf[node.id].orEmpty()
                             val inputs = incoming
                                 .sortedBy { it.toPort }
                                 .flatMap { outputsById[it.fromNode]?.port(it.fromPort).orEmpty() }
-                            val out = if (incoming.isNotEmpty() && inputs.isEmpty()) {
+                            val skipped = incoming.isNotEmpty() && inputs.isEmpty()
+                            val out = if (skipped) {
                                 // An upstream control port emitted no items. Do not seed
                                 // and accidentally execute the unselected branch.
-                                logs.add("Skipped — no input items")
+                                logs.add(SKIP_NO_INPUT)
                                 NodeOutput.EMPTY
-                            } else if (registry[node.kind]?.usesSession == true) {
-                                ctx.sessionMutex.withLock { runNode(ctx, node, inputs) { logs.add(it) } }
                             } else {
-                                runNode(ctx, node, inputs) { logs.add(it) }
+                                // Provider availability is a runtime property of the selected
+                                // branch. A dead branch must not fail an otherwise valid run.
+                                val spec = registry[node.kind]
+                                    ?: throw ExecError("Unknown node kind '${node.kind}' — its provider isn't available")
+                                val exec = spec.executor
+                                    ?: throw ExecError("${spec.label} is unavailable — its provider isn't loaded")
+                                if (spec.usesSession) {
+                                    ctx.sessionMutex.withLock { runNode(ctx, node, inputs, spec, exec) { logs.add(it) } }
+                                } else {
+                                    runNode(ctx, node, inputs, spec, exec) { logs.add(it) }
+                                }
                             }
                             outputsById[node.id] = out
                             val flattened = out.allItems()
                             ctx.outputsByTitle[node.title] = flattened
-                            onStatus(node.id, NodeRun(RunStatus.SUCCESS, flattened, null, logs))
+                            val status = if (skipped) RunStatus.SKIPPED else RunStatus.SUCCESS
+                            onStatus(
+                                node.id,
+                                NodeRun(
+                                    status = status,
+                                    output = flattened,
+                                    logs = logs,
+                                    skipReason = SKIP_NO_INPUT.takeIf { skipped },
+                                ),
+                            )
                         } catch (ce: CancellationException) {
                             throw ce
                         } catch (e: Exception) {
@@ -135,12 +165,10 @@ class FlowExecutor(
         ctx: RunContext,
         node: PlanNode,
         inputs: List<Item>,
+        spec: NodeSpec,
+        exec: NodeExecutor,
         log: (String) -> Unit
     ): NodeOutput {
-        val spec = registry[node.kind]
-            ?: throw ExecError("Unknown node kind '${node.kind}' — its provider isn't available")
-        val exec = spec.executor
-            ?: throw ExecError("${spec.label} is unavailable — its provider isn't loaded")
         return when (spec.runMode) {
             RunMode.PER_ITEM -> {
                 val accumulated = HashMap<Int, MutableList<Item>>()
@@ -152,10 +180,16 @@ class FlowExecutor(
                         log,
                     )
                     output.ports.forEach { (port, items) ->
-                        accumulated.getOrPut(port) { mutableListOf() }.addAll(items)
+                        if (items.isNotEmpty()) {
+                            accumulated.getOrPut(port) { mutableListOf() }.addAll(items)
+                        }
                     }
                 }
-                NodeOutput(accumulated.mapValues { (_, items) -> items.toList() })
+                if (accumulated.isEmpty()) {
+                    NodeOutput.EMPTY
+                } else {
+                    NodeOutput(accumulated.mapValues { (_, items) -> items.toList() })
+                }
             }
             RunMode.ONCE -> {
                 val item = inputs.firstOrNull() ?: SEED_ITEMS.first()

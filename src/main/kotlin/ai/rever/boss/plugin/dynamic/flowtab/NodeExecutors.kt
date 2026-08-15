@@ -34,7 +34,9 @@ private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 // still loading its content. Generic across every browser node.
 private const val ELEMENT_WAIT_MS = 20_000
 private const val ELEMENT_POLL_MS = 200
-private val CONDITION_COMPARISON = Regex("""^\s*(.+?)\s+(==|!=|>=|<=|>|<)\s+(.+?)\s*$""")
+// Order matters: longest operators must be checked before their one-character prefixes.
+private val CONDITION_OPERATORS = listOf("==", "!=", ">=", "<=", ">", "<")
+private val CONDITION_NUMBER = Regex("""[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?""")
 
 /**
  * Polls (up to [timeoutMs]) for [selector] to match an element, returning whether
@@ -129,7 +131,12 @@ class ConfigReader(
     private val item: Item,
     private val outputsByTitle: Map<String, List<Item>>
 ) {
-    private fun raw(key: String): String = (config[key] as? JsonPrimitive)?.content ?: ""
+    /** Raw scalar template, before current-item expressions are resolved. */
+    internal fun raw(key: String): String = (config[key] as? JsonPrimitive)?.content ?: ""
+
+    /** Resolve expressions in an arbitrary fragment against this reader's current item. */
+    internal fun interpolate(template: String): String =
+        ExpressionEval.interpolate(template, item.json, outputsByTitle)
 
     /** Field value with `{{ }}` resolved. */
     fun str(key: String, default: String = ""): String {
@@ -195,7 +202,7 @@ fun interface NodeExecutor {
  */
 object NodeCatalog {
 
-    fun executor(type: NodeType): NodeExecutor? = when (type) {
+    fun executor(type: NodeType): NodeExecutor = when (type) {
         NodeType.TRIGGER -> NodeExecutor { _, _, _, _ -> NodeOutput.single(SEED_ITEMS) }
 
         NodeType.OPEN_BROWSER -> NodeExecutor { ctx, cfg, inputs, log ->
@@ -323,8 +330,7 @@ object NodeCatalog {
             NodeOutput.single(listOf(Item(merged)))
         }
 
-        NodeType.CODE -> NodeExecutor { _, cfg, inputs, log ->
-            val current = inputs.firstOrNull() ?: SEED_ITEMS.first()
+        NodeType.CODE -> NodeExecutor { _, cfg, _, log ->
             val rendered = runCatching { cfg.jsonTemplate("code") }
                 .getOrElse { throw ExecError("Code: 'code' must be valid JSON: ${it.message}") }
                 ?: throw ExecError("Code needs an output JSON template")
@@ -335,9 +341,9 @@ object NodeCatalog {
         }
 
         NodeType.IF -> NodeExecutor { _, cfg, inputs, log ->
-            val condition = cfg.str("condition")
-            if (condition.isBlank()) throw ExecError("If needs a condition")
-            val matched = evaluateCondition(condition)
+            val conditionTemplate = cfg.raw("condition")
+            if (conditionTemplate.isBlank()) throw ExecError("If needs a condition")
+            val matched = evaluateCondition(conditionTemplate, cfg::interpolate)
             log("Condition → ${if (matched) "true" else "false"}")
             NodeOutput.onPort(if (matched) 0 else 1, inputs)
         }
@@ -358,40 +364,115 @@ object NodeCatalog {
     }
 
     /**
-     * Small, deterministic predicate language for If after `{{ }}` interpolation.
-     * Binary operators require surrounding whitespace, which keeps `<`/`>` inside
-     * interpolated HTML or text from being mistaken for the operator. If both operands
-     * parse as numbers they are compared as [Double]s; otherwise comparison is lexical.
-     * Without an operator, blank/false/null/undefined/0/no/off are falsy.
+     * Small, deterministic predicate language for If. The raw condition template is
+     * split before [interpolate] resolves either operand, so newlines and operator-like
+     * text in item data cannot alter the predicate grammar. Binary operators require
+     * surrounding whitespace. Equality supports strings or numbers. Ordering is numeric
+     * when both operands are numbers, lexical when both are text, false when either is
+     * blank, and rejected when one is numeric and the other is text. A raw condition
+     * without an operator — including an expression-only template — is tested only for
+     * truthiness; blank/false/null/undefined/0/no/off are falsy.
      */
-    internal fun evaluateCondition(raw: String): Boolean {
-        val comparison = CONDITION_COMPARISON.matchEntire(raw)
+    internal fun evaluateCondition(
+        raw: String,
+        interpolate: (String) -> String,
+    ): Boolean {
+        val comparison = splitComparison(raw)
         if (comparison != null) {
-            val left = comparison.groupValues[1].unquote()
-            val op = comparison.groupValues[2]
-            val right = comparison.groupValues[3].unquote()
-            val leftNumber = left.toDoubleOrNull()
-            val rightNumber = right.toDoubleOrNull()
-            val order = if (leftNumber != null && rightNumber != null) {
-                leftNumber.compareTo(rightNumber)
-            } else {
-                left.compareTo(right)
-            }
+            val left = interpolate(comparison.left).unquote()
+            val op = comparison.operator
+            val right = interpolate(comparison.right).unquote()
+            val leftNumber = left.conditionNumberOrNull()
+            val rightNumber = right.conditionNumberOrNull()
             return when (op) {
-                "==" -> if (leftNumber != null && rightNumber != null) order == 0 else left == right
-                "!=" -> if (leftNumber != null && rightNumber != null) order != 0 else left != right
-                ">" -> order > 0
-                ">=" -> order >= 0
-                "<" -> order < 0
-                "<=" -> order <= 0
+                "==" -> if (leftNumber != null && rightNumber != null) leftNumber == rightNumber else left == right
+                "!=" -> if (leftNumber != null && rightNumber != null) leftNumber != rightNumber else left != right
+                ">", ">=", "<", "<=" -> {
+                    if (left.isBlank() || right.isBlank()) return false
+                    if ((leftNumber == null) != (rightNumber == null)) {
+                        throw ExecError(
+                            "If: cannot order-compare '${left.preview()}' with '${right.preview()}' — " +
+                                "normalize both values upstream or use ==/!=",
+                        )
+                    }
+                    val order = if (leftNumber != null && rightNumber != null) {
+                        leftNumber.compareTo(rightNumber)
+                    } else {
+                        left.compareTo(right)
+                    }
+                    when (op) {
+                        ">" -> order > 0
+                        ">=" -> order >= 0
+                        "<" -> order < 0
+                        else -> order <= 0
+                    }
+                }
                 else -> false
             }
         }
-        return when (val value = raw.trim().unquote().lowercase()) {
+        return when (val value = interpolate(raw).trim().unquote().lowercase()) {
             "", "false", "null", "undefined", "0", "no", "off" -> false
             else -> value.toDoubleOrNull()?.let { it != 0.0 } ?: true
         }
     }
+
+    private data class Comparison(val left: String, val operator: String, val right: String)
+
+    /** Find a whitespace-delimited operator outside `{{ }}` spans and quoted literals. */
+    private fun splitComparison(raw: String): Comparison? {
+        var i = 0
+        while (i < raw.length) {
+            if (raw.startsWith("{{", i)) {
+                val end = raw.indexOf("}}", startIndex = i + 2)
+                i = if (end >= 0) end + 2 else i + 2
+                continue
+            }
+            val quote = raw[i].takeIf {
+                (it == '\'' || it == '"') &&
+                    (i == 0 || raw[i - 1].isWhitespace() || raw[i - 1] in "=!<>")
+            }
+            val closingQuote = quote?.let { findClosingQuote(raw, i + 1, it) } ?: -1
+            if (closingQuote >= 0) {
+                i = closingQuote + 1
+                continue
+            }
+            val operator = CONDITION_OPERATORS.firstOrNull { raw.startsWith(it, i) }
+            if (operator != null) {
+                val after = i + operator.length
+                val delimitedBefore = i == 0 || raw[i - 1].isWhitespace()
+                val delimitedAfter = after == raw.length || raw[after].isWhitespace()
+                if (delimitedBefore && delimitedAfter) {
+                    val left = raw.substring(0, i).trim()
+                    val right = raw.substring(after).trim()
+                    if (left.isEmpty() || right.isEmpty()) {
+                        throw ExecError("If: comparison '$raw' is missing an operand")
+                    }
+                    return Comparison(left, operator, right)
+                }
+            }
+            i++
+        }
+        return null
+    }
+
+    private fun findClosingQuote(raw: String, start: Int, quote: Char): Int {
+        var i = start
+        while (i < raw.length) {
+            if (raw[i] == '\\') {
+                i += 2
+            } else if (raw[i] == quote) {
+                return i
+            } else {
+                i++
+            }
+        }
+        return -1
+    }
+
+    private fun String.conditionNumberOrNull(): Double? =
+        trim().takeIf { CONDITION_NUMBER.matches(it) }?.toDoubleOrNull()?.takeIf { it.isFinite() }
+
+    private fun String.preview(): String = replace("\n", "\\n").take(40)
 
     private fun String.unquote(): String {
         val s = trim()

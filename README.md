@@ -8,7 +8,17 @@ together with edges, n8n style.
 - **Canvas** with smooth pan (drag empty space) and zoom (scroll wheel, toward cursor).
 - **Nodes** you can spawn from the toolbar palette (Trigger, HTTP, Code, If, Set, Merge).
 - **Code node** applies a typed JSON output template per item; it does not execute
-  JavaScript because the host does not currently provide a plugin-safe JS runtime.
+  JavaScript because the host does not currently provide a plugin-safe JS runtime. A
+  value containing only `{{ expression }}` preserves its JSON type; add surrounding
+  text when a string result is required.
+- **Empty output stops a branch**: downstream nodes are marked Skipped rather than
+  being seeded with a synthetic item and executed.
+- **If conditions** support whitespace-delimited `==`, `!=`, `>`, `>=`, `<`, and `<=`.
+  Ordering is numeric for two numbers and lexical for two text values (including ISO
+  dates); an empty operand makes any ordering comparison false. Mixed numeric/text
+  operands error the If node, discard that input batch, stop both outputs, and fail the
+  run; normalize them upstream or use equality instead. A condition that contains only
+  an expression is tested for truthiness and is never parsed as a comparison.
 - **Edges**: drag from an output port to an input port to connect nodes; bezier curves.
 - **Move / select / delete**: drag nodes to reposition, click to select, `Delete` to remove
   the selected node (and its edges) or a selected edge.
