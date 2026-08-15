@@ -366,6 +366,29 @@ class FlowExecutorTest {
     }
 
     @Test
+    fun `if parses its raw condition before interpolated data can become an operator`() {
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            n("source", NodeType.SET, "assignments" to """{"text":"1 > 2"}"""),
+            n("if", NodeType.IF, "condition" to "{{ \$json.text }}"),
+            n("yes", NodeType.SET, "assignments" to """{"branch":"yes"}"""),
+            n("no", NodeType.SET, "assignments" to """{"branch":"no"}"""),
+        )
+        val edges = listOf(
+            e("t", "source"),
+            e("source", "if"),
+            e("if", "yes", fp = 0),
+            e("if", "no", fp = 1),
+        )
+
+        val states = runGraph(nodes, edges)
+
+        assertEquals(RunStatus.SUCCESS, states["yes"]?.status)
+        assertEquals("yes", states["yes"]!!.output.single().json.str("branch"))
+        assertEquals(RunStatus.SKIPPED, states["no"]?.status)
+    }
+
+    @Test
     fun `merge concatenates items arriving on both input ports`() {
         val nodes = listOf(
             n("t", NodeType.TRIGGER),

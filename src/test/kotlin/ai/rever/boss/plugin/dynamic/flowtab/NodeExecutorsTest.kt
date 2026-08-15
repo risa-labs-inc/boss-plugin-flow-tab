@@ -89,8 +89,12 @@ class NodeExecutorsTest {
         val missing = NodeCatalog.evaluateCondition("{{ missing }} > 10") { fragment ->
             fragment.replace("{{ missing }}", "")
         }
+        val bothMissing = NodeCatalog.evaluateCondition("{{ left }} <= {{ right }}") { fragment ->
+            fragment.replace("{{ left }}", "").replace("{{ right }}", "")
+        }
 
         assertFalse(missing)
+        assertFalse(bothMissing)
         assertFailsWith<ExecError> { evaluate("10d > 5") }
     }
 }

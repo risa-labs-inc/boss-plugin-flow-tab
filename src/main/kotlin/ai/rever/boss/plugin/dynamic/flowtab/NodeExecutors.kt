@@ -368,8 +368,8 @@ object NodeCatalog {
      * split before [interpolate] resolves either operand, so newlines and operator-like
      * text in item data cannot alter the predicate grammar. Binary operators require
      * surrounding whitespace. Equality supports strings or numbers. Ordering is numeric
-     * when both operands are numbers, lexical when both are text, and rejected when one
-     * is numeric and the other is text. Without an operator,
+     * when both operands are numbers, lexical when both are text, false when either is
+     * blank, and rejected when one is numeric and the other is text. Without an operator,
      * blank/false/null/undefined/0/no/off are falsy.
      */
     internal fun evaluateCondition(
