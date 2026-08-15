@@ -4,8 +4,12 @@ import ai.rever.boss.plugin.api.PluginContext
 import kotlin.random.Random
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
@@ -151,6 +155,9 @@ class FlowExecutor(
                                     ),
                                 )
                             } catch (ce: CancellationException) {
+                                // Propagate cancellation through the dependency signal instead
+                                // of letting a dependant misreport missing output as SKIPPED.
+                                done[node.id]?.cancel(ce)
                                 throw ce
                             } catch (e: Exception) {
                                 failed.add(node.id)
@@ -165,10 +172,17 @@ class FlowExecutor(
                 }
             }
         } finally {
-            // Cleanup must not defeat the run watchdog. A host browser disposer that
-            // stalls is abandoned after a short best-effort window.
+            // Run cleanup independently so a non-cooperative host disposer cannot keep
+            // this execution alive past the best-effort cleanup window.
             withContext(NonCancellable) {
-                withTimeoutOrNull(CLEANUP_TIMEOUT_MS) { ctx.close() }
+                val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+                val cleanup = cleanupScope.launch { ctx.close() }
+                try {
+                    withTimeoutOrNull(CLEANUP_TIMEOUT_MS) { cleanup.join() }
+                } finally {
+                    cleanup.cancel()
+                    cleanupScope.cancel()
+                }
             }
         }
     }

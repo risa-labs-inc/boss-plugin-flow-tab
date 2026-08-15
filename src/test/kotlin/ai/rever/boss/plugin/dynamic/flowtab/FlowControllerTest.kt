@@ -9,10 +9,11 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.PluginStorageFactory
 import ai.rever.boss.plugin.api.PluginStorageProvider
 import ai.rever.boss.plugin.api.TabRegistry
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -20,6 +21,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -80,7 +82,7 @@ class FlowControllerTest {
         storage: PluginStorageProvider = FakeStorage(),
         registry: NodeRegistry = builtinNodeRegistry(),
         runTimeoutMs: Long = FlowController.DEFAULT_RUN_TIMEOUT_MS,
-    ) = FlowController(context(storage), scope, registry, runTimeoutMs)
+    ) = FlowController(context(storage), { scope }, registry, runTimeoutMs)
 
     // ---- authoring ----------------------------------------------------------
 
@@ -271,6 +273,8 @@ class FlowControllerTest {
 
     @Test
     fun `flow_result exposes live node state and the watchdog terminates a hung executor`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
         val registry = builtinNodeRegistry().also {
             it.register(
                 NodeSpec(
@@ -281,25 +285,31 @@ class FlowControllerTest {
                     accent = 0,
                     description = "test only",
                     runMode = RunMode.ONCE,
-                    executor = NodeExecutor { _, _, _, _ -> awaitCancellation() },
+                    executor = NodeExecutor { _, _, _, _ ->
+                        entered.complete(Unit)
+                        withContext(NonCancellable) { release.await() }
+                        NodeOutput.EMPTY
+                    },
                 )
             )
         }
-        val fc = controller(registry = registry, runTimeoutMs = 150)
+        val fc = controller(registry = registry, runTimeoutMs = 500)
         val tabId = fc.createFlow()
         val nodeId = fc.addNode(tabId, "HANG")
         val runId = fc.startRun(tabId)
 
-        withTimeout(1_000) {
-            while (fc.runResult(runId)?.get(nodeId)?.status != RunStatus.RUNNING) delay(5)
-        }
-        assertEquals(RunJobState.RUNNING, fc.runStatus(runId)!!.state)
-        assertEquals(RunStatus.RUNNING, fc.runResult(runId)!![nodeId]!!.status)
+        try {
+            withTimeout(1_000) { entered.await() }
+            assertEquals(RunJobState.RUNNING, fc.runStatus(runId)!!.state)
+            assertEquals(RunStatus.RUNNING, fc.runResult(runId)!![nodeId]!!.status)
 
-        val job = awaitTerminal(fc, runId)
-        assertEquals(RunJobState.FAILED, job.state)
-        assertTrue(job.error!!.contains("timeout", ignoreCase = true))
-        assertEquals(RunStatus.ERROR, fc.runResult(runId)!![nodeId]!!.status)
+            val job = awaitTerminal(fc, runId)
+            assertEquals(RunJobState.FAILED, job.state)
+            assertTrue(job.error!!.contains("timeout", ignoreCase = true))
+            assertEquals(RunStatus.ERROR, fc.runResult(runId)!![nodeId]!!.status)
+        } finally {
+            release.complete(Unit)
+        }
     }
 
     @Test
@@ -329,7 +339,7 @@ class FlowControllerTest {
     fun `dispatch into an already cancelled scope fails instead of staying running`() = runBlocking {
         val cancelledScope = CoroutineScope(Dispatchers.Default + SupervisorJob()).also { it.cancel() }
         val storage = FakeStorage()
-        val fc = FlowController(context(storage), cancelledScope)
+        val fc = FlowController(context(storage), { cancelledScope })
         val tabId = fc.createFlow()
         fc.addNode(tabId, "TRIGGER")
 

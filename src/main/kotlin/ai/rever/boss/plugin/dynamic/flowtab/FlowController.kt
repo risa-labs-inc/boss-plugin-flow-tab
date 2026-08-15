@@ -4,9 +4,12 @@ import ai.rever.boss.plugin.api.PluginContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -42,23 +45,20 @@ data class RunJob(
  * with no tab open; a live tab, if any, re-reads storage on the Main thread.
  *
  * Runs are asynchronous: [startRun] returns a runId and executes the flow on
- * [scope] via the UI-free [FlowExecutor]. Jobs are held in memory and persisted at
+ * [scopeProvider] via the UI-free [FlowExecutor]. Jobs are held in memory and persisted at
  * `run:<runId>` so status/result survive a reload.
  */
 class FlowController(
     private val context: PluginContext,
-    private val scope: CoroutineScope = context.pluginScope,
+    /** Resolve the scope at dispatch time. A sandbox watchdog restart replaces
+     * [PluginContext.pluginScope], while the UI supplies its stable tab scope. */
+    private val scopeProvider: () -> CoroutineScope = { context.pluginScope },
     /** Kind-id → spec map used to lay out new nodes and dispatch runs. Threading the
      *  same instance the tab uses keeps tool/agent kinds resolvable. */
     val registry: NodeRegistry = builtinNodeRegistry(),
-    /** Hard ceiling for a headless run. Individual nodes have their own tighter
-     *  bounds; this final watchdog guarantees a missed bound cannot stay RUNNING
-     *  forever. Injectable so timeout behavior can be tested without waiting. */
+    /** Hard ceiling for a headless run. An independent monitor publishes FAILED at
+     *  this deadline even when a node is stuck in a non-cooperative host call. */
     private val runTimeoutMs: Long = DEFAULT_RUN_TIMEOUT_MS,
-    /** Resolve the scope at dispatch time. A sandbox watchdog restart replaces
-     *  [PluginContext.pluginScope]; caching the registration-time scope makes every
-     *  later run a no-op because its parent job has already been cancelled. */
-    private val runScopeProvider: () -> CoroutineScope = { scope },
 ) {
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; encodeDefaults = true }
     private val storage = runCatching {
@@ -134,7 +134,7 @@ class FlowController(
     // ---- async run jobs (F1) ------------------------------------------------
 
     /**
-     * Launch flow [tabId] on [scope] and return a runId immediately. The run drives
+     * Launch flow [tabId] on [scopeProvider] and return a runId immediately. The run drives
      * the headless [FlowExecutor]; poll [runStatus]/[runResult] for progress. A missing
      * flow or an executor throw becomes a [RunJobState.FAILED] job (never a crash); a
      * run in which any node errors is FAILED too, but always reaches a terminal state.
@@ -143,35 +143,36 @@ class FlowController(
         val runId = "run-${UUID.randomUUID()}"
         jobs[runId] = RunJob(runId, tabId, RunJobState.RUNNING)
         val states = ConcurrentHashMap<String, NodeRun>()
-        val execution = runScopeProvider().launch(Dispatchers.Default) {
-            val job = try {
-                withTimeout(runTimeoutMs) {
-                    val snap = getFlow(tabId) ?: throw IllegalStateException("No flow '$tabId'")
-                    val plan = snap.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
-                    // This flow is now on the call stack: a nested lanager pointing back at it
-                    // is a cycle. Depth is threaded so the nesting bound can be enforced.
-                    FlowExecutor(context, registry).run(
-                        plan, snap.edges, depth = depth, ancestry = ancestry + tabId,
-                    ) { id, r ->
-                        states[id] = r
-                        // flow_result must be a non-blocking snapshot even while the
-                        // run is active. Publish each transition into the in-memory job.
-                        jobs.computeIfPresent(runId) { _, current ->
+        val execution = scopeProvider().launch(Dispatchers.Default) {
+            // Persist RUNNING before executing so a reload can still diagnose an in-flight run.
+            persistRun(jobs.getValue(runId))
+            val candidate = try {
+                val snap = getFlow(tabId) ?: throw IllegalStateException("No flow '$tabId'")
+                val plan = snap.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
+                // This flow is now on the call stack: a nested lanager pointing back at it
+                // is a cycle. Depth is threaded so the nesting bound can be enforced.
+                FlowExecutor(context, registry).run(
+                    plan, snap.edges, depth = depth, ancestry = ancestry + tabId,
+                ) { id, r ->
+                    states[id] = r
+                    // flow_result must be a non-blocking snapshot even while the
+                    // run is active. Do not let late output overwrite a watchdog result.
+                    jobs.computeIfPresent(runId) { _, current ->
+                        if (current.state == RunJobState.RUNNING) {
                             current.copy(nodes = states.toRunSnapshot().states)
+                        } else {
+                            current
                         }
                     }
-                    val firstError = states.values.firstOrNull { it.status == RunStatus.ERROR }
-                    RunJob(
-                        runId = runId,
-                        tabId = tabId,
-                        state = if (firstError != null) RunJobState.FAILED else RunJobState.SUCCEEDED,
-                        error = firstError?.error,
-                        nodes = states.toRunSnapshot().states,
-                    )
                 }
-            } catch (_: TimeoutCancellationException) {
-                val message = "Flow exceeded its ${runTimeoutMs}ms run timeout"
-                failedRun(runId, tabId, states, message)
+                val firstError = states.values.firstOrNull { it.status == RunStatus.ERROR }
+                RunJob(
+                    runId = runId,
+                    tabId = tabId,
+                    state = if (firstError != null) RunJobState.FAILED else RunJobState.SUCCEEDED,
+                    error = firstError?.error,
+                    nodes = states.toRunSnapshot().states,
+                )
             } catch (cancelled: CancellationException) {
                 val message = cancelled.message?.let { "Flow run cancelled: $it" }
                     ?: "Flow run cancelled before completion"
@@ -179,26 +180,62 @@ class FlowController(
             } catch (t: Throwable) {
                 failedRun(runId, tabId, states, t.message ?: t.toString())
             }
-            jobs[runId] = job
-            runCatching { storage?.putJson(runKey(runId), json.encodeToString(RunJob.serializer(), job)) }
+            val published = publishTerminalIfRunning(runId, candidate)
+            persistRun(published)
         }
-        // launch() against a scope that was cancelled just before the sandbox swapped
-        // in its replacement never enters the body above. Close that race explicitly;
-        // otherwise this job would remain RUNNING with an empty node map forever.
-        execution.invokeOnCompletion { cause ->
-            if (cause != null) {
-                val message = cause.message?.let { "Flow run cancelled: $it" }
-                    ?: "Flow run cancelled before dispatch"
-                jobs.computeIfPresent(runId) { _, current ->
-                    if (current.state == RunJobState.RUNNING) {
-                        failedRun(runId, tabId, states, message)
-                    } else {
-                        current
-                    }
-                }
+
+        // This monitor is deliberately not a child of execution. join() is cancellable,
+        // so its timeout fires even if execution is stuck in a non-suspending host call.
+        val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val monitor = monitorScope.launch {
+            val completed = withTimeoutOrNull(runTimeoutMs) {
+                execution.join()
+                true
+            } == true
+            if (!completed) {
+                val message = "Flow exceeded its ${runTimeoutMs}ms run timeout"
+                transitionToFailed(runId, tabId, states, message)?.let { persistRun(it) }
+                execution.cancel(CancellationException(message))
+            } else if (execution.isCancelled) {
+                // launch() against an already-cancelled scope never enters its body.
+                val message = "Flow run cancelled before dispatch"
+                transitionToFailed(runId, tabId, states, message)?.let { persistRun(it) }
             }
         }
+        monitor.invokeOnCompletion {
+            monitorScope.cancel()
+        }
         return runId
+    }
+
+    private fun publishTerminalIfRunning(runId: String, candidate: RunJob): RunJob =
+        jobs.computeIfPresent(runId) { _, current ->
+            if (current.state == RunJobState.RUNNING) candidate else current
+        } ?: candidate
+
+    private fun transitionToFailed(
+        runId: String,
+        tabId: String,
+        states: ConcurrentHashMap<String, NodeRun>,
+        message: String,
+    ): RunJob? {
+        var transitioned: RunJob? = null
+        jobs.computeIfPresent(runId) { _, current ->
+            if (current.state == RunJobState.RUNNING) {
+                failedRun(runId, tabId, states, message).also { transitioned = it }
+            } else {
+                current
+            }
+        }
+        return transitioned
+    }
+
+    private suspend fun persistRun(job: RunJob) {
+        withContext(NonCancellable) {
+            runCatching {
+                storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), job))
+            }
+        }
     }
 
     /**
@@ -279,14 +316,10 @@ fun buildHeadlessController(
     scope: CoroutineScope? = null,
 ): FlowController {
     val initialScope = scope ?: context.pluginScope
+    val scopeProvider: () -> CoroutineScope = scope?.let { fixed -> { fixed } } ?: { context.pluginScope }
     val controller = FlowController(
         context = context,
-        scope = initialScope,
-        runScopeProvider = if (scope == null) {
-            { context.pluginScope }
-        } else {
-            { scope }
-        },
+        scopeProvider = scopeProvider,
     )
     // Host tools -> tool:boss:* kinds (the fix): reactively synced onto this registry.
     syncBossTools(context, controller.registry, initialScope)

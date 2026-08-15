@@ -42,7 +42,7 @@ class LanagerNodeTest {
 
     /** A controller whose registry also knows the `lanager` kind (executor holds it). */
     private fun controllerWithLanager(maxDepth: Int = 3): FlowController {
-        val fc = FlowController(context(TestStorage()), scope)
+        val fc = FlowController(context(TestStorage()), { scope })
         fc.registry.register(lanagerNodeSpec(fc, maxDepth = maxDepth))
         return fc
     }

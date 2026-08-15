@@ -75,7 +75,7 @@ class FlowMcpToolProviderTest {
         registry: NodeRegistry = builtinNodeRegistry(),
     ): FlowMcpToolProvider {
         val ctx = context(storage)
-        return FlowMcpToolProvider(FlowController(ctx, scope, registry), PromptRegistry(storage))
+        return FlowMcpToolProvider(FlowController(ctx, { scope }, registry), PromptRegistry(storage))
     }
 
     private fun FlowMcpToolProvider.tool(name: String): McpToolDefinition =
