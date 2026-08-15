@@ -343,6 +343,54 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `persisted running job becomes failed when loaded after plugin restart`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val storage = FakeStorage()
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "RELOAD_HANG",
+                    label = "Reload Hang",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, _, _ ->
+                        entered.complete(Unit)
+                        withContext(NonCancellable) { release.await() }
+                        NodeOutput.EMPTY
+                    },
+                ),
+            )
+        }
+        val beforeReload = FlowController(context(storage), { runScope }, registry, 5_000)
+        val tabId = beforeReload.createFlow()
+        val nodeId = beforeReload.addNode(tabId, "RELOAD_HANG")
+        val runId = beforeReload.startRun(tabId)
+
+        try {
+            withTimeout(5_000) { entered.await() }
+            beforeReload.dispose()
+            runScope.cancel()
+
+            val afterReload = FlowController(context(storage), { scope })
+            try {
+                val loaded = afterReload.runStatus(runId)!!
+                assertEquals(RunJobState.FAILED, loaded.state)
+                assertTrue(loaded.error!!.contains("plugin reload"))
+                assertEquals(RunStatus.SKIPPED, loaded.nodes.getValue(nodeId).status)
+            } finally {
+                afterReload.dispose()
+            }
+        } finally {
+            release.complete(Unit)
+        }
+    }
+
+    @Test
     fun `headless runs use the replacement sandbox scope after watchdog restart`() = runBlocking {
         val storage = FakeStorage()
         var sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())

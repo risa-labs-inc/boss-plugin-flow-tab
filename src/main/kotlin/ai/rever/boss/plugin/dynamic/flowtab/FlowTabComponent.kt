@@ -166,6 +166,7 @@ class FlowTabComponent(
         lifecycle.subscribe(
             object : Lifecycle.Callbacks {
                 override fun onDestroy() {
+                    controller.dispose()
                     coroutineScope.cancel()
                 }
             }

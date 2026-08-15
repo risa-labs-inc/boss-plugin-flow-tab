@@ -34,6 +34,7 @@ class FlowTabDynamicPlugin : DynamicPlugin {
      *  threaded into every Flow tab + the headless MCP path so external servers are
      *  connected once and reaped once (red-team F9). Null on a host without storage. */
     private var externalMcp: ExternalMcpManager? = null
+    private var headlessController: FlowController? = null
 
     override fun register(context: PluginContext) {
         pluginContext = context
@@ -76,6 +77,7 @@ class FlowTabDynamicPlugin : DynamicPlugin {
             // Single wiring point (S1): built-ins + boss tools + agent + lanager + external,
             // so an MCP-authored flow_run resolves exactly what a UI-authored flow can.
             val controller = buildHeadlessController(context, prompts, external)
+            headlessController = controller
             context.registerMcpToolProvider(FlowMcpToolProvider(controller, prompts))
 
             // The MCP *server* may be off by default; resolve its controller lazily and
@@ -94,6 +96,8 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         pluginContext?.tabRegistry?.unregisterTabType(FlowTabType.typeId)
         pluginContext?.panelRegistry?.unregisterPanel(FlowLauncherInfo.id)
         runCatching { pluginContext?.unregisterMcpToolProvider(FlowMcpToolProvider.PROVIDER_ID) }
+        headlessController?.dispose()
+        headlessController = null
         // Reap any external MCP child processes / sockets (red-team F9), bounded so a
         // hung server can't block plugin teardown.
         externalMcp?.let { mgr ->

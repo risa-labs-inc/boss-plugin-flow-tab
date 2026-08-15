@@ -194,12 +194,13 @@ class FlowExecutor(
             // returns; the controller watchdog can bound reporting, not reclaim that call.
             withContext(NonCancellable) {
                 val cleanupScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-                val cleanup = cleanupScope.launch { ctx.close() }
-                try {
-                    withTimeoutOrNull(CLEANUP_TIMEOUT_MS) { cleanup.join() }
-                } finally {
-                    cleanup.cancel()
-                    cleanupScope.cancel()
+                val cleanup = cleanupScope.launch { runCatching { ctx.close() } }
+                cleanup.invokeOnCompletion { cleanupScope.cancel() }
+                if (withTimeoutOrNull(CLEANUP_TIMEOUT_MS) { cleanup.join() } == null) {
+                    println(
+                        "[flow-tab] session cleanup exceeded ${CLEANUP_TIMEOUT_MS}ms; " +
+                            "disposal continues in the background",
+                    )
                 }
             }
         }

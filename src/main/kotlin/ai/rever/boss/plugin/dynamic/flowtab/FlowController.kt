@@ -65,6 +65,9 @@ class FlowController(
         context.pluginStorageFactory?.createStorage(STORAGE_NAMESPACE)
     }.getOrNull()
     private val jobs = ConcurrentHashMap<String, RunJob>()
+    /** Independent from pluginScope so it can observe that scope being replaced, but
+     * still explicitly owned by this controller and cancelled from [dispose]. */
+    private val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     // ---- authoring (storage-seated) -----------------------------------------
 
@@ -186,8 +189,7 @@ class FlowController(
 
         // This monitor is deliberately not a child of execution. join() is cancellable,
         // so its timeout fires even if execution is stuck in a non-suspending host call.
-        val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val monitor = monitorScope.launch {
+        monitorScope.launch {
             val completed = withTimeoutOrNull(runTimeoutMs) {
                 execution.join()
                 true
@@ -207,10 +209,12 @@ class FlowController(
                 transitionToFailed(runId, tabId, states, message)?.let { persistRun(it) }
             }
         }
-        monitor.invokeOnCompletion {
-            monitorScope.cancel()
-        }
         return runId
+    }
+
+    /** Release independent run monitors when the owning tab/plugin is destroyed. */
+    fun dispose() {
+        monitorScope.cancel()
     }
 
     private fun publishTerminalIfRunning(runId: String, candidate: RunJob): RunJob =
@@ -256,7 +260,38 @@ class FlowController(
 
     private suspend fun loadJob(runId: String): RunJob? {
         val raw = storage?.getJson(runKey(runId)) ?: return null
-        return runCatching { json.decodeFromString(RunJob.serializer(), raw) }.getOrNull()
+        val loaded = runCatching { json.decodeFromString(RunJob.serializer(), raw) }.getOrNull()
+            ?: return null
+        if (loaded.state != RunJobState.RUNNING) return loaded
+
+        // An in-memory monitor is the only owner capable of completing a RUNNING job.
+        // Reaching storage fallback means that owner was lost during a plugin reload.
+        val message = "Flow run did not survive plugin reload"
+        val savedNodes = loaded.nodes.mapValues { (_, node) ->
+            if (node.status == RunStatus.RUNNING) {
+                node.copy(status = RunStatus.ERROR, error = message)
+            } else {
+                node
+            }
+        }
+        val notStarted = "Skipped — run ended during plugin reload"
+        val graphNodes = getFlow(loaded.tabId)?.nodes.orEmpty().associate { node ->
+            node.id to (
+                savedNodes[node.id] ?: NodeRunSnap(
+                    status = RunStatus.SKIPPED,
+                    error = message,
+                    logs = listOf(notStarted),
+                    skipReason = notStarted,
+                )
+            )
+        }
+        val failed = loaded.copy(
+            state = RunJobState.FAILED,
+            error = message,
+            nodes = graphNodes + savedNodes,
+        )
+        persistRun(failed)
+        return failed
     }
 
     // ---- internals ----------------------------------------------------------
