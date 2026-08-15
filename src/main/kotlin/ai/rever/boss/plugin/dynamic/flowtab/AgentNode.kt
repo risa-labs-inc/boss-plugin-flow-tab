@@ -89,7 +89,7 @@ class AgentNodeExecutor(
         cfg: ConfigReader,
         inputs: List<Item>,
         log: (String) -> Unit,
-    ): List<Item> {
+    ): NodeOutput {
         val settings = parse(cfg, inputs)
         val system = resolveSystem(settings)
         val provider = providerFor(settings)
@@ -97,14 +97,14 @@ class AgentNodeExecutor(
         val result = AgentRuntime(provider, source, settings.budget)
             .run(system = system, input = settings.input, allowlist = settings.allowlist, log = log)
         log("agent stopped: ${result.stopReason} (${result.steps} step(s), ${result.toolCalls} tool call(s))")
-        return listOf(
+        return NodeOutput.single(listOf(
             Item(buildJsonObject {
                 put("text", result.finalText)
                 put("stopReason", result.stopReason.name)
                 put("steps", result.steps)
                 put("toolCalls", result.toolCalls)
             })
-        )
+        ))
     }
 
     private suspend fun resolveSystem(settings: AgentSettings): String {

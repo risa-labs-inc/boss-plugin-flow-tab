@@ -14,6 +14,9 @@ import kotlinx.serialization.json.JsonPrimitive
  *  - `$node["Title"].json` — the first output item of the node titled "Title"
  *
  * Paths use `.key`, `["key"]`, and `[index]`. Anything unresolved renders empty.
+ * [interpolateJson] recursively resolves JSON templates: a string containing exactly
+ * one expression preserves the resolved JSON type, while expressions mixed with text
+ * render into a string.
  * This is deliberately NOT full JavaScript (GraalJS can't be plugin-bundled —
  * the host's binary-compat validator rejects the fat jar). Full JS would require
  * the host to ship GraalJS. See docs/AI_PIPELINE.md.
@@ -55,6 +58,36 @@ object ExpressionEval {
             } ?: return null
         }
         return cur
+    }
+
+    /**
+     * Recursively interpolate a JSON template. A string that consists solely of
+     * one expression keeps the resolved JSON type (number, boolean, object, array,
+     * or null); expressions embedded in surrounding text render as strings.
+     */
+    fun interpolateJson(
+        template: JsonElement,
+        json: JsonObject,
+        nodeOutputsByTitle: Map<String, List<Item>>,
+    ): JsonElement = when (template) {
+        is JsonObject -> JsonObject(
+            template.mapValues { (_, value) -> interpolateJson(value, json, nodeOutputsByTitle) }
+        )
+        is JsonArray -> JsonArray(template.map { interpolateJson(it, json, nodeOutputsByTitle) })
+        is JsonPrimitive -> {
+            if (!template.isString) template
+            else {
+                val trimmed = template.content.trim()
+                // Reuse EXPR so a value containing two expressions cannot backtrack
+                // into one false "whole expression" spanning the first {{ to last }}.
+                val whole = EXPR.find(trimmed)?.takeIf { it.range.first == 0 && it.value.length == trimmed.length }
+                if (whole != null) {
+                    eval(whole.groupValues[1].trim(), json, nodeOutputsByTitle) ?: JsonNull
+                } else {
+                    JsonPrimitive(interpolate(template.content, json, nodeOutputsByTitle))
+                }
+            }
+        }
     }
 
     private fun render(el: JsonElement?): String = when (el) {

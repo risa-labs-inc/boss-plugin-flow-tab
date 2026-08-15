@@ -56,9 +56,9 @@ enum class NodeType(
     INJECT("Inject", 1, 1, 0xFFEC407A, "Run JS / push data to the page", RunMode.ONCE),
     HTTP("HTTP Request", 1, 1, 0xFF2196F3, "Call an API endpoint", RunMode.PER_ITEM),
     SET("Set", 1, 1, 0xFF00BCD4, "Set or edit fields", RunMode.PER_ITEM),
-    CODE("Code", 1, 1, 0xFF9C27B0, "Run custom code (not yet runnable)", RunMode.PER_ITEM),
-    IF("If", 1, 2, 0xFFFF9800, "Branch on a condition (not yet runnable)", RunMode.ONCE),
-    MERGE("Merge", 2, 1, 0xFF607D8B, "Combine two inputs (not yet runnable)", RunMode.ONCE);
+    CODE("Code", 1, 1, 0xFF9C27B0, "Transform each item with a JSON template", RunMode.PER_ITEM),
+    IF("If", 1, 2, 0xFFFF9800, "Route each item by a condition", RunMode.PER_ITEM),
+    MERGE("Merge", 2, 1, 0xFF607D8B, "Combine two inputs", RunMode.ONCE);
 
     /** Human-friendly label for an output port (e.g. If → true/false). */
     fun outputLabel(index: Int): String = when (this) {
@@ -129,6 +129,22 @@ enum class NodeType(
         )
         SET -> listOf(
             ConfigField("assignments", "Fields (JSON: key → value/expr)", FieldType.TEXTAREA, placeholder = "{\"name\":\"{{ \$json.first }}\"}")
+        )
+        CODE -> listOf(
+            ConfigField(
+                "code",
+                "Output JSON template",
+                FieldType.JSON,
+                placeholder = "{\"name\":\"{{ \$json.first }} {{ \$json.last }}\",\"age\":\"{{ \$json.age }}\"}",
+            )
+        )
+        IF -> listOf(
+            ConfigField(
+                "condition",
+                "Condition",
+                FieldType.TEXT,
+                placeholder = "{{ \$json.score }} >= 80",
+            )
         )
         else -> emptyList()
     }

@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
 
 /**
  * Characterization tests: the builtin registry must reproduce the legacy [NodeType]
@@ -43,10 +44,11 @@ class BuiltinNodesTest {
     }
 
     @Test
-    fun `runnable set matches NodeCatalog (CODE, IF, MERGE have no executor)`() {
+    fun `all builtin kinds are runnable`() {
         for (t in NodeType.entries) {
             val s = reg[t.name]!!
-            assertEquals(NodeCatalog.executor(t) != null, s.executor != null, "${t.name} runnable")
+            assertNotNull(NodeCatalog.executor(t), "${t.name} catalog executor")
+            assertNotNull(s.executor, "${t.name} registry executor")
         }
     }
 }

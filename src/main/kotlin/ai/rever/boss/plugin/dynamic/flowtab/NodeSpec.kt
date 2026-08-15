@@ -12,9 +12,9 @@ import kotlinx.serialization.json.JsonObject
  * existing serialized graphs keep loading. Dynamic kinds (registry tools, agents)
  * register specs with namespaced ids (`"tool:boss:foo"`, `"agent"`, …).
  *
- * [executor] is null for kinds that are not runnable (declared-but-unimplemented,
- * or a tool whose backing provider is absent at load) — the engine surfaces that
- * as a first-class "unavailable" node rather than a hard error.
+ * [executor] is null only for unavailable kinds, such as a tool whose backing
+ * provider is absent at load. The engine surfaces that as a first-class
+ * "unavailable" node rather than failing graph loading.
  */
 data class NodeSpec(
     val id: String,
@@ -43,12 +43,9 @@ data class NodeSpec(
     fun inputLabel(index: Int): String = inputLabels.getOrElse(index) { "" }
 
     /** True when this is a placeholder for a kind-id with no registered spec. */
-    val isUnavailable: Boolean get() = executor == null && id !in RUNNABLE_LESS_BUILTINS
+    val isUnavailable: Boolean get() = executor == null
 
     companion object {
-        /** Built-in kinds that legitimately have no executor yet (declared, not unavailable). */
-        private val RUNNABLE_LESS_BUILTINS = setOf("CODE", "IF", "MERGE")
-
         /** Neutral accent for unavailable / unknown kinds. */
         const val UNAVAILABLE_ACCENT = 0xFF6B6B6B
 

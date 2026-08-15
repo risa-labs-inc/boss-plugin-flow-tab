@@ -48,4 +48,34 @@ class ExpressionEvalTest {
         assertEquals("", ExpressionEval.interpolate("{{ \$json.nope }}", empty, emptyMap()))
         assertEquals("just text", ExpressionEval.interpolate("just text", empty, emptyMap()))
     }
+
+    @Test
+    fun `json interpolation preserves whole-expression types`() {
+        val json = buildJsonObject {
+            put("count", 3)
+            put("profile", buildJsonObject { put("name", "Ada") })
+        }
+        val template = buildJsonObject {
+            put("count", "{{ \$json.count }}")
+            put("profile", "{{ \$json.profile }}")
+            put("label", "count={{ \$json.count }}")
+        }
+        val result = ExpressionEval.interpolateJson(template, json, emptyMap()) as JsonObject
+
+        assertEquals("3", result["count"].toString())
+        assertEquals("{\"name\":\"Ada\"}", result["profile"].toString())
+        assertEquals("\"count=3\"", result["label"].toString())
+    }
+
+    @Test
+    fun `json interpolation keeps two expressions as one rendered string`() {
+        val json = buildJsonObject { put("first", "Ada"); put("last", "Lovelace") }
+        val template = buildJsonObject {
+            put("name", "{{ \$json.first }} {{ \$json.last }}")
+        }
+
+        val result = ExpressionEval.interpolateJson(template, json, emptyMap()) as JsonObject
+
+        assertEquals("\"Ada Lovelace\"", result["name"].toString())
+    }
 }

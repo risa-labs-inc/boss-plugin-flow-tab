@@ -181,6 +181,43 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `control flow run routes by port and reaches a terminal state`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+        val trigger = fc.addNode(tabId, "TRIGGER")
+        val seed = fc.addNode(
+            tabId,
+            "SET",
+            buildJsonObject { put("assignments", """{"score":"90"}""") },
+        )
+        val branch = fc.addNode(
+            tabId,
+            "IF",
+            buildJsonObject { put("condition", "{{ \$json.score }} >= 80") },
+        )
+        val yes = fc.addNode(
+            tabId,
+            "CODE",
+            buildJsonObject { put("code", """{"result":"accepted"}""") },
+        )
+        val no = fc.addNode(
+            tabId,
+            "CODE",
+            buildJsonObject { put("code", """{"result":"rejected"}""") },
+        )
+        fc.connect(tabId, trigger, 0, seed, 0)
+        fc.connect(tabId, seed, 0, branch, 0)
+        fc.connect(tabId, branch, 0, yes, 0)
+        fc.connect(tabId, branch, 1, no, 0)
+
+        val job = awaitTerminal(fc, fc.startRun(tabId))
+        val result = fc.runResult(job.runId)!!
+        assertEquals(RunJobState.SUCCEEDED, job.state)
+        assertEquals("accepted", result[yes]!!.output.single()["result"]!!.jsonPrimitive.content)
+        assertTrue(result[no]!!.output.isEmpty(), "the unselected false branch must stay empty")
+    }
+
+    @Test
     fun `startRun on an unknown flow fails the job`() = runBlocking {
         val fc = controller()
         val runId = fc.startRun("flow-missing")

@@ -15,6 +15,25 @@ typealias PortData = List<Item>
 /** The seed item produced by a trigger: one empty object. */
 val SEED_ITEMS: List<Item> = listOf(Item(JsonObject(emptyMap())))
 
+/**
+ * Data emitted by one node, keyed by output-port index. Most nodes emit only on
+ * port 0; control nodes such as If choose between multiple ports. Keeping the
+ * port here (instead of flattening immediately) makes [EdgeModel.fromPort]
+ * meaningful at execution time.
+ */
+data class NodeOutput(val ports: Map<Int, PortData>) {
+    fun port(index: Int): PortData = ports[index].orEmpty()
+
+    /** Flattened view used by the inspector, persisted run state, and node refs. */
+    fun allItems(): List<Item> = ports.toSortedMap().values.flatten()
+
+    companion object {
+        val EMPTY = NodeOutput(emptyMap())
+        fun single(items: PortData): NodeOutput = NodeOutput(mapOf(0 to items))
+        fun onPort(index: Int, items: PortData): NodeOutput = NodeOutput(mapOf(index to items))
+    }
+}
+
 /** Per-node execution status (drives the canvas badge + inspector). */
 @Serializable
 enum class RunStatus { IDLE, RUNNING, SUCCESS, ERROR }
