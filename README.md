@@ -13,6 +13,9 @@ together with edges, n8n style.
   text when a string result is required.
 - **Empty output stops a branch**: downstream nodes are marked Skipped rather than
   being seeded with a synthetic item and executed.
+- **If conditions** support whitespace-delimited `==`, `!=`, `>`, `>=`, `<`, and `<=`.
+  Ordering is numeric for two numbers and lexical for two text values (including ISO
+  dates); normalize mixed numeric/text operands upstream.
 - **Edges**: drag from an output port to an input port to connect nodes; bezier curves.
 - **Move / select / delete**: drag nodes to reposition, click to select, `Delete` to remove
   the selected node (and its edges) or a selected edge.

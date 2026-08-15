@@ -34,10 +34,7 @@ private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 // still loading its content. Generic across every browser node.
 private const val ELEMENT_WAIT_MS = 20_000
 private const val ELEMENT_POLL_MS = 200
-private val CONDITION_COMPARISON = Regex(
-    """\s*(.+?)\s+(==|!=|>=|<=|>|<)\s+(.+?)\s*""",
-    RegexOption.DOT_MATCHES_ALL,
-)
+private val CONDITION_OPERATORS = listOf("==", "!=", ">=", "<=", ">", "<")
 
 /**
  * Polls (up to [timeoutMs]) for [selector] to match an element, returning whether
@@ -132,10 +129,8 @@ class ConfigReader(
     private val item: Item,
     private val outputsByTitle: Map<String, List<Item>>
 ) {
-    private fun raw(key: String): String = (config[key] as? JsonPrimitive)?.content ?: ""
-
     /** Raw scalar template, before current-item expressions are resolved. */
-    internal fun template(key: String): String = raw(key)
+    internal fun raw(key: String): String = (config[key] as? JsonPrimitive)?.content ?: ""
 
     /** Resolve expressions in an arbitrary fragment against this reader's current item. */
     internal fun interpolate(template: String): String =
@@ -344,7 +339,7 @@ object NodeCatalog {
         }
 
         NodeType.IF -> NodeExecutor { _, cfg, inputs, log ->
-            val conditionTemplate = cfg.template("condition")
+            val conditionTemplate = cfg.raw("condition")
             if (conditionTemplate.isBlank()) throw ExecError("If needs a condition")
             val matched = evaluateCondition(conditionTemplate, cfg::interpolate)
             log("Condition → ${if (matched) "true" else "false"}")
@@ -370,28 +365,36 @@ object NodeCatalog {
      * Small, deterministic predicate language for If. The raw condition template is
      * split before [interpolate] resolves either operand, so newlines and operator-like
      * text in item data cannot alter the predicate grammar. Binary operators require
-     * surrounding whitespace. Equality supports strings or numbers; ordering requires
-     * two numbers. Without an operator, blank/false/null/undefined/0/no/off are falsy.
+     * surrounding whitespace. Equality supports strings or numbers. Ordering is numeric
+     * when both operands are numbers, lexical when both are text, and rejected when one
+     * is numeric and the other is text. Without an operator,
+     * blank/false/null/undefined/0/no/off are falsy.
      */
     internal fun evaluateCondition(
         raw: String,
-        interpolate: (String) -> String = { it },
+        interpolate: (String) -> String,
     ): Boolean {
-        val comparison = CONDITION_COMPARISON.matchEntire(raw)
+        val comparison = splitComparison(raw)
         if (comparison != null) {
-            val left = interpolate(comparison.groupValues[1]).unquote()
-            val op = comparison.groupValues[2]
-            val right = interpolate(comparison.groupValues[3]).unquote()
+            val left = interpolate(comparison.left).unquote()
+            val op = comparison.operator
+            val right = interpolate(comparison.right).unquote()
             val leftNumber = left.toDoubleOrNull()
             val rightNumber = right.toDoubleOrNull()
             return when (op) {
                 "==" -> if (leftNumber != null && rightNumber != null) leftNumber == rightNumber else left == right
                 "!=" -> if (leftNumber != null && rightNumber != null) leftNumber != rightNumber else left != right
                 ">", ">=", "<", "<=" -> {
-                    if (leftNumber == null || rightNumber == null) {
-                        throw ExecError("If: cannot order-compare non-numeric values '$left' and '$right'")
+                    if ((leftNumber == null) != (rightNumber == null)) {
+                        throw ExecError(
+                            "If: cannot order-compare a number with text; normalize both values upstream or use ==/!=",
+                        )
                     }
-                    val order = leftNumber.compareTo(rightNumber)
+                    val order = if (leftNumber != null && rightNumber != null) {
+                        leftNumber.compareTo(rightNumber)
+                    } else {
+                        left.compareTo(right)
+                    }
                     when (op) {
                         ">" -> order > 0
                         ">=" -> order >= 0
@@ -406,6 +409,48 @@ object NodeCatalog {
             "", "false", "null", "undefined", "0", "no", "off" -> false
             else -> value.toDoubleOrNull()?.let { it != 0.0 } ?: true
         }
+    }
+
+    private data class Comparison(val left: String, val operator: String, val right: String)
+
+    /** Find a whitespace-delimited operator outside `{{ }}` spans and quoted literals. */
+    private fun splitComparison(raw: String): Comparison? {
+        var i = 0
+        while (i < raw.length) {
+            if (raw.startsWith("{{", i)) {
+                val end = raw.indexOf("}}", startIndex = i + 2)
+                i = if (end >= 0) end + 2 else i + 2
+                continue
+            }
+            val quote = raw[i].takeIf { it == '\'' || it == '"' }
+            if (quote != null) {
+                i++
+                while (i < raw.length) {
+                    if (raw[i] == '\\') {
+                        i += 2
+                    } else if (raw[i] == quote) {
+                        i++
+                        break
+                    } else {
+                        i++
+                    }
+                }
+                continue
+            }
+            val operator = CONDITION_OPERATORS.firstOrNull { raw.startsWith(it, i) }
+            if (operator != null) {
+                val after = i + operator.length
+                if (i > 0 && after < raw.length && raw[i - 1].isWhitespace() && raw[after].isWhitespace()) {
+                    val left = raw.substring(0, i).trim()
+                    val right = raw.substring(after).trim()
+                    if (left.isNotEmpty() && right.isNotEmpty()) {
+                        return Comparison(left, operator, right)
+                    }
+                }
+            }
+            i++
+        }
+        return null
     }
 
     private fun String.unquote(): String {

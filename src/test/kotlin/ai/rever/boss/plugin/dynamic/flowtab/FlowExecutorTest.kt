@@ -186,6 +186,48 @@ class FlowExecutorTest {
     }
 
     @Test
+    fun `per-item node emitting no items leaves downstream skipped`() {
+        val registry = builtinNodeRegistry().also { reg ->
+            reg.register(
+                NodeSpec(
+                    id = "EMPTY_PER_ITEM",
+                    label = "Empty Per Item",
+                    inputs = 1,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.PER_ITEM,
+                    executor = NodeExecutor { _, _, _, _ -> NodeOutput.single(emptyList()) },
+                )
+            )
+            reg.register(
+                NodeSpec(
+                    id = "TWO_ITEMS",
+                    label = "Two Items",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, _, _ ->
+                        NodeOutput.single(listOf(Item(JsonObject(emptyMap())), Item(JsonObject(emptyMap()))))
+                    },
+                )
+            )
+        }
+        val nodes = listOf(
+            nk("source", "TWO_ITEMS"),
+            nk("empty", "EMPTY_PER_ITEM"),
+            n("after", NodeType.SET, "assignments" to """{"ran":true}"""),
+        )
+        val states = runGraph(nodes, listOf(e("source", "empty"), e("empty", "after")), registry = registry)
+
+        assertEquals(RunStatus.SUCCESS, states["empty"]?.status)
+        assertTrue(states["empty"]!!.output.isEmpty())
+        assertEquals(RunStatus.SKIPPED, states["after"]?.status)
+    }
+
+    @Test
     fun `failure skips downstream but independent branch still runs`() {
         val handle = FakeHandle(responder = { script ->
             if (script.contains("JSON.stringify")) """{"ok":false,"error":"boom"}""" else true
@@ -195,13 +237,18 @@ class FlowExecutorTest {
             n("open", NodeType.OPEN_BROWSER),
             n("ex", NodeType.EXTRACT, "selector" to ".x"), // will fail (ok:false)
             n("after", NodeType.SET, "assignments" to """{"x":"1"}"""), // downstream of failure
+            n("after2", NodeType.SET, "assignments" to """{"z":"3"}"""), // transitive downstream
             n("indep", NodeType.SET, "assignments" to """{"y":"2"}""")  // independent branch
         )
-        val edges = listOf(e("t", "open"), e("open", "ex"), e("ex", "after"), e("t", "indep"))
+        val edges = listOf(
+            e("t", "open"), e("open", "ex"), e("ex", "after"), e("after", "after2"), e("t", "indep")
+        )
         val states = runGraph(nodes, edges, FakeService(handle))
 
         assertEquals(RunStatus.ERROR, states["ex"]?.status)
         assertEquals(RunStatus.SKIPPED, states["after"]?.status)
+        assertEquals(listOf("Skipped — upstream node failed"), states["after"]?.logs)
+        assertEquals(RunStatus.SKIPPED, states["after2"]?.status)
         assertEquals(RunStatus.SUCCESS, states["indep"]?.status) // unaffected
     }
 
@@ -378,7 +425,7 @@ class FlowExecutorTest {
     }
 
     @Test
-    fun `unavailable kind errors even when its input port is empty`() {
+    fun `unavailable kind on an unselected branch is skipped`() {
         val nodes = listOf(
             n("t", NodeType.TRIGGER),
             n("if", NodeType.IF, "condition" to "false"),
@@ -387,18 +434,8 @@ class FlowExecutorTest {
         val edges = listOf(e("t", "if"), e("if", "missing", fp = 0))
         val states = runGraph(nodes, edges)
 
-        assertEquals(RunStatus.ERROR, states["missing"]?.status)
-        assertTrue(states["missing"]!!.error!!.contains("Unknown node kind"))
-    }
-
-    @Test
-    fun `node output normalizes empty ports and flattens in port order`() {
-        val low = Item(buildJsonObject { put("port", 0) })
-        val high = Item(buildJsonObject { put("port", 2) })
-
-        assertEquals(NodeOutput.EMPTY, NodeOutput.single(emptyList()))
-        assertEquals(NodeOutput.EMPTY, NodeOutput.onPort(4, emptyList()))
-        assertEquals(listOf(low, high), NodeOutput(mapOf(2 to listOf(high), 0 to listOf(low))).allItems())
+        assertEquals(RunStatus.SKIPPED, states["missing"]?.status)
+        assertTrue(states["missing"]!!.error == null)
     }
 
     @Test

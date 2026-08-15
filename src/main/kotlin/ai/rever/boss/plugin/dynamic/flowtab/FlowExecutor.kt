@@ -106,12 +106,6 @@ class FlowExecutor(
                         if (humanize) delay(Random.nextLong(HUMANIZE_MIN_MS, HUMANIZE_MAX_MS))
                         val logs = mutableListOf<String>()
                         try {
-                            // Resolve before empty-input skipping: an unavailable node must
-                            // still report its configuration/provider error, not "skipped".
-                            val spec = registry[node.kind]
-                                ?: throw ExecError("Unknown node kind '${node.kind}' — its provider isn't available")
-                            val exec = spec.executor
-                                ?: throw ExecError("${spec.label} is unavailable — its provider isn't loaded")
                             val incoming = incomingOf[node.id].orEmpty()
                             val inputs = incoming
                                 .sortedBy { it.toPort }
@@ -122,10 +116,18 @@ class FlowExecutor(
                                 // and accidentally execute the unselected branch.
                                 logs.add("Skipped — no input items")
                                 NodeOutput.EMPTY
-                            } else if (spec.usesSession) {
-                                ctx.sessionMutex.withLock { runNode(ctx, node, inputs, spec, exec) { logs.add(it) } }
                             } else {
-                                runNode(ctx, node, inputs, spec, exec) { logs.add(it) }
+                                // Provider availability is a runtime property of the selected
+                                // branch. A dead branch must not fail an otherwise valid run.
+                                val spec = registry[node.kind]
+                                    ?: throw ExecError("Unknown node kind '${node.kind}' — its provider isn't available")
+                                val exec = spec.executor
+                                    ?: throw ExecError("${spec.label} is unavailable — its provider isn't loaded")
+                                if (spec.usesSession) {
+                                    ctx.sessionMutex.withLock { runNode(ctx, node, inputs, spec, exec) { logs.add(it) } }
+                                } else {
+                                    runNode(ctx, node, inputs, spec, exec) { logs.add(it) }
+                                }
                             }
                             outputsById[node.id] = out
                             val flattened = out.allItems()
