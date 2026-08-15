@@ -65,8 +65,32 @@ class NodeExecutorsTest {
     @Test
     fun `ordering supports two text operands but rejects mixed number and text`() {
         assertTrue(evaluate("\"2024-06-01\" >= \"2024-01-01\""))
-        assertFailsWith<ExecError> {
+        val error = assertFailsWith<ExecError> {
             evaluate("abc >= 5")
         }
+        assertTrue(error.message!!.contains("'abc'"))
+        assertTrue(error.message!!.contains("'5'"))
+    }
+
+    @Test
+    fun `apostrophe in unquoted text does not hide the comparison operator`() {
+        assertTrue(evaluate("Ada's book == Ada's book"))
+        assertFalse(evaluate("Ada's book == Grace's book"))
+    }
+
+    @Test
+    fun `malformed comparison reports a missing operand`() {
+        assertFailsWith<ExecError> { evaluate("x ==") }
+        assertFailsWith<ExecError> { evaluate("== 5") }
+    }
+
+    @Test
+    fun `missing ordering operand is false and nonstandard number text is rejected`() {
+        val missing = NodeCatalog.evaluateCondition("{{ missing }} > 10") { fragment ->
+            fragment.replace("{{ missing }}", "")
+        }
+
+        assertFalse(missing)
+        assertFailsWith<ExecError> { evaluate("10d > 5") }
     }
 }

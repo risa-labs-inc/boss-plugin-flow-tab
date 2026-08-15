@@ -34,7 +34,9 @@ private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 // still loading its content. Generic across every browser node.
 private const val ELEMENT_WAIT_MS = 20_000
 private const val ELEMENT_POLL_MS = 200
+// Order matters: longest operators must be checked before their one-character prefixes.
 private val CONDITION_OPERATORS = listOf("==", "!=", ">=", "<=", ">", "<")
+private val CONDITION_NUMBER = Regex("""[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?""")
 
 /**
  * Polls (up to [timeoutMs]) for [selector] to match an element, returning whether
@@ -379,15 +381,17 @@ object NodeCatalog {
             val left = interpolate(comparison.left).unquote()
             val op = comparison.operator
             val right = interpolate(comparison.right).unquote()
-            val leftNumber = left.toDoubleOrNull()
-            val rightNumber = right.toDoubleOrNull()
+            val leftNumber = left.conditionNumberOrNull()
+            val rightNumber = right.conditionNumberOrNull()
             return when (op) {
                 "==" -> if (leftNumber != null && rightNumber != null) leftNumber == rightNumber else left == right
                 "!=" -> if (leftNumber != null && rightNumber != null) leftNumber != rightNumber else left != right
                 ">", ">=", "<", "<=" -> {
+                    if (left.isBlank() || right.isBlank()) return false
                     if ((leftNumber == null) != (rightNumber == null)) {
                         throw ExecError(
-                            "If: cannot order-compare a number with text; normalize both values upstream or use ==/!=",
+                            "If: cannot order-compare '${left.preview()}' with '${right.preview()}' — " +
+                                "normalize both values upstream or use ==/!=",
                         )
                     }
                     val order = if (leftNumber != null && rightNumber != null) {
@@ -422,36 +426,52 @@ object NodeCatalog {
                 i = if (end >= 0) end + 2 else i + 2
                 continue
             }
-            val quote = raw[i].takeIf { it == '\'' || it == '"' }
-            if (quote != null) {
-                i++
-                while (i < raw.length) {
-                    if (raw[i] == '\\') {
-                        i += 2
-                    } else if (raw[i] == quote) {
-                        i++
-                        break
-                    } else {
-                        i++
-                    }
-                }
+            val quote = raw[i].takeIf {
+                (it == '\'' || it == '"') &&
+                    (i == 0 || raw[i - 1].isWhitespace() || raw[i - 1] in "=!<>")
+            }
+            val closingQuote = quote?.let { findClosingQuote(raw, i + 1, it) } ?: -1
+            if (closingQuote >= 0) {
+                i = closingQuote + 1
                 continue
             }
             val operator = CONDITION_OPERATORS.firstOrNull { raw.startsWith(it, i) }
             if (operator != null) {
                 val after = i + operator.length
-                if (i > 0 && after < raw.length && raw[i - 1].isWhitespace() && raw[after].isWhitespace()) {
+                val delimitedBefore = i == 0 || raw[i - 1].isWhitespace()
+                val delimitedAfter = after == raw.length || raw[after].isWhitespace()
+                if (delimitedBefore && delimitedAfter) {
                     val left = raw.substring(0, i).trim()
                     val right = raw.substring(after).trim()
-                    if (left.isNotEmpty() && right.isNotEmpty()) {
-                        return Comparison(left, operator, right)
+                    if (left.isEmpty() || right.isEmpty()) {
+                        throw ExecError("If: comparison '$raw' is missing an operand")
                     }
+                    return Comparison(left, operator, right)
                 }
             }
             i++
         }
         return null
     }
+
+    private fun findClosingQuote(raw: String, start: Int, quote: Char): Int {
+        var i = start
+        while (i < raw.length) {
+            if (raw[i] == '\\') {
+                i += 2
+            } else if (raw[i] == quote) {
+                return i
+            } else {
+                i++
+            }
+        }
+        return -1
+    }
+
+    private fun String.conditionNumberOrNull(): Double? =
+        trim().takeIf { CONDITION_NUMBER.matches(it) }?.toDoubleOrNull()?.takeIf { it.isFinite() }
+
+    private fun String.preview(): String = replace("\n", "\\n").take(40)
 
     private fun String.unquote(): String {
         val s = trim()
