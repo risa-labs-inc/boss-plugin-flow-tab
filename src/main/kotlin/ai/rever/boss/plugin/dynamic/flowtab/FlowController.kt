@@ -8,6 +8,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
@@ -65,6 +67,7 @@ class FlowController(
         context.pluginStorageFactory?.createStorage(STORAGE_NAMESPACE)
     }.getOrNull()
     private val jobs = ConcurrentHashMap<String, RunJob>()
+    private val persistMutex = Mutex()
     /** Independent from pluginScope so it can observe that scope being replaced, but
      * still explicitly owned by this controller and cancelled from [dispose]. */
     private val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -167,6 +170,9 @@ class FlowController(
                             current
                         }
                     }
+                    // Serialize storage writes through persistRun so a delayed live
+                    // snapshot can never overwrite a terminal watchdog verdict.
+                    monitorScope.launch { jobs[runId]?.let { persistRun(it) } }
                 }
                 val firstError = states.values.firstOrNull { it.status == RunStatus.ERROR }
                 RunJob(
@@ -241,8 +247,13 @@ class FlowController(
 
     private suspend fun persistRun(job: RunJob) {
         withContext(NonCancellable) {
-            runCatching {
-                storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), job))
+            persistMutex.withLock {
+                runCatching {
+                    // Always serialize the newest in-memory snapshot. Coroutine
+                    // scheduling may otherwise let an older live write run last.
+                    val safeJob = jobs[job.runId] ?: job
+                    storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), safeJob))
+                }
             }
         }
     }
@@ -290,7 +301,6 @@ class FlowController(
             error = message,
             nodes = graphNodes + savedNodes,
         )
-        persistRun(failed)
         return failed
     }
 

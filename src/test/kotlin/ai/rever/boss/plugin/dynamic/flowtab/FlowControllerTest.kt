@@ -323,7 +323,7 @@ class FlowControllerTest {
                 )
             )
         }
-        val fc = controller(registry = registry, runTimeoutMs = 1_000)
+        val fc = controller(registry = registry, runTimeoutMs = 3_000)
         val tabId = fc.createFlow()
         val nodeId = fc.addNode(tabId, "HANG")
         val runId = fc.startRun(tabId)
@@ -373,6 +373,11 @@ class FlowControllerTest {
 
         try {
             withTimeout(5_000) { entered.await() }
+            withTimeout(5_000) {
+                while (storage.getJson("${FlowController.RUN_PREFIX}$runId")?.contains(nodeId) != true) {
+                    delay(5)
+                }
+            }
             beforeReload.dispose()
             runScope.cancel()
 
@@ -381,7 +386,7 @@ class FlowControllerTest {
                 val loaded = afterReload.runStatus(runId)!!
                 assertEquals(RunJobState.FAILED, loaded.state)
                 assertTrue(loaded.error!!.contains("plugin reload"))
-                assertEquals(RunStatus.SKIPPED, loaded.nodes.getValue(nodeId).status)
+                assertEquals(RunStatus.ERROR, loaded.nodes.getValue(nodeId).status)
             } finally {
                 afterReload.dispose()
             }
