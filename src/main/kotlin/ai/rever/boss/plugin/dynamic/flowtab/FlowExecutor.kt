@@ -94,7 +94,11 @@ class FlowExecutor(
                             failed.add(node.id)
                             onStatus(
                                 node.id,
-                                NodeRun(RunStatus.SKIPPED, logs = listOf("Skipped — upstream node failed")),
+                                NodeRun(
+                                    RunStatus.SKIPPED,
+                                    logs = listOf(SKIP_UPSTREAM_FAILED),
+                                    skipReason = SKIP_UPSTREAM_FAILED,
+                                ),
                             )
                             done[node.id]?.complete(Unit)
                             return@launch
@@ -114,7 +118,7 @@ class FlowExecutor(
                             val out = if (skipped) {
                                 // An upstream control port emitted no items. Do not seed
                                 // and accidentally execute the unselected branch.
-                                logs.add("Skipped — no input items")
+                                logs.add(SKIP_NO_INPUT)
                                 NodeOutput.EMPTY
                             } else {
                                 // Provider availability is a runtime property of the selected
@@ -133,7 +137,15 @@ class FlowExecutor(
                             val flattened = out.allItems()
                             ctx.outputsByTitle[node.title] = flattened
                             val status = if (skipped) RunStatus.SKIPPED else RunStatus.SUCCESS
-                            onStatus(node.id, NodeRun(status, flattened, null, logs))
+                            onStatus(
+                                node.id,
+                                NodeRun(
+                                    status = status,
+                                    output = flattened,
+                                    logs = logs,
+                                    skipReason = SKIP_NO_INPUT.takeIf { skipped },
+                                ),
+                            )
                         } catch (ce: CancellationException) {
                             throw ce
                         } catch (e: Exception) {

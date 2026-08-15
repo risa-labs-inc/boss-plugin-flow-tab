@@ -247,7 +247,8 @@ class FlowExecutorTest {
 
         assertEquals(RunStatus.ERROR, states["ex"]?.status)
         assertEquals(RunStatus.SKIPPED, states["after"]?.status)
-        assertEquals(listOf("Skipped — upstream node failed"), states["after"]?.logs)
+        assertEquals(listOf(SKIP_UPSTREAM_FAILED), states["after"]?.logs)
+        assertEquals(SKIP_UPSTREAM_FAILED, states["after"]?.skipReason)
         assertEquals(RunStatus.SKIPPED, states["after2"]?.status)
         assertEquals(RunStatus.SUCCESS, states["indep"]?.status) // unaffected
     }
@@ -385,6 +386,49 @@ class FlowExecutorTest {
 
         assertEquals(RunStatus.SUCCESS, states["yes"]?.status)
         assertEquals("yes", states["yes"]!!.output.single().json.str("branch"))
+        assertEquals(RunStatus.SKIPPED, states["no"]?.status)
+    }
+
+    @Test
+    fun `mixed ordering type errors the if node and skips both outputs`() {
+        val registry = builtinNodeRegistry().also { reg ->
+            reg.register(
+                NodeSpec(
+                    id = "TEST_SOURCE",
+                    label = "Test Source",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, _, _ ->
+                        NodeOutput.single(
+                            listOf(
+                                Item(buildJsonObject { put("price", 150) }),
+                                Item(buildJsonObject { put("price", "N/A") }),
+                            ),
+                        )
+                    },
+                ),
+            )
+        }
+        val nodes = listOf(
+            nk("source", "TEST_SOURCE"),
+            n("if", NodeType.IF, "condition" to "{{ \$json.price }} > 100"),
+            n("yes", NodeType.SET, "assignments" to """{"branch":"yes"}"""),
+            n("no", NodeType.SET, "assignments" to """{"branch":"no"}"""),
+        )
+        val edges = listOf(
+            e("source", "if"),
+            e("if", "yes", fp = 0),
+            e("if", "no", fp = 1),
+        )
+
+        val states = runGraph(nodes, edges, registry = registry)
+
+        assertEquals(RunStatus.ERROR, states["if"]?.status)
+        assertTrue(states["if"]!!.error!!.contains("N/A"))
+        assertEquals(RunStatus.SKIPPED, states["yes"]?.status)
         assertEquals(RunStatus.SKIPPED, states["no"]?.status)
     }
 

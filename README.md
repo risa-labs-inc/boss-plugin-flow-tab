@@ -16,8 +16,9 @@ together with edges, n8n style.
 - **If conditions** support whitespace-delimited `==`, `!=`, `>`, `>=`, `<`, and `<=`.
   Ordering is numeric for two numbers and lexical for two text values (including ISO
   dates); an empty operand makes any ordering comparison false. Mixed numeric/text
-  operands error the node and stop that branch; normalize them upstream or use equality
-  instead.
+  operands error the If node, discard that input batch, stop both outputs, and fail the
+  run; normalize them upstream or use equality instead. A condition that contains only
+  an expression is tested for truthiness and is never parsed as a comparison.
 - **Edges**: drag from an output port to an input port to connect nodes; bezier curves.
 - **Move / select / delete**: drag nodes to reposition, click to select, `Delete` to remove
   the selected node (and its edges) or a selected edge.
