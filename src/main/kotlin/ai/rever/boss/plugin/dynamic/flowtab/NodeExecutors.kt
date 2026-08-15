@@ -168,29 +168,41 @@ class ConfigReader(
             else -> el.toString()
         }
     }
+
+    /** Parse [key] as JSON and recursively resolve `{{ }}` while preserving types. */
+    fun jsonTemplate(key: String): JsonElement? {
+        val configured = config[key] ?: return null
+        val template = if (configured is JsonPrimitive && configured.isString) {
+            if (configured.content.isBlank()) return null
+            EXEC_JSON.parseToJsonElement(configured.content)
+        } else {
+            configured
+        }
+        return ExpressionEval.interpolateJson(template, item.json, outputsByTitle)
+    }
 }
 
 /** Executes one node. Receives the current item's [cfg] and (for ONCE nodes) all [inputs]. */
 fun interface NodeExecutor {
-    suspend fun run(ctx: RunContext, cfg: ConfigReader, inputs: List<Item>, log: (String) -> Unit): List<Item>
+    suspend fun run(ctx: RunContext, cfg: ConfigReader, inputs: List<Item>, log: (String) -> Unit): NodeOutput
 }
 
 /**
- * Maps each [NodeType] to its executor. `null` = not runnable yet (the engine
- * marks the node as an error). Browser nodes drive `ctx.session` via
- * [BrowserScripts]; HTTP/SET are pure data nodes.
+ * Maps each built-in [NodeType] to its executor. Browser nodes drive
+ * `ctx.session` via [BrowserScripts]; HTTP, Set, Code, If, and Merge are pure
+ * data/control nodes.
  */
 object NodeCatalog {
 
     fun executor(type: NodeType): NodeExecutor? = when (type) {
-        NodeType.TRIGGER -> NodeExecutor { _, _, _, _ -> SEED_ITEMS }
+        NodeType.TRIGGER -> NodeExecutor { _, _, _, _ -> NodeOutput.single(SEED_ITEMS) }
 
         NodeType.OPEN_BROWSER -> NodeExecutor { ctx, cfg, inputs, log ->
             val session = ctx.openSession(cfg.bool("headless"), log)
             log(if (session is BrowserHandleIntegration) "Browser session ready (headless)" else "Browser session ready (visible)")
             val url = cfg.str("url")
             if (url.isNotBlank()) { ctx.requireSession().navigate(url); log("Navigated to $url") }
-            inputs.ifEmpty { SEED_ITEMS }
+            NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
         }
 
         NodeType.NAVIGATE -> NodeExecutor { ctx, cfg, inputs, log ->
@@ -198,7 +210,7 @@ object NodeCatalog {
             if (url.isBlank()) throw ExecError("Navigate needs a URL")
             ctx.requireSession().navigate(url)
             log("Navigated to $url")
-            inputs.ifEmpty { SEED_ITEMS }
+            NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
         }
 
         NodeType.CLICK -> NodeExecutor { ctx, cfg, inputs, log ->
@@ -209,7 +221,7 @@ object NodeCatalog {
             val ok = session.executeJavaScript(BrowserScripts.clickScript(type, sel)) == true
             if (!ok) throw ExecError("Click: no element matched '$sel'")
             log("Clicked '$sel'")
-            inputs.ifEmpty { SEED_ITEMS }
+            NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
         }
 
         NodeType.TYPE -> NodeExecutor { ctx, cfg, inputs, log ->
@@ -221,7 +233,7 @@ object NodeCatalog {
             val ok = session.executeJavaScript(BrowserScripts.inputScript(type, sel, text)) == true
             if (!ok) throw ExecError("Type: no element matched '$sel'")
             log("Typed into '$sel'")
-            inputs.ifEmpty { SEED_ITEMS }
+            NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
         }
 
         NodeType.EXTRACT -> NodeExecutor { ctx, cfg, _, log ->
@@ -253,7 +265,7 @@ object NodeCatalog {
                 listOf(Item(buildJsonObject { put(field, value) }))
             }
             log("Extracted ${items.size} item(s) from '$sel'")
-            items
+            NodeOutput.single(items)
         }
 
         NodeType.INJECT -> NodeExecutor { ctx, cfg, inputs, log ->
@@ -261,7 +273,7 @@ object NodeCatalog {
             if (script.isBlank()) throw ExecError("Inject needs a script")
             ctx.requireSession().executeJavaScript(script)
             log("Ran injected script")
-            inputs.ifEmpty { SEED_ITEMS }
+            NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
         }
 
         NodeType.HTTP -> NodeExecutor { _, cfg, _, log ->
@@ -288,10 +300,10 @@ object NodeCatalog {
             val parsedBody = runCatching { EXEC_JSON.parseToJsonElement(resp.body()) }
                 .getOrElse { JsonPrimitive(resp.body()) }
             log("→ ${resp.statusCode()}")
-            listOf(Item(buildJsonObject {
+            NodeOutput.single(listOf(Item(buildJsonObject {
                 put("status", resp.statusCode())
                 put("body", parsedBody)
-            }))
+            })))
         }
 
         NodeType.SET -> NodeExecutor { _, cfg, inputs, _ ->
@@ -307,11 +319,32 @@ object NodeCatalog {
                     put(k, ExpressionEval.interpolate(template, current, emptyMap()))
                 }
             }
-            listOf(Item(merged))
+            NodeOutput.single(listOf(Item(merged)))
         }
 
-        // Not yet runnable in Phase 1.
-        NodeType.CODE, NodeType.IF, NodeType.MERGE -> null
+        NodeType.CODE -> NodeExecutor { _, cfg, inputs, log ->
+            val current = inputs.firstOrNull() ?: SEED_ITEMS.first()
+            val rendered = runCatching { cfg.jsonTemplate("code") }
+                .getOrElse { throw ExecError("Code: 'code' must be valid JSON: ${it.message}") }
+                ?: current.json
+            val obj = rendered as? JsonObject
+                ?: throw ExecError("Code: the JSON template must produce an object")
+            log("Transformed item with JSON template")
+            NodeOutput.single(listOf(Item(obj)))
+        }
+
+        NodeType.IF -> NodeExecutor { _, cfg, inputs, log ->
+            val condition = cfg.str("condition")
+            if (condition.isBlank()) throw ExecError("If needs a condition")
+            val matched = evaluateCondition(condition)
+            log("Condition → ${if (matched) "true" else "false"}")
+            NodeOutput.onPort(if (matched) 0 else 1, inputs)
+        }
+
+        NodeType.MERGE -> NodeExecutor { _, _, inputs, log ->
+            log("Merged ${inputs.size} item(s)")
+            NodeOutput.single(inputs)
+        }
     }
 
     private fun parseHeaders(raw: String): Map<String, String> {
@@ -321,6 +354,42 @@ object NodeCatalog {
                 (v as? JsonPrimitive)?.content ?: v.toString()
             }
         }.getOrDefault(emptyMap())
+    }
+
+    /** Small, deterministic predicate language for If after `{{ }}` interpolation. */
+    internal fun evaluateCondition(raw: String): Boolean {
+        val comparison = Regex("""^\s*(.*?)\s*(==|!=|>=|<=|>|<)\s*(.*?)\s*$""").matchEntire(raw)
+        if (comparison != null) {
+            val left = comparison.groupValues[1].unquote()
+            val op = comparison.groupValues[2]
+            val right = comparison.groupValues[3].unquote()
+            val leftNumber = left.toDoubleOrNull()
+            val rightNumber = right.toDoubleOrNull()
+            val order = if (leftNumber != null && rightNumber != null) {
+                leftNumber.compareTo(rightNumber)
+            } else {
+                left.compareTo(right)
+            }
+            return when (op) {
+                "==" -> if (leftNumber != null && rightNumber != null) order == 0 else left == right
+                "!=" -> if (leftNumber != null && rightNumber != null) order != 0 else left != right
+                ">" -> order > 0
+                ">=" -> order >= 0
+                "<" -> order < 0
+                "<=" -> order <= 0
+                else -> false
+            }
+        }
+        return when (val value = raw.trim().unquote().lowercase()) {
+            "", "false", "null", "undefined", "0", "no", "off" -> false
+            else -> value.toDoubleOrNull()?.let { it != 0.0 } ?: true
+        }
+    }
+
+    private fun String.unquote(): String {
+        val s = trim()
+        return if (s.length >= 2 && ((s.first() == '"' && s.last() == '"') ||
+                (s.first() == '\'' && s.last() == '\''))) s.substring(1, s.length - 1) else s
     }
 }
 

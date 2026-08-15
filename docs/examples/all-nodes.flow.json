@@ -108,15 +108,17 @@
     {
       "id": "h3",
       "type": "IF",
-      "title": "Branch (placeholder)",
+      "title": "Popular repo?",
       "x": 640.0,
       "y": 520.0,
-      "config": {}
+      "config": {
+        "condition": "{{ $json.stars }} >= 1000"
+      }
     },
     {
       "id": "h4",
       "type": "MERGE",
-      "title": "Merge (placeholder)",
+      "title": "Merge branches",
       "x": 920.0,
       "y": 520.0,
       "config": {}
@@ -124,10 +126,12 @@
     {
       "id": "h5",
       "type": "CODE",
-      "title": "Code (placeholder)",
+      "title": "Format result",
       "x": 360.0,
       "y": 700.0,
-      "config": {}
+      "config": {
+        "code": "{\"summary\":\"{{ $json.repo }} has {{ $json.stars }} stars\",\"stars\":\"{{ $json.stars }}\"}"
+      }
     }
   ],
   "edges": [

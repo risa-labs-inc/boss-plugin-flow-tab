@@ -100,14 +100,14 @@ class ToolNodeExecutor(
         cfg: ConfigReader,
         inputs: List<Item>,
         log: (String) -> Unit,
-    ): List<Item> {
+    ): NodeOutput {
         val schema = (cfg.element(ToolNode.SCHEMA_KEY) as? JsonPrimitive)?.content ?: fallbackSchema
         val argsJson = ToolNode.buildArgs(schema, cfg)
         log("→ ${ref.name} $argsJson")
         val result = source.invoke(ref.name, argsJson)
         if (result.isError) throw ExecError("Tool '${ref.name}' failed: ${result.text}")
         log("← ${ref.name} ok")
-        return listOf(ToolNode.resultItem(result.text))
+        return NodeOutput.single(listOf(ToolNode.resultItem(result.text)))
     }
 }
 

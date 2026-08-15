@@ -21,6 +21,7 @@ import kotlinx.serialization.json.JsonPrimitive
 object ExpressionEval {
 
     private val EXPR = Regex("""\{\{(.*?)}}""")
+    private val WHOLE_EXPR = Regex("""^\s*\{\{(.*?)}}\s*$""")
 
     /** Replace each `{{ expr }}` in [template] with its resolved value. */
     fun interpolate(
@@ -55,6 +56,33 @@ object ExpressionEval {
             } ?: return null
         }
         return cur
+    }
+
+    /**
+     * Recursively interpolate a JSON template. A string that consists solely of
+     * one expression keeps the resolved JSON type (number, boolean, object, array,
+     * or null); expressions embedded in surrounding text render as strings.
+     */
+    fun interpolateJson(
+        template: JsonElement,
+        json: JsonObject,
+        nodeOutputsByTitle: Map<String, List<Item>>,
+    ): JsonElement = when (template) {
+        is JsonObject -> JsonObject(
+            template.mapValues { (_, value) -> interpolateJson(value, json, nodeOutputsByTitle) }
+        )
+        is JsonArray -> JsonArray(template.map { interpolateJson(it, json, nodeOutputsByTitle) })
+        is JsonPrimitive -> {
+            if (!template.isString) template
+            else {
+                val whole = WHOLE_EXPR.matchEntire(template.content)
+                if (whole != null) {
+                    eval(whole.groupValues[1].trim(), json, nodeOutputsByTitle) ?: JsonNull
+                } else {
+                    JsonPrimitive(interpolate(template.content, json, nodeOutputsByTitle))
+                }
+            }
+        }
     }
 
     private fun render(el: JsonElement?): String = when (el) {

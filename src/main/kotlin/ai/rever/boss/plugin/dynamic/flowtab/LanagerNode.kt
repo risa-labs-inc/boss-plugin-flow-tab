@@ -38,7 +38,7 @@ class LanagerNodeExecutor(
         cfg: ConfigReader,
         inputs: List<Item>,
         log: (String) -> Unit,
-    ): List<Item> {
+    ): NodeOutput {
         val subId = cfg.str(LanagerNode.FLOW_ID_KEY).ifBlank { throw ExecError("lanager needs a 'flowId'") }
 
         if (subId in ctx.ancestry) throw ExecError("lanager cycle detected: '$subId' is already running")
@@ -53,13 +53,13 @@ class LanagerNodeExecutor(
             throw ExecError("lanager sub-flow '$subId' failed: ${job.error ?: "unknown error"}")
         }
         log("lanager ← sub-flow '$subId' ${job.state}")
-        return listOf(
+        return NodeOutput.single(listOf(
             Item(buildJsonObject {
                 put("subFlow", subId)
                 put("runId", runId)
                 put("state", job.state.name)
             })
-        )
+        ))
     }
 
     /**

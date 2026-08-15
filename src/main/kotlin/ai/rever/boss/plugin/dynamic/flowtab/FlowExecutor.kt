@@ -68,7 +68,7 @@ class FlowExecutor(
         val depsOf: Map<String, List<String>> = nodes.associate { n ->
             n.id to edges.filter { it.toNode == n.id }.map { it.fromNode }.distinct()
         }
-        val outputsById = ConcurrentHashMap<String, List<Item>>()
+        val outputsById = ConcurrentHashMap<String, NodeOutput>()
         val failed = ConcurrentHashMap.newKeySet<String>()
         val done = nodes.associate { it.id to CompletableDeferred<Unit>() }
         val ctx = RunContext(
@@ -98,19 +98,23 @@ class FlowExecutor(
                         if (humanize) delay(Random.nextLong(HUMANIZE_MIN_MS, HUMANIZE_MAX_MS))
                         val logs = mutableListOf<String>()
                         try {
-                            val inputs = edges
-                                .filter { it.toNode == node.id }
+                            val incoming = edges.filter { it.toNode == node.id }
+                            val inputs = incoming
                                 .sortedBy { it.toPort }
-                                .flatMap { outputsById[it.fromNode].orEmpty() }
-                            val out =
-                                if (registry[node.kind]?.usesSession == true) {
-                                    ctx.sessionMutex.withLock { runNode(ctx, node, inputs) { logs.add(it) } }
-                                } else {
-                                    runNode(ctx, node, inputs) { logs.add(it) }
-                                }
+                                .flatMap { outputsById[it.fromNode]?.port(it.fromPort).orEmpty() }
+                            val out = if (incoming.isNotEmpty() && inputs.isEmpty()) {
+                                // An upstream control port emitted no items. Do not seed
+                                // and accidentally execute the unselected branch.
+                                NodeOutput.EMPTY
+                            } else if (registry[node.kind]?.usesSession == true) {
+                                ctx.sessionMutex.withLock { runNode(ctx, node, inputs) { logs.add(it) } }
+                            } else {
+                                runNode(ctx, node, inputs) { logs.add(it) }
+                            }
                             outputsById[node.id] = out
-                            ctx.outputsByTitle[node.title] = out
-                            onStatus(node.id, NodeRun(RunStatus.SUCCESS, out, null, logs))
+                            val flattened = out.allItems()
+                            ctx.outputsByTitle[node.title] = flattened
+                            onStatus(node.id, NodeRun(RunStatus.SUCCESS, flattened, null, logs))
                         } catch (ce: CancellationException) {
                             throw ce
                         } catch (e: Exception) {
@@ -131,14 +135,14 @@ class FlowExecutor(
         node: PlanNode,
         inputs: List<Item>,
         log: (String) -> Unit
-    ): List<Item> {
+    ): NodeOutput {
         val spec = registry[node.kind]
             ?: throw ExecError("Unknown node kind '${node.kind}' — its provider isn't available")
         val exec = spec.executor
-            ?: throw ExecError("${spec.label} is not runnable yet (Phase 1)")
+            ?: throw ExecError("Node kind '${node.kind}' is unavailable")
         return when (spec.runMode) {
-            RunMode.PER_ITEM -> inputs.ifEmpty { SEED_ITEMS }.flatMap { item ->
-                exec.run(ctx, ConfigReader(node.config, item, ctx.outputsByTitle), listOf(item), log)
+            RunMode.PER_ITEM -> inputs.ifEmpty { SEED_ITEMS }.fold(NodeOutput.EMPTY) { output, item ->
+                output + exec.run(ctx, ConfigReader(node.config, item, ctx.outputsByTitle), listOf(item), log)
             }
             RunMode.ONCE -> {
                 val item = inputs.firstOrNull() ?: SEED_ITEMS.first()

@@ -132,11 +132,12 @@ private fun e(from: String, to: String, fp: Int = 0, tp: Int = 0) =
 private fun runGraph(
     nodes: List<PlanNode>,
     edges: List<EdgeModel>,
-    service: BrowserService? = null
+    service: BrowserService? = null,
+    registry: NodeRegistry = builtinNodeRegistry(),
 ): Map<String, NodeRun> {
     val states = ConcurrentHashMap<String, NodeRun>()
     runBlocking(Dispatchers.Default) {
-        FlowExecutor(FakeContext(service)).run(nodes, edges) { id, r -> states[id] = r }
+        FlowExecutor(FakeContext(service), registry).run(nodes, edges) { id, r -> states[id] = r }
     }
     return states
 }
@@ -243,10 +244,84 @@ class FlowExecutorTest {
     }
 
     @Test
-    fun `unimplemented node type errors clearly`() {
-        val states = runGraph(listOf(n("c", NodeType.CODE)), emptyList())
-        assertEquals(RunStatus.ERROR, states["c"]?.status)
-        assertTrue(states["c"]!!.error!!.contains("not runnable", ignoreCase = true))
+    fun `code transforms each item with a typed JSON template`() {
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            n("s", NodeType.SET, "assignments" to """{"name":"Ada"}"""),
+            n(
+                "c",
+                NodeType.CODE,
+                "code" to """{"greeting":"Hello {{ ${'$'}json.name }}","active":true,"count":2}""",
+            ),
+        )
+        val states = runGraph(nodes, listOf(e("t", "s"), e("s", "c")))
+
+        assertEquals(RunStatus.SUCCESS, states["c"]?.status)
+        val out = states["c"]!!.output.single().json
+        assertEquals("Hello Ada", out.str("greeting"))
+        assertEquals("true", out["active"]?.jsonPrimitive?.content)
+        assertEquals("2", out["count"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `if independently routes multiple items through both output ports`() {
+        val registry = builtinNodeRegistry().also { reg ->
+            reg.register(
+                NodeSpec(
+                    id = "TEST_SOURCE",
+                    label = "Test Source",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, _, _ ->
+                        NodeOutput.single(
+                            listOf(90, 70, 95).map { score ->
+                                Item(buildJsonObject { put("score", score) })
+                            }
+                        )
+                    },
+                )
+            )
+        }
+        val nodes = listOf(
+            nk("source", "TEST_SOURCE"),
+            n("if", NodeType.IF, "condition" to "{{ \$json.score }} >= 80"),
+            n("yes", NodeType.SET, "assignments" to """{"branch":"yes"}"""),
+            n("no", NodeType.SET, "assignments" to """{"branch":"no"}"""),
+        )
+        val edges = listOf(
+            e("source", "if"),
+            e("if", "yes", fp = 0),
+            e("if", "no", fp = 1),
+        )
+        val states = runGraph(nodes, edges, registry = registry)
+
+        assertEquals(listOf("90", "95"), states["yes"]!!.output.map { it.json.str("score") })
+        assertEquals(listOf("70"), states["no"]!!.output.map { it.json.str("score") })
+        assertTrue(states["yes"]!!.output.all { it.json.str("branch") == "yes" })
+        assertTrue(states["no"]!!.output.all { it.json.str("branch") == "no" })
+    }
+
+    @Test
+    fun `merge concatenates items arriving on both input ports`() {
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            n("a", NodeType.SET, "assignments" to """{"side":"a"}"""),
+            n("b", NodeType.SET, "assignments" to """{"side":"b"}"""),
+            n("m", NodeType.MERGE),
+        )
+        val edges = listOf(
+            e("t", "a"),
+            e("t", "b"),
+            e("a", "m", tp = 0),
+            e("b", "m", tp = 1),
+        )
+        val states = runGraph(nodes, edges)
+
+        assertEquals(RunStatus.SUCCESS, states["m"]?.status)
+        assertEquals(listOf("a", "b"), states["m"]!!.output.map { it.json.str("side") })
     }
 
     @Test
