@@ -145,7 +145,7 @@ class FlowController(
         val states = ConcurrentHashMap<String, NodeRun>()
         val execution = scopeProvider().launch(Dispatchers.Default) {
             // Persist RUNNING before executing so a reload can still diagnose an in-flight run.
-            persistRun(jobs.getValue(runId))
+            persistRun(jobs[runId] ?: RunJob(runId, tabId, RunJobState.RUNNING))
             val candidate = try {
                 val snap = getFlow(tabId) ?: throw IllegalStateException("No flow '$tabId'")
                 val plan = snap.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
@@ -196,9 +196,14 @@ class FlowController(
                 val message = "Flow exceeded its ${runTimeoutMs}ms run timeout"
                 transitionToFailed(runId, tabId, states, message)?.let { persistRun(it) }
                 execution.cancel(CancellationException(message))
-            } else if (execution.isCancelled) {
-                // launch() against an already-cancelled scope never enters its body.
-                val message = "Flow run cancelled before dispatch"
+            } else {
+                // Covers launch() against an already-cancelled scope and any unexpected
+                // throw that escaped execution before it could publish a terminal result.
+                val message = if (execution.isCancelled) {
+                    "Flow run cancelled before dispatch"
+                } else {
+                    "Flow run ended without publishing a result"
+                }
                 transitionToFailed(runId, tabId, states, message)?.let { persistRun(it) }
             }
         }
@@ -316,7 +321,7 @@ fun buildHeadlessController(
     scope: CoroutineScope? = null,
 ): FlowController {
     val initialScope = scope ?: context.pluginScope
-    val scopeProvider: () -> CoroutineScope = scope?.let { fixed -> { fixed } } ?: { context.pluginScope }
+    val scopeProvider: () -> CoroutineScope = { scope ?: context.pluginScope }
     val controller = FlowController(
         context = context,
         scopeProvider = scopeProvider,
