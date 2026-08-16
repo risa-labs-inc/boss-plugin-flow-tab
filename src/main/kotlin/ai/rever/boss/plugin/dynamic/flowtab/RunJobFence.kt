@@ -12,6 +12,8 @@ import kotlin.coroutines.EmptyCoroutineContext
 /**
  * Launches runs serially even when cancellation of the preceding run is cooperative.
  * Calls are confined to the UI thread; the launched jobs may execute elsewhere.
+ * The predecessor wait is intentionally unbounded to prevent side-effect overlap; a
+ * wedged predecessor blocks the queue, and Clear is the UI escape hatch.
  */
 internal class RunJobFence(private val scope: CoroutineScope) {
     private var current: Job? = null

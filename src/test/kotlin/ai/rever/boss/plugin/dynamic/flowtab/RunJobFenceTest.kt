@@ -12,6 +12,11 @@ import kotlin.test.assertTrue
 class RunJobFenceTest {
 
     @Test
+    fun `cancelling with no current run is a no-op`() = runBlocking {
+        RunJobFence(this).cancelCurrent()
+    }
+
+    @Test
     fun `new run waits for cancelled run to finish unwinding`() = runBlocking {
         val fence = RunJobFence(this)
         val firstStarted = CompletableDeferred<Unit>()

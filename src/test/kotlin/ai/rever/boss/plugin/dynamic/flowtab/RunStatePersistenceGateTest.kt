@@ -104,7 +104,30 @@ class RunStatePersistenceGateTest {
 
         val cleared = gate.clearAfterInvalidation(invalidation) { saved = null }
 
-        assertFalse(cleared)
+        assertTrue(cleared == RunStateClearResult.PRESERVED_NEWER)
         assertTrue(saved == "newer run")
+    }
+
+    @Test
+    fun `persist times out while clear owns the mutex`() = runBlocking {
+        val gate = RunStatePersistenceGate(persistTimeoutMs = 20, clearTimeoutMs = 1_000)
+        gate.beginRun()
+        val invalidation = gate.invalidateRun()
+        val clearEntered = CompletableDeferred<Unit>()
+        val finishClear = CompletableDeferred<Unit>()
+        val clearJob = launch {
+            gate.clearAfterInvalidation(invalidation) {
+                clearEntered.complete(Unit)
+                finishClear.await()
+            }
+        }
+        clearEntered.await()
+        val newerToken = gate.beginRun()
+
+        val persisted = gate.persistIfCurrent(newerToken) { }
+
+        assertFalse(persisted)
+        finishClear.complete(Unit)
+        clearJob.join()
     }
 }

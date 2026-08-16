@@ -13,6 +13,12 @@ internal class RunInvalidation internal constructor(
     internal val generation: Long,
 )
 
+internal enum class RunStateClearResult {
+    CLEARED,
+    PRESERVED_NEWER,
+    TIMED_OUT,
+}
+
 /**
  * Orders run-state persistence against destructive actions such as clearing a flow.
  *
@@ -21,7 +27,10 @@ internal class RunInvalidation internal constructor(
  * passed its generation check when Clear starts: Clear waits for that save, then
  * removes it; if Clear wins the mutex, the stale save re-checks its token and skips.
  */
-internal class RunStatePersistenceGate {
+internal class RunStatePersistenceGate(
+    private val persistTimeoutMs: Long = DEFAULT_OPERATION_TIMEOUT_MS,
+    private val clearTimeoutMs: Long = DEFAULT_OPERATION_TIMEOUT_MS,
+) {
     private val generation = AtomicLong(0)
     private val persistenceMutex = Mutex()
     private var lastPersistedGeneration = 0L
@@ -34,7 +43,9 @@ internal class RunStatePersistenceGate {
 
     suspend fun persistIfCurrent(token: Long, persist: suspend () -> Unit): Boolean =
         withContext(NonCancellable) {
-            withTimeoutOrNull(PERSIST_TIMEOUT_MS) {
+            // This bounds mutex contention and suspending provider calls. A host API
+            // that blocks its thread without suspending cannot be pre-empted.
+            withTimeoutOrNull(persistTimeoutMs) {
                 persistenceMutex.withLock {
                     if (!isCurrent(token)) return@withLock false
                     persist()
@@ -52,22 +63,25 @@ internal class RunStatePersistenceGate {
     suspend fun clearAfterInvalidation(
         invalidation: RunInvalidation,
         clearPersisted: suspend () -> Unit,
-    ): Boolean {
-        check(invalidation.owner === this && generation.get() >= invalidation.generation) {
-            "Run was not invalidated by this gate before clear"
-        }
+    ): RunStateClearResult {
+        check(invalidation.owner === this) { "Run was invalidated by a different gate" }
         return withContext(NonCancellable) {
-            persistenceMutex.withLock {
-                // If a newer run already saved while this async clear was queued, its
-                // snapshot owns the shared key and must not be removed.
-                if (lastPersistedGeneration > invalidation.generation) return@withLock false
-                clearPersisted()
-                true
-            }
+            // As above, this bounds contention and cooperative/suspending host calls.
+            withTimeoutOrNull(clearTimeoutMs) {
+                persistenceMutex.withLock {
+                    // If a newer run already saved while this async clear was queued,
+                    // its snapshot owns the shared key and must not be removed.
+                    if (lastPersistedGeneration > invalidation.generation) {
+                        return@withLock RunStateClearResult.PRESERVED_NEWER
+                    }
+                    clearPersisted()
+                    RunStateClearResult.CLEARED
+                }
+            } ?: RunStateClearResult.TIMED_OUT
         }
     }
 
     private companion object {
-        const val PERSIST_TIMEOUT_MS = 5_000L
+        const val DEFAULT_OPERATION_TIMEOUT_MS = 5_000L
     }
 }

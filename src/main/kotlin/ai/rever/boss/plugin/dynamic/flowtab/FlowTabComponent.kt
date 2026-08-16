@@ -79,6 +79,7 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 
 private val ToolbarBg = Color(0xFF202024)
@@ -145,8 +146,7 @@ class FlowTabComponent(
     private var realistic by mutableStateOf(false)
     // The visible browser tab this flow opened; closed at the start of the next run
     // so each Run opens a fresh tab (no stale reuse, no stacked splits).
-    @Volatile
-    private var visibleTabId: String? = null
+    private val visibleTabId = AtomicReference<String?>(null)
 
     init {
         // Surface the host registry's tools as live palette nodes, re-deriving whenever
@@ -242,15 +242,16 @@ class FlowTabComponent(
         fun viewCenterScreen(): Offset =
             Offset(viewportSize.width / 2f, viewportSize.height / 2f)
 
-        // ---- run wiring ---- (state/executor/runJob/toggles are component fields,
+        // ---- run wiring ---- (state/executor/runJobs/toggles are component fields,
         // so an in-flight run survives the split-induced composition recreation)
         fun startRun() {
             if (state.isRunning) return
             // Fresh start: close the browser tab a prior run opened (no-op if the user
             // already closed it) and clear tracking, so this run opens a new visible
             // tab rather than reusing a stale/closed one or stacking splits.
-            visibleTabId?.let { id -> runCatching { context.activeTabsProvider?.closeTab(id) } }
-            visibleTabId = null
+            visibleTabId.getAndSet(null)?.let { id ->
+                runCatching { context.activeTabsProvider?.closeTab(id) }
+            }
             state.clearRun()
             state.notice = null
             state.isRunning = true
@@ -268,12 +269,21 @@ class FlowTabComponent(
                         plan, edges,
                         humanize = realistic,
                         onVisibleTab = { id ->
-                            if (runStatePersistence.isCurrent(runToken)) {
-                                visibleTabId = id
-                            } else {
-                                id?.let { staleId ->
+                            id?.let { tabId ->
+                                if (runStatePersistence.isCurrent(runToken)) {
+                                    visibleTabId.set(tabId)
+                                    // Close a tab published across a concurrent Clear
+                                    // after the first generation check passed.
+                                    if (!runStatePersistence.isCurrent(runToken) &&
+                                        visibleTabId.compareAndSet(tabId, null)
+                                    ) {
+                                        coroutineScope.launch(Dispatchers.Main) {
+                                            runCatching { context.activeTabsProvider?.closeTab(tabId) }
+                                        }
+                                    }
+                                } else {
                                     coroutineScope.launch(Dispatchers.Main) {
-                                        runCatching { context.activeTabsProvider?.closeTab(staleId) }
+                                        runCatching { context.activeTabsProvider?.closeTab(tabId) }
                                     }
                                 }
                             }
@@ -295,11 +305,14 @@ class FlowTabComponent(
                 } finally {
                     // Persist the run results (capped) so they survive reopening.
                     try {
-                        runStatePersistence.persistIfCurrent(runToken) {
+                        val persisted = runStatePersistence.persistIfCurrent(runToken) {
                             storage?.putJson(
                                 "$RUN_STATE_PREFIX${config.id}",
                                 json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
                             )
+                        }
+                        if (!persisted && runStatePersistence.isCurrent(runToken)) {
+                            state.notice = "Run completed, but its saved state timed out"
                         }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
@@ -309,6 +322,8 @@ class FlowTabComponent(
                 }
             }
             // This also runs when a queued job is cancelled before its block starts.
+            // It intentionally follows the bounded final save, so Stop can remain
+            // visible for up to five seconds while run-state persistence finishes.
             job.invokeOnCompletion {
                 if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
             }
@@ -362,16 +377,20 @@ class FlowTabComponent(
             val invalidation = runStatePersistence.invalidateRun()
             runJobs.cancelCurrent()
             state.isRunning = false
-            visibleTabId?.let { id -> runCatching { context.activeTabsProvider?.closeTab(id) } }
-            visibleTabId = null
+            visibleTabId.getAndSet(null)?.let { id ->
+                runCatching { context.activeTabsProvider?.closeTab(id) }
+            }
             state.nodes.clear()
             state.edges.clear()
             state.clearRun()
             state.selection = null
             uiScope.launch {
                 try {
-                    runStatePersistence.clearAfterInvalidation(invalidation) {
+                    val result = runStatePersistence.clearAfterInvalidation(invalidation) {
                         clearPersistedRunState(storage, config.id)
+                    }
+                    if (result == RunStateClearResult.TIMED_OUT) {
+                        state.notice = "Flow cleared, but saved run-state cleanup timed out"
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
