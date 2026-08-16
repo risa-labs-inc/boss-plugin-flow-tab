@@ -1,9 +1,11 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import kotlin.test.Test
 import kotlin.test.assertFalse
@@ -12,16 +14,16 @@ import kotlin.test.assertTrue
 class RunJobFenceTest {
 
     @Test
-    fun `cancelling with no current run is a no-op`() = runBlocking {
+    fun `cancelling with no current run is a no-op`() = runTimedTest {
         val fence = RunJobFence(this)
 
-        fence.cancelCurrent()
+        fence.cancelAll()
 
         assertFalse(fence.hasActiveRun())
     }
 
     @Test
-    fun `new run waits for cancelled run to finish unwinding`() = runBlocking {
+    fun `new run waits for cancelled run to finish unwinding`() = runTimedTest {
         val fence = RunJobFence(this)
         val firstStarted = CompletableDeferred<Unit>()
         val releaseFirst = CompletableDeferred<Unit>()
@@ -32,18 +34,21 @@ class RunJobFenceTest {
         }
         firstStarted.await()
 
-        fence.cancelCurrent()
+        fence.cancelAll()
         val second = fence.launch { secondStarted.complete(Unit) }
         yield()
 
-        assertFalse(secondStarted.isCompleted)
-        releaseFirst.complete(Unit)
+        try {
+            assertFalse(secondStarted.isCompleted)
+        } finally {
+            releaseFirst.complete(Unit)
+        }
         second.join()
         assertTrue(secondStarted.isCompleted)
     }
 
     @Test
-    fun `cancelling a queued run completes it after the prior run unwinds`() = runBlocking {
+    fun `cancelling a queued run completes it after the prior run unwinds`() = runTimedTest {
         val fence = RunJobFence(this)
         val firstStarted = CompletableDeferred<Unit>()
         val releaseFirst = CompletableDeferred<Unit>()
@@ -60,7 +65,7 @@ class RunJobFenceTest {
         // Let the queued coroutine enter its non-cancellable fence wait before
         // cancelling it; otherwise it may be cancelled before its body starts.
         yield()
-        fence.cancelCurrent()
+        fence.cancelAll()
         yield()
 
         try {
@@ -72,5 +77,9 @@ class RunJobFenceTest {
         queued.join()
         assertTrue(completionCalled)
         assertFalse(queuedBlockStarted)
+    }
+
+    private fun runTimedTest(block: suspend CoroutineScope.() -> Unit) = runBlocking {
+        withTimeout(5_000) { block() }
     }
 }

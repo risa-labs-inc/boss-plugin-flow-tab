@@ -90,6 +90,7 @@ private val IconTint = Color(0xFFCDCDD4)
 private val ConfirmBg = Color(0xFF3A2E12)
 private val NoticeBg = Color(0xFF26456E)
 private val RunGreen = Color(0xFF2E7D32)
+private const val WAITING_FOR_PREVIOUS_NOTICE = "Waiting for the previous run to stop…"
 
 /**
  * Flow tab component: a node-based canvas where nodes are spawned from the left
@@ -257,7 +258,7 @@ class FlowTabComponent(
             state.isRunning = true
             val waitingForPrevious = runJobs.hasActiveRun()
             if (waitingForPrevious) {
-                state.notice = "Waiting for the previous run to stop…"
+                state.notice = WAITING_FOR_PREVIOUS_NOTICE
             }
             val runToken = runStatePersistence.beginRun()
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
@@ -276,7 +277,10 @@ class FlowTabComponent(
                         plan, edges,
                         humanize = realistic,
                         onVisibleTab = { id ->
-                            id?.let { tabId ->
+                            if (id == null) {
+                                visibleTabId.set(null)
+                            } else {
+                                val tabId = id
                                 if (runStatePersistence.isCurrent(runToken)) {
                                     visibleTabId.set(tabId)
                                     // Close a tab published across a concurrent Clear
@@ -333,12 +337,16 @@ class FlowTabComponent(
             }
             // This also runs when a queued job is cancelled before its block starts.
             job.invokeOnCompletion {
-                if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
+                if (runStatePersistence.isCurrent(runToken)) {
+                    state.isRunning = false
+                    if (state.notice == WAITING_FOR_PREVIOUS_NOTICE) state.notice = null
+                }
             }
         }
 
         fun stopRun() {
-            runJobs.cancelCurrent()
+            runJobs.cancelAll()
+            if (state.notice == WAITING_FOR_PREVIOUS_NOTICE) state.notice = null
         }
 
         // ---- export / import ----
@@ -383,8 +391,9 @@ class FlowTabComponent(
             // Invalidate before cancelling or mutating state so late executor callbacks
             // and the run finalizer cannot repopulate the cleared snapshot.
             val invalidation = runStatePersistence.invalidateRun()
-            runJobs.cancelCurrent()
+            runJobs.cancelAll()
             state.isRunning = false
+            state.notice = null
             visibleTabId.getAndSet(null)?.let { id ->
                 runCatching { context.activeTabsProvider?.closeTab(id) }
             }
@@ -394,7 +403,7 @@ class FlowTabComponent(
             state.selection = null
             // Component scope survives split collapse when closing the visible browser
             // tab disposes and recreates this composition; deletion must survive too.
-            coroutineScope.launch {
+            coroutineScope.launch(Dispatchers.IO) {
                 try {
                     val result = runStatePersistence.clearAfterInvalidation(invalidation) {
                         clearPersistedRunState(storage, config.id)

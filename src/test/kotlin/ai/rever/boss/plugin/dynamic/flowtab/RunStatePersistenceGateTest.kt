@@ -1,8 +1,10 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
@@ -11,7 +13,7 @@ import kotlin.test.assertTrue
 class RunStatePersistenceGateTest {
 
     @Test
-    fun `current run can persist`() = runBlocking {
+    fun `current run can persist`() = runTimedTest {
         val gate = RunStatePersistenceGate()
         val token = gate.beginRun()
         var saved = false
@@ -23,7 +25,7 @@ class RunStatePersistenceGateTest {
     }
 
     @Test
-    fun `clear removes a save already in progress`() = runBlocking {
+    fun `clear removes a save already in progress`() = runTimedTest {
         val gate = RunStatePersistenceGate()
         val token = gate.beginRun()
         val saveEntered = CompletableDeferred<Unit>()
@@ -48,7 +50,7 @@ class RunStatePersistenceGateTest {
     }
 
     @Test
-    fun `stale save queued behind clear is skipped`() = runBlocking {
+    fun `stale save queued behind clear is skipped`() = runTimedTest {
         val gate = RunStatePersistenceGate()
         val token = gate.beginRun()
         val invalidation = gate.invalidateRun()
@@ -82,7 +84,7 @@ class RunStatePersistenceGateTest {
     }
 
     @Test
-    fun `queued clear does not invalidate a newer run`() = runBlocking {
+    fun `queued clear does not invalidate a newer run`() = runTimedTest {
         val gate = RunStatePersistenceGate()
         gate.beginRun()
         val invalidation = gate.invalidateRun()
@@ -94,7 +96,7 @@ class RunStatePersistenceGateTest {
     }
 
     @Test
-    fun `queued clear does not delete a newer persisted run`() = runBlocking {
+    fun `queued clear does not delete a newer persisted run`() = runTimedTest {
         val gate = RunStatePersistenceGate()
         gate.beginRun()
         val invalidation = gate.invalidateRun()
@@ -109,7 +111,7 @@ class RunStatePersistenceGateTest {
     }
 
     @Test
-    fun `persist times out while clear owns the mutex`() = runBlocking {
+    fun `persist times out while clear owns the mutex`() = runTimedTest {
         val gate = RunStatePersistenceGate(persistTimeoutMs = 20, clearTimeoutMs = 1_000)
         gate.beginRun()
         val invalidation = gate.invalidateRun()
@@ -129,5 +131,9 @@ class RunStatePersistenceGateTest {
         assertFalse(persisted)
         finishClear.complete(Unit)
         clearJob.join()
+    }
+
+    private fun runTimedTest(block: suspend CoroutineScope.() -> Unit) = runBlocking {
+        withTimeout(5_000) { block() }
     }
 }
