@@ -43,8 +43,13 @@ import kotlin.test.assertTrue
  */
 class FlowControllerTest {
 
-    /** In-memory [PluginStorageProvider] — only the JSON/key surface is real. */
-    private class FakeStorage : PluginStorageProvider {
+    /**
+     * Mirrors the desktop provider's typed-key behavior: JSON reads/writes add
+     * `json:`, enumeration exposes that physical key, and contains/remove operate
+     * on raw keys. The last detail is intentionally host-compatible, even though
+     * it means contains("graph:...") does not find a JSON value.
+     */
+    private class DesktopStorage : PluginStorageProvider {
         val map = ConcurrentHashMap<String, String>()
         override fun getPluginId() = "test"
         override suspend fun putJson(key: String, jsonValue: String) { map["json:$key"] = jsonValue }
@@ -80,7 +85,7 @@ class FlowControllerTest {
     }
 
     private fun controller(
-        storage: PluginStorageProvider = FakeStorage(),
+        storage: PluginStorageProvider = DesktopStorage(),
         registry: NodeRegistry = builtinNodeRegistry(),
         runTimeoutMs: Long = FlowController.DEFAULT_RUN_TIMEOUT_MS,
     ) = FlowController(context(storage), { scope }, registry, runTimeoutMs)
@@ -89,7 +94,7 @@ class FlowControllerTest {
 
     @Test
     fun `createFlow seeds a v2 snapshot at graph colon tabId`() = runBlocking {
-        val storage = FakeStorage()
+        val storage = DesktopStorage()
         val fc = controller(storage)
         val tabId = fc.createFlow(FlowMeta(name = "Router", description = "test"))
         assertTrue(tabId.startsWith("flow-"))
@@ -152,6 +157,14 @@ class FlowControllerTest {
         val a = fc.createFlow()
         val b = fc.createFlow()
         assertEquals(setOf(a, b), fc.listFlows().toSet())
+    }
+
+    @Test
+    fun `listFlows also accepts providers that enumerate logical graph keys`() = runBlocking {
+        val storage = TestStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        assertEquals(listOf(tabId), fc.listFlows())
     }
 
     @Test
@@ -346,7 +359,7 @@ class FlowControllerTest {
     fun `persisted running job becomes failed when loaded after plugin restart`() = runBlocking {
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
-        val storage = FakeStorage()
+        val storage = DesktopStorage()
         val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         val registry = builtinNodeRegistry().also {
             it.register(
@@ -397,7 +410,7 @@ class FlowControllerTest {
 
     @Test
     fun `headless runs use the replacement sandbox scope after watchdog restart`() = runBlocking {
-        val storage = FakeStorage()
+        val storage = DesktopStorage()
         var sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         val ctx = object : PluginContext {
             override val panelRegistry = PanelRegistry()
@@ -421,7 +434,7 @@ class FlowControllerTest {
     @Test
     fun `dispatch into an already cancelled scope fails instead of staying running`() = runBlocking {
         val cancelledScope = CoroutineScope(Dispatchers.Default + SupervisorJob()).also { it.cancel() }
-        val storage = FakeStorage()
+        val storage = DesktopStorage()
         val fc = FlowController(context(storage), { cancelledScope })
         val tabId = fc.createFlow()
         fc.addNode(tabId, "TRIGGER")
@@ -433,7 +446,7 @@ class FlowControllerTest {
 
     @Test
     fun `run jobs are persisted to storage`() = runBlocking {
-        val storage = FakeStorage()
+        val storage = DesktopStorage()
         val fc = controller(storage)
         val tabId = fc.createFlow()
         fc.addNode(tabId, "TRIGGER", JsonObject(emptyMap()))
@@ -446,7 +459,7 @@ class FlowControllerTest {
 
     @Test
     fun `run status and result survive a fresh controller over the same storage`() = runBlocking {
-        val storage = FakeStorage()
+        val storage = DesktopStorage()
         val fc1 = controller(storage)
         val tabId = fc1.createFlow()
         val trig = fc1.addNode(tabId, "TRIGGER", JsonObject(emptyMap()))
@@ -490,7 +503,7 @@ class FlowControllerTest {
 
     @Test
     fun `headless controller resolves boss tool node kinds so MCP flow_run can use them`() = runBlocking {
-        val storage = FakeStorage()
+        val storage = DesktopStorage()
         val ctx = contextWithBossTool(storage, "demo")
         val controller = buildHeadlessController(ctx, PromptRegistry(storage), external = null, scope = scope)
         // The tools StateFlow collector registers the kind asynchronously; wait for it.

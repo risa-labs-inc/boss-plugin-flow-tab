@@ -139,6 +139,7 @@ class FlowController(
             .map { it.removePrefix(JSON_STORAGE_PREFIX) }
             .filter { it.startsWith(GRAPH_PREFIX) }
             .map { it.removePrefix(GRAPH_PREFIX) }
+            .filter { it.isNotEmpty() }
             .distinct()
             .sorted()
 
