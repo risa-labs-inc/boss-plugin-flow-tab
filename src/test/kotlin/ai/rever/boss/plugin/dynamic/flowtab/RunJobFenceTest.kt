@@ -13,7 +13,11 @@ class RunJobFenceTest {
 
     @Test
     fun `cancelling with no current run is a no-op`() = runBlocking {
-        RunJobFence(this).cancelCurrent()
+        val fence = RunJobFence(this)
+
+        fence.cancelCurrent()
+
+        assertFalse(fence.hasActiveRun())
     }
 
     @Test

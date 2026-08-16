@@ -255,11 +255,18 @@ class FlowTabComponent(
             state.clearRun()
             state.notice = null
             state.isRunning = true
+            val waitingForPrevious = runJobs.hasActiveRun()
+            if (waitingForPrevious) {
+                state.notice = "Waiting for the previous run to stop…"
+            }
             val runToken = runStatePersistence.beginRun()
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
             val job = runJobs.launch(Dispatchers.Default) {
                 try {
+                    if (waitingForPrevious && runStatePersistence.isCurrent(runToken)) {
+                        state.notice = null
+                    }
                     // Write status straight from the run thread. These are observable
                     // snapshot-state writes, so Compose picks them up on the next frame
                     // and the canvas updates live. (Marshalling them onto the Main scope
@@ -303,6 +310,9 @@ class FlowTabComponent(
                         state.runError = e.message ?: e.toString()
                     }
                 } finally {
+                    // Give ordinary Stop immediate feedback. invokeOnCompletion below
+                    // remains the fallback for a queued job cancelled before this block.
+                    if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
                     // Persist the run results (capped) so they survive reopening.
                     try {
                         val persisted = runStatePersistence.persistIfCurrent(runToken) {
@@ -322,8 +332,6 @@ class FlowTabComponent(
                 }
             }
             // This also runs when a queued job is cancelled before its block starts.
-            // It intentionally follows the bounded final save, so Stop can remain
-            // visible for up to five seconds while run-state persistence finishes.
             job.invokeOnCompletion {
                 if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
             }
@@ -384,7 +392,9 @@ class FlowTabComponent(
             state.edges.clear()
             state.clearRun()
             state.selection = null
-            uiScope.launch {
+            // Component scope survives split collapse when closing the visible browser
+            // tab disposes and recreates this composition; deletion must survive too.
+            coroutineScope.launch {
                 try {
                     val result = runStatePersistence.clearAfterInvalidation(invalidation) {
                         clearPersistedRunState(storage, config.id)
