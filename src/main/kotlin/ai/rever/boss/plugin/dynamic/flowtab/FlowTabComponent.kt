@@ -72,7 +72,6 @@ import com.arkivanov.essenty.lifecycle.Lifecycle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -138,7 +137,7 @@ class FlowTabComponent(
     // Bundled starter templates (scrape / agent), enumerated from resources/templates
     // via its index. Read-only; instantiated into a new tab from the gallery overlay.
     private val templateCatalog = TemplateCatalog()
-    private var runJob: Job? = null
+    private val runJobs = RunJobFence(coroutineScope)
     private val runStatePersistence = RunStatePersistenceGate()
     private var initialized = false
     // "Realistic" mode: pace the run with human-like delays between steps, so it's
@@ -257,7 +256,7 @@ class FlowTabComponent(
             val runToken = runStatePersistence.beginRun()
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
-            runJob = coroutineScope.launch(Dispatchers.Default) {
+            runJobs.launch(Dispatchers.Default) {
                 try {
                     // Write status straight from the run thread. These are observable
                     // snapshot-state writes, so Compose picks them up on the next frame
@@ -268,12 +267,20 @@ class FlowTabComponent(
                         plan, edges,
                         humanize = realistic,
                         onVisibleTab = { id ->
-                            if (runStatePersistence.isCurrent(runToken)) visibleTabId = id
+                            if (runStatePersistence.isCurrent(runToken)) {
+                                visibleTabId = id
+                            } else {
+                                id?.let { staleId ->
+                                    runCatching { context.activeTabsProvider?.closeTab(staleId) }
+                                }
+                            }
                         },
                         // Seed this flow's own id so a lanager pointing back at it is caught
                         // as a cycle at depth 0, not only one level deeper (red-team S7).
                         ancestry = setOf(config.id),
                     ) { id, run ->
+                        // A check/write can straddle Clear, but orphaned ids do not render
+                        // and the separately gated finalizer cannot persist them.
                         if (runStatePersistence.isCurrent(runToken)) state.runStates[id] = run
                     }
                 } catch (ce: CancellationException) {
@@ -285,20 +292,24 @@ class FlowTabComponent(
                 } finally {
                     if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
                     // Persist the run results (capped) so they survive reopening.
-                    runCatching {
+                    try {
                         runStatePersistence.persistIfCurrent(runToken) {
                             storage?.putJson(
                                 "$RUN_STATE_PREFIX${config.id}",
                                 json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
                             )
                         }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        // Run-state persistence is best-effort, as before.
                     }
                 }
             }
         }
 
         fun stopRun() {
-            runJob?.cancel()
+            runJobs.cancelCurrent()
         }
 
         // ---- export / import ----
@@ -342,17 +353,18 @@ class FlowTabComponent(
         fun doClear() {
             // Invalidate before cancelling or mutating state so late executor callbacks
             // and the run finalizer cannot repopulate the cleared snapshot.
-            runStatePersistence.invalidateRun()
-            runJob?.cancel()
-            runJob = null
+            val invalidation = runStatePersistence.invalidateRun()
+            runJobs.cancelCurrent()
             state.isRunning = false
+            visibleTabId?.let { id -> runCatching { context.activeTabsProvider?.closeTab(id) } }
+            visibleTabId = null
             state.nodes.clear()
             state.edges.clear()
             state.clearRun()
             state.selection = null
             uiScope.launch {
                 try {
-                    runStatePersistence.clear {
+                    runStatePersistence.clearAfterInvalidation(invalidation) {
                         clearPersistedRunState(storage, config.id)
                     }
                 } catch (cancelled: CancellationException) {
