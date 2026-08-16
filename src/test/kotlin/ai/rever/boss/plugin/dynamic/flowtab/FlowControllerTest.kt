@@ -47,8 +47,8 @@ class FlowControllerTest {
     private class FakeStorage : PluginStorageProvider {
         val map = ConcurrentHashMap<String, String>()
         override fun getPluginId() = "test"
-        override suspend fun putJson(key: String, jsonValue: String) { map[key] = jsonValue }
-        override suspend fun getJson(key: String): String? = map[key]
+        override suspend fun putJson(key: String, jsonValue: String) { map["json:$key"] = jsonValue }
+        override suspend fun getJson(key: String): String? = map["json:$key"]
         override suspend fun contains(key: String): Boolean = map.containsKey(key)
         override suspend fun remove(key: String) { map.remove(key) }
         override suspend fun getAllKeys(): Set<String> = map.keys.toSet()
@@ -93,7 +93,7 @@ class FlowControllerTest {
         val fc = controller(storage)
         val tabId = fc.createFlow(FlowMeta(name = "Router", description = "test"))
         assertTrue(tabId.startsWith("flow-"))
-        assertTrue(storage.map.containsKey("graph:$tabId"))
+        assertTrue(storage.map.containsKey("json:graph:$tabId"))
         val snap = fc.getFlow(tabId)!!
         assertEquals(SUPPORTED_SCHEMA_VERSION, snap.schemaVersion)
         assertEquals("Router", snap.metadata?.name)
@@ -439,7 +439,7 @@ class FlowControllerTest {
         fc.addNode(tabId, "TRIGGER", JsonObject(emptyMap()))
         val runId = fc.startRun(tabId)
         awaitTerminal(fc, runId)
-        assertTrue(storage.map.keys.any { it == "run:$runId" })
+        assertTrue(storage.map.keys.any { it == "json:run:$runId" })
     }
 
     // ---- S2: run durability across controller instances ---------------------
