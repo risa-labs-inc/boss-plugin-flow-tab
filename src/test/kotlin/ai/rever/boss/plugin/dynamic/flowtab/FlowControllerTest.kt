@@ -17,10 +17,8 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -28,7 +26,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import java.util.concurrent.ConcurrentHashMap
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -42,35 +39,6 @@ import kotlin.test.assertTrue
  * — all against an in-memory fake store, no live boss server (F1 async, F5 storage).
  */
 class FlowControllerTest {
-
-    /**
-     * Mirrors the desktop provider's typed-key behavior: JSON reads/writes add
-     * `json:`, enumeration exposes that physical key, and contains/remove operate
-     * on raw keys. The last detail is intentionally host-compatible, even though
-     * it means contains("graph:...") does not find a JSON value.
-     */
-    private class DesktopStorage : PluginStorageProvider {
-        val map = ConcurrentHashMap<String, String>()
-        override fun getPluginId() = "test"
-        override suspend fun putJson(key: String, jsonValue: String) { map["json:$key"] = jsonValue }
-        override suspend fun getJson(key: String): String? = map["json:$key"]
-        override suspend fun contains(key: String): Boolean = map.containsKey(key)
-        override suspend fun remove(key: String) { map.remove(key) }
-        override suspend fun getAllKeys(): Set<String> = map.keys.toSet()
-        override suspend fun clear() { map.clear() }
-        override suspend fun putString(key: String, value: String) { map[key] = value }
-        override suspend fun getString(key: String, defaultValue: String?): String? = map[key] ?: defaultValue
-        override suspend fun putInt(key: String, value: Int) {}
-        override suspend fun getInt(key: String, defaultValue: Int): Int = defaultValue
-        override suspend fun putLong(key: String, value: Long) {}
-        override suspend fun getLong(key: String, defaultValue: Long): Long = defaultValue
-        override suspend fun putBoolean(key: String, value: Boolean) {}
-        override suspend fun getBoolean(key: String, defaultValue: Boolean): Boolean = defaultValue
-        override suspend fun putFloat(key: String, value: Float) {}
-        override suspend fun getFloat(key: String, defaultValue: Float): Float = defaultValue
-        override fun observeString(key: String): Flow<String> = emptyFlow()
-        override fun observeChanges(): Flow<String> = emptyFlow()
-    }
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 

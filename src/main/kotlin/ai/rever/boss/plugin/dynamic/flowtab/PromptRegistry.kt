@@ -44,10 +44,16 @@ class PromptRegistry(private val storage: PluginStorageProvider?) {
         if (prompt.id !in ids) writeIndex(ids + prompt.id)
     }
 
-    /** Remove [id]'s blob and its index entry (no-op if unknown). */
+    /**
+     * Remove [id]'s blob and its index entry (no-op if unknown). The index is
+     * updated only after verified blob removal, so a storage failure leaves the
+     * prompt visible instead of hiding an orphan that cannot be deleted.
+     *
+     * @throws IllegalStateException if the host leaves the JSON blob behind.
+     */
     suspend fun delete(id: String) {
         val s = storage ?: return
-        s.remove(key(id))
+        s.removeJsonValue(key(id))
         val ids = readIndex()
         if (id in ids) writeIndex(ids - id)
     }

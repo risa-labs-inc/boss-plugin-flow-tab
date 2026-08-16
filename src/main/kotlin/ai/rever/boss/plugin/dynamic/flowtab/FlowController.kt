@@ -350,7 +350,6 @@ class FlowController(
 
     companion object {
         const val STORAGE_NAMESPACE = "ai.rever.boss.plugin.dynamic.flowtab"
-        private const val JSON_STORAGE_PREFIX = "json:"
         const val GRAPH_PREFIX = "graph:"
         const val RUN_PREFIX = "run:"
         const val DEFAULT_RUN_TIMEOUT_MS = 15 * 60 * 1000L
