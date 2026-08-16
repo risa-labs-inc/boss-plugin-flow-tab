@@ -73,13 +73,11 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlin.math.roundToInt
@@ -141,6 +139,7 @@ class FlowTabComponent(
     // via its index. Read-only; instantiated into a new tab from the gallery overlay.
     private val templateCatalog = TemplateCatalog()
     private var runJob: Job? = null
+    private val runStatePersistence = RunStatePersistenceGate()
     private var initialized = false
     // "Realistic" mode: pace the run with human-like delays between steps, so it's
     // watchable and mimics a person driving the page. Observed by the toolbar.
@@ -255,6 +254,7 @@ class FlowTabComponent(
             state.clearRun()
             state.notice = null
             state.isRunning = true
+            val runToken = runStatePersistence.beginRun()
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
             runJob = coroutineScope.launch(Dispatchers.Default) {
@@ -267,20 +267,26 @@ class FlowTabComponent(
                     executor.run(
                         plan, edges,
                         humanize = realistic,
-                        onVisibleTab = { id -> visibleTabId = id },
+                        onVisibleTab = { id ->
+                            if (runStatePersistence.isCurrent(runToken)) visibleTabId = id
+                        },
                         // Seed this flow's own id so a lanager pointing back at it is caught
                         // as a cycle at depth 0, not only one level deeper (red-team S7).
                         ancestry = setOf(config.id),
-                    ) { id, run -> state.runStates[id] = run }
+                    ) { id, run ->
+                        if (runStatePersistence.isCurrent(runToken)) state.runStates[id] = run
+                    }
                 } catch (ce: CancellationException) {
                     // stopped by user
                 } catch (e: Exception) {
-                    state.runError = e.message ?: e.toString()
+                    if (runStatePersistence.isCurrent(runToken)) {
+                        state.runError = e.message ?: e.toString()
+                    }
                 } finally {
-                    state.isRunning = false
+                    if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
                     // Persist the run results (capped) so they survive reopening.
-                    withContext(NonCancellable) {
-                        runCatching {
+                    runCatching {
+                        runStatePersistence.persistIfCurrent(runToken) {
                             storage?.putJson(
                                 "$RUN_STATE_PREFIX${config.id}",
                                 json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
@@ -334,13 +340,21 @@ class FlowTabComponent(
         }
 
         fun doClear() {
+            // Invalidate before cancelling or mutating state so late executor callbacks
+            // and the run finalizer cannot repopulate the cleared snapshot.
+            runStatePersistence.invalidateRun()
+            runJob?.cancel()
+            runJob = null
+            state.isRunning = false
             state.nodes.clear()
             state.edges.clear()
             state.clearRun()
             state.selection = null
             uiScope.launch {
                 try {
-                    clearPersistedRunState(storage, config.id)
+                    runStatePersistence.clear {
+                        clearPersistedRunState(storage, config.id)
+                    }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {
