@@ -133,8 +133,14 @@ class FlowController(
     /** Ids of every flow persisted in storage (UI- or controller-authored). */
     suspend fun listFlows(): List<String> =
         storage?.getAllKeys().orEmpty()
+            // Desktop storage enumerates the physical key written by putJson
+            // (`json:graph:<tabId>`), while other providers may expose the logical
+            // key (`graph:<tabId>`). Normalize both forms before filtering.
+            .map { it.removePrefix(JSON_STORAGE_PREFIX) }
             .filter { it.startsWith(GRAPH_PREFIX) }
             .map { it.removePrefix(GRAPH_PREFIX) }
+            .filter { it.isNotEmpty() }
+            .distinct()
             .sorted()
 
     // ---- async run jobs (F1) ------------------------------------------------
@@ -344,6 +350,7 @@ class FlowController(
 
     companion object {
         const val STORAGE_NAMESPACE = "ai.rever.boss.plugin.dynamic.flowtab"
+        private const val JSON_STORAGE_PREFIX = "json:"
         const val GRAPH_PREFIX = "graph:"
         const val RUN_PREFIX = "run:"
         const val DEFAULT_RUN_TIMEOUT_MS = 15 * 60 * 1000L
