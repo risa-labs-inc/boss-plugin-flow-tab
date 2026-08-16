@@ -136,7 +136,7 @@ class FlowTabComponent(
     private val prompts = PromptRegistry(
         runCatching { context.pluginStorageFactory?.createStorage(FlowController.STORAGE_NAMESPACE) }.getOrNull()
     )
-    private val controller = FlowController(context, coroutineScope, registry)
+    private val controller = FlowController(context, { coroutineScope }, registry)
     // Bundled starter templates (scrape / agent), enumerated from resources/templates
     // via its index. Read-only; instantiated into a new tab from the gallery overlay.
     private val templateCatalog = TemplateCatalog()
@@ -166,6 +166,7 @@ class FlowTabComponent(
         lifecycle.subscribe(
             object : Lifecycle.Callbacks {
                 override fun onDestroy() {
+                    controller.dispose()
                     coroutineScope.cancel()
                 }
             }

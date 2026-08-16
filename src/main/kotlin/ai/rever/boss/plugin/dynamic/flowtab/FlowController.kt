@@ -1,9 +1,17 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.PluginContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -39,21 +47,30 @@ data class RunJob(
  * with no tab open; a live tab, if any, re-reads storage on the Main thread.
  *
  * Runs are asynchronous: [startRun] returns a runId and executes the flow on
- * [scope] via the UI-free [FlowExecutor]. Jobs are held in memory and persisted at
+ * [scopeProvider] via the UI-free [FlowExecutor]. Jobs are held in memory and persisted at
  * `run:<runId>` so status/result survive a reload.
  */
 class FlowController(
     private val context: PluginContext,
-    private val scope: CoroutineScope = context.pluginScope,
+    /** Resolve the scope at dispatch time. A sandbox watchdog restart replaces
+     * [PluginContext.pluginScope], while the UI supplies its stable tab scope. */
+    private val scopeProvider: () -> CoroutineScope = { context.pluginScope },
     /** Kind-id → spec map used to lay out new nodes and dispatch runs. Threading the
      *  same instance the tab uses keeps tool/agent kinds resolvable. */
     val registry: NodeRegistry = builtinNodeRegistry(),
+    /** Hard ceiling for a headless run. An independent monitor publishes FAILED at
+     *  this deadline even when a node is stuck in a non-cooperative host call. */
+    private val runTimeoutMs: Long = DEFAULT_RUN_TIMEOUT_MS,
 ) {
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; encodeDefaults = true }
     private val storage = runCatching {
         context.pluginStorageFactory?.createStorage(STORAGE_NAMESPACE)
     }.getOrNull()
     private val jobs = ConcurrentHashMap<String, RunJob>()
+    private val persistMutex = Mutex()
+    /** Independent from pluginScope so it can observe that scope being replaced, but
+     * still explicitly owned by this controller and cancelled from [dispose]. */
+    private val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     // ---- authoring (storage-seated) -----------------------------------------
 
@@ -123,7 +140,7 @@ class FlowController(
     // ---- async run jobs (F1) ------------------------------------------------
 
     /**
-     * Launch flow [tabId] on [scope] and return a runId immediately. The run drives
+     * Launch flow [tabId] on [scopeProvider] and return a runId immediately. The run drives
      * the headless [FlowExecutor]; poll [runStatus]/[runResult] for progress. A missing
      * flow or an executor throw becomes a [RunJobState.FAILED] job (never a crash); a
      * run in which any node errors is FAILED too, but always reaches a terminal state.
@@ -131,16 +148,32 @@ class FlowController(
     fun startRun(tabId: String, depth: Int = 0, ancestry: Set<String> = emptySet()): String {
         val runId = "run-${UUID.randomUUID()}"
         jobs[runId] = RunJob(runId, tabId, RunJobState.RUNNING)
-        scope.launch(Dispatchers.Default) {
-            val job = runCatching {
+        val states = ConcurrentHashMap<String, NodeRun>()
+        val execution = scopeProvider().launch(Dispatchers.Default) {
+            // Persist RUNNING before executing so a reload can still diagnose an in-flight run.
+            persistRun(jobs[runId] ?: RunJob(runId, tabId, RunJobState.RUNNING))
+            val candidate = try {
                 val snap = getFlow(tabId) ?: throw IllegalStateException("No flow '$tabId'")
                 val plan = snap.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
-                val states = ConcurrentHashMap<String, NodeRun>()
                 // This flow is now on the call stack: a nested lanager pointing back at it
                 // is a cycle. Depth is threaded so the nesting bound can be enforced.
                 FlowExecutor(context, registry).run(
                     plan, snap.edges, depth = depth, ancestry = ancestry + tabId,
-                ) { id, r -> states[id] = r }
+                ) { id, r ->
+                    states[id] = r
+                    // flow_result must be a non-blocking snapshot even while the
+                    // run is active. Do not let late output overwrite a watchdog result.
+                    jobs.computeIfPresent(runId) { _, current ->
+                        if (current.state == RunJobState.RUNNING) {
+                            current.copy(nodes = states.toRunSnapshot().states)
+                        } else {
+                            current
+                        }
+                    }
+                    // Serialize storage writes through persistRun so a delayed live
+                    // snapshot can never overwrite a terminal watchdog verdict.
+                    monitorScope.launch { jobs[runId]?.let { persistRun(it) } }
+                }
                 val firstError = states.values.firstOrNull { it.status == RunStatus.ERROR }
                 RunJob(
                     runId = runId,
@@ -149,11 +182,80 @@ class FlowController(
                     error = firstError?.error,
                     nodes = states.toRunSnapshot().states,
                 )
-            }.getOrElse { RunJob(runId, tabId, RunJobState.FAILED, it.message ?: it.toString()) }
-            jobs[runId] = job
-            runCatching { storage?.putJson(runKey(runId), json.encodeToString(RunJob.serializer(), job)) }
+            } catch (cancelled: CancellationException) {
+                val message = cancelled.message?.let { "Flow run cancelled: $it" }
+                    ?: "Flow run cancelled before completion"
+                failedRun(runId, tabId, states, message)
+            } catch (t: Throwable) {
+                failedRun(runId, tabId, states, t.message ?: t.toString())
+            }
+            val published = publishTerminalIfRunning(runId, candidate)
+            persistRun(published)
+        }
+
+        // This monitor is deliberately not a child of execution. join() is cancellable,
+        // so its timeout fires even if execution is stuck in a non-suspending host call.
+        monitorScope.launch {
+            val completed = withTimeoutOrNull(runTimeoutMs) {
+                execution.join()
+                true
+            } == true
+            if (!completed) {
+                val message = "Flow exceeded its ${runTimeoutMs}ms run timeout"
+                transitionToFailed(runId, tabId, states, message)?.let { persistRun(it) }
+                execution.cancel(CancellationException(message))
+            } else {
+                // Covers launch() against an already-cancelled scope and any unexpected
+                // throw that escaped execution before it could publish a terminal result.
+                val message = if (execution.isCancelled) {
+                    "Flow run cancelled before dispatch"
+                } else {
+                    "Flow run ended without publishing a result"
+                }
+                transitionToFailed(runId, tabId, states, message)?.let { persistRun(it) }
+            }
         }
         return runId
+    }
+
+    /** Release independent run monitors when the owning tab/plugin is destroyed. */
+    fun dispose() {
+        monitorScope.cancel()
+    }
+
+    private fun publishTerminalIfRunning(runId: String, candidate: RunJob): RunJob =
+        jobs.computeIfPresent(runId) { _, current ->
+            if (current.state == RunJobState.RUNNING) candidate else current
+        } ?: candidate
+
+    private fun transitionToFailed(
+        runId: String,
+        tabId: String,
+        states: ConcurrentHashMap<String, NodeRun>,
+        message: String,
+    ): RunJob? {
+        var transitioned: RunJob? = null
+        jobs.computeIfPresent(runId) { _, current ->
+            if (current.state == RunJobState.RUNNING) {
+                failedRun(runId, tabId, states, message).also { transitioned = it }
+            } else {
+                current
+            }
+        }
+        return transitioned
+    }
+
+    private suspend fun persistRun(job: RunJob) {
+        withContext(NonCancellable) {
+            persistMutex.withLock {
+                runCatching {
+                    // Always serialize the newest in-memory snapshot. Coroutine
+                    // scheduling may otherwise let an older live write run last.
+                    val safeJob = jobs[job.runId] ?: job
+                    storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), safeJob))
+                }
+            }
+        }
     }
 
     /**
@@ -169,13 +271,65 @@ class FlowController(
 
     private suspend fun loadJob(runId: String): RunJob? {
         val raw = storage?.getJson(runKey(runId)) ?: return null
-        return runCatching { json.decodeFromString(RunJob.serializer(), raw) }.getOrNull()
+        val loaded = runCatching { json.decodeFromString(RunJob.serializer(), raw) }.getOrNull()
+            ?: return null
+        if (loaded.state != RunJobState.RUNNING) return loaded
+
+        // An in-memory monitor is the only owner capable of completing a RUNNING job.
+        // Reaching storage fallback means that owner was lost during a plugin reload.
+        val message = "Flow run did not survive plugin reload"
+        val savedNodes = loaded.nodes.mapValues { (_, node) ->
+            if (node.status == RunStatus.RUNNING) {
+                node.copy(status = RunStatus.ERROR, error = message)
+            } else {
+                node
+            }
+        }
+        val notStarted = "Skipped — run ended during plugin reload"
+        val graphNodes = getFlow(loaded.tabId)?.nodes.orEmpty().associate { node ->
+            node.id to (
+                savedNodes[node.id] ?: NodeRunSnap(
+                    status = RunStatus.SKIPPED,
+                    error = message,
+                    logs = listOf(notStarted),
+                    skipReason = notStarted,
+                )
+            )
+        }
+        val failed = loaded.copy(
+            state = RunJobState.FAILED,
+            error = message,
+            nodes = graphNodes + savedNodes,
+        )
+        return failed
     }
 
     // ---- internals ----------------------------------------------------------
 
     private suspend fun write(tabId: String, snapshot: GraphSnapshot) {
         storage?.putJson(graphKey(tabId), json.encodeToString(GraphSnapshot.serializer(), snapshot))
+    }
+
+    private fun failedRun(
+        runId: String,
+        tabId: String,
+        states: ConcurrentHashMap<String, NodeRun>,
+        message: String,
+    ): RunJob {
+        val terminalNodes = states.toRunSnapshot().states.mapValues { (_, node) ->
+            if (node.status == RunStatus.RUNNING) {
+                node.copy(status = RunStatus.ERROR, error = message)
+            } else {
+                node
+            }
+        }
+        return RunJob(
+            runId = runId,
+            tabId = tabId,
+            state = RunJobState.FAILED,
+            error = message,
+            nodes = terminalNodes,
+        )
     }
 
     private fun uniqueTitle(base: String, taken: Set<String>): String {
@@ -192,6 +346,7 @@ class FlowController(
         const val STORAGE_NAMESPACE = "ai.rever.boss.plugin.dynamic.flowtab"
         const val GRAPH_PREFIX = "graph:"
         const val RUN_PREFIX = "run:"
+        const val DEFAULT_RUN_TIMEOUT_MS = 15 * 60 * 1000L
     }
 }
 
@@ -208,16 +363,21 @@ fun buildHeadlessController(
     context: PluginContext,
     prompts: PromptRegistry,
     external: ExternalMcpManager?,
-    scope: CoroutineScope = context.pluginScope,
+    scope: CoroutineScope? = null,
 ): FlowController {
-    val controller = FlowController(context, scope)
+    val initialScope = scope ?: context.pluginScope
+    val scopeProvider: () -> CoroutineScope = { scope ?: context.pluginScope }
+    val controller = FlowController(
+        context = context,
+        scopeProvider = scopeProvider,
+    )
     // Host tools -> tool:boss:* kinds (the fix): reactively synced onto this registry.
-    syncBossTools(context, controller.registry, scope)
+    syncBossTools(context, controller.registry, initialScope)
     // Make agent + lanager kinds runnable in headless (MCP-driven) runs too, sharing
     // the controller's registry so a lanager's sub-run resolves the same kinds.
     controller.registry.register(defaultAgentNodeSpec(context, prompts, external))
     controller.registry.register(lanagerNodeSpec(controller))
     // Surface external MCP tools (flag-gated inside) as tool:ext:<server>/* kinds.
-    external?.let { syncExternalMcpTools(it, controller.registry, scope) }
+    external?.let { syncExternalMcpTools(it, controller.registry, initialScope) }
     return controller
 }
