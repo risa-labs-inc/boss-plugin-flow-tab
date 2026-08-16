@@ -1,6 +1,10 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.io.IOException
 import kotlin.test.Test
@@ -37,10 +41,10 @@ class PluginStorageCompatTest {
         }
         storage.putJson("runstate:flow-1", "{}")
 
-        assertFailsWith<IllegalStateException> {
+        val failure = assertFailsWith<IllegalStateException> {
             storage.removeJsonValue("runstate:flow-1")
         }
-        Unit
+        assertEquals("JSON value 'runstate:flow-1' remains after removal", failure.message)
     }
 
     @Test
@@ -57,7 +61,45 @@ class PluginStorageCompatTest {
             storage.removeJsonValue("runstate:flow-1")
         }
         assertEquals("disk write failed", failure.suppressed.single().message)
-        Unit
+    }
+
+    @Test
+    fun `removeJsonValue tolerates a rejected redundant key when deletion succeeds`() = runBlocking {
+        val storage = object : DesktopStorage() {
+            override suspend fun remove(key: String) {
+                if (!key.startsWith(JSON_STORAGE_PREFIX)) throw IOException("logical key rejected")
+                super.remove(key)
+            }
+        }
+        storage.putJson("runstate:flow-1", "{}")
+
+        storage.removeJsonValue("runstate:flow-1")
+
+        assertNull(storage.getJson("runstate:flow-1"))
+    }
+
+    @Test
+    fun `clearPersistedRunState is non-cancellable once removal starts`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val storage = object : DesktopStorage() {
+            override suspend fun remove(key: String) {
+                entered.complete(Unit)
+                delay(20)
+                super.remove(key)
+            }
+        }
+        storage.putJson("runstate:flow-1", "{}")
+        val job = launch { clearPersistedRunState(storage, "flow-1") }
+        entered.await()
+
+        job.cancelAndJoin()
+
+        assertNull(storage.getJson("runstate:flow-1"))
+    }
+
+    @Test
+    fun `clearPersistedRunState accepts a missing storage provider`() = runBlocking {
+        clearPersistedRunState(null, "flow-1")
     }
 
     @Test
@@ -68,9 +110,9 @@ class PluginStorageCompatTest {
             }
         }
 
-        assertFailsWith<CancellationException> {
+        val failure = assertFailsWith<CancellationException> {
             storage.removeJsonValue("runstate:flow-1")
         }
-        Unit
+        assertEquals("cancelled", failure.message)
     }
 }

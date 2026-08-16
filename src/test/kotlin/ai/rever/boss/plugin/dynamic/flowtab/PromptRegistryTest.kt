@@ -4,6 +4,7 @@ import ai.rever.boss.plugin.api.PluginStorageProvider
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -61,7 +62,7 @@ class PromptRegistryTest {
         reg.upsert(sample("b"))
         reg.delete("a")
         assertNull(reg.get("a"))
-        assertTrue(!storage.map.containsKey("${JSON_STORAGE_PREFIX}prompt:a"))
+        assertFalse(storage.map.containsKey("${JSON_STORAGE_PREFIX}prompt:a"))
         assertEquals(listOf("b"), reg.list().map { it.id })
     }
 

@@ -199,7 +199,7 @@ class FlowTabComponent(
                     state.selection = null
                 }
                 // Restore the last run's per-node status/output, if any.
-                runCatching { storage?.getJson("runstate:${config.id}") }.getOrNull()?.let { rs ->
+                runCatching { storage?.getJson("$RUN_STATE_PREFIX${config.id}") }.getOrNull()?.let { rs ->
                     runCatching {
                         state.runStates.putAll(json.decodeFromString(RunSnapshot.serializer(), rs).toRuns())
                     }
@@ -282,7 +282,7 @@ class FlowTabComponent(
                     withContext(NonCancellable) {
                         runCatching {
                             storage?.putJson(
-                                "runstate:${config.id}",
+                                "$RUN_STATE_PREFIX${config.id}",
                                 json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
                             )
                         }
@@ -338,7 +338,15 @@ class FlowTabComponent(
             state.edges.clear()
             state.clearRun()
             state.selection = null
-            uiScope.launch { runCatching { clearPersistedRunState(storage, config.id) } }
+            uiScope.launch {
+                try {
+                    clearPersistedRunState(storage, config.id)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    state.notice = "Flow cleared, but saved run state could not be removed: ${failure.message}"
+                }
+            }
         }
 
         // Import an RPA Recorder config → a new tab with a chain of browser nodes.
