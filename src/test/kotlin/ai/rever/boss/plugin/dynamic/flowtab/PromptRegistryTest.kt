@@ -61,8 +61,20 @@ class PromptRegistryTest {
         reg.upsert(sample("b"))
         reg.delete("a")
         assertNull(reg.get("a"))
-        assertTrue(!storage.map.containsKey("json:prompt:a"))
+        assertTrue(!storage.map.containsKey("${JSON_STORAGE_PREFIX}prompt:a"))
         assertEquals(listOf("b"), reg.list().map { it.id })
+    }
+
+    @Test
+    fun `delete also supports logical-key storage providers`() = runBlocking {
+        val storage = TestStorage()
+        val reg = PromptRegistry(storage)
+        reg.upsert(sample("a"))
+
+        reg.delete("a")
+
+        assertNull(reg.get("a"))
+        assertTrue(reg.list().isEmpty())
     }
 
     @Test

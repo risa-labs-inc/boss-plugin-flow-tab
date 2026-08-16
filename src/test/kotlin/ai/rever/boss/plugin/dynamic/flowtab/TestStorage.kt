@@ -38,11 +38,11 @@ class TestStorage : PluginStorageProvider {
  * enumeration, contains, and remove operate on the raw backing keys exactly as
  * the current desktop host does.
  */
-class DesktopStorage : PluginStorageProvider {
+open class DesktopStorage : PluginStorageProvider {
     val map = ConcurrentHashMap<String, String>()
     override fun getPluginId() = "test-desktop"
-    override suspend fun putJson(key: String, jsonValue: String) { map["json:$key"] = jsonValue }
-    override suspend fun getJson(key: String): String? = map["json:$key"]
+    override suspend fun putJson(key: String, jsonValue: String) { map["$JSON_STORAGE_PREFIX$key"] = jsonValue }
+    override suspend fun getJson(key: String): String? = map["$JSON_STORAGE_PREFIX$key"]
     override suspend fun contains(key: String): Boolean = map.containsKey(key)
     override suspend fun remove(key: String) { map.remove(key) }
     override suspend fun getAllKeys(): Set<String> = map.keys.toSet()
