@@ -123,6 +123,15 @@ build.gradle.kts   → Build config + version (single source of truth)
 - Persistence: graph JSON saved per-tab via `context.pluginStorageFactory`.
 - Null-safe provider access: providers may be null, UI must handle gracefully.
 
+### Plugin storage JSON keys
+
+The current desktop `PluginStorageProvider` stores `putJson("key", value)` under the physical
+key `json:key`. `getJson` adds that prefix, but `getAllKeys`, `contains`, and `remove` operate on
+raw backing keys. Consequently, normalize the optional `json:` prefix when enumerating and use
+`removeJsonValue` when deleting JSON so both desktop-shaped and logical providers are supported.
+Tests that exercise this behavior should use `DesktopStorage`; `TestStorage` intentionally models
+a provider that exposes logical keys.
+
 ## Version Management
 
 **`build.gradle.kts` is the single source of truth for version.**

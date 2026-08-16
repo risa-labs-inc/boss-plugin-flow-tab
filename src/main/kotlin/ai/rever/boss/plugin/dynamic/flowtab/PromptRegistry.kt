@@ -47,7 +47,7 @@ class PromptRegistry(private val storage: PluginStorageProvider?) {
     /** Remove [id]'s blob and its index entry (no-op if unknown). */
     suspend fun delete(id: String) {
         val s = storage ?: return
-        s.remove(key(id))
+        s.removeJsonValue(key(id))
         val ids = readIndex()
         if (id in ids) writeIndex(ids - id)
     }

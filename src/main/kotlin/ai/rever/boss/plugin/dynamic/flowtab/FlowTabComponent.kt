@@ -338,7 +338,7 @@ class FlowTabComponent(
             state.edges.clear()
             state.clearRun()
             state.selection = null
-            uiScope.launch { runCatching { storage?.remove("runstate:${config.id}") } }
+            uiScope.launch { runCatching { storage?.removeJsonValue("runstate:${config.id}") } }
         }
 
         // Import an RPA Recorder config → a new tab with a chain of browser nodes.

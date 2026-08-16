@@ -1,10 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.PluginStorageProvider
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
-import java.util.concurrent.ConcurrentHashMap
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
@@ -19,32 +16,6 @@ import kotlin.test.assertTrue
  */
 class PromptRegistryTest {
 
-    /** Minimal in-memory [PluginStorageProvider] — only the JSON/key surface the
-     *  registry uses is real; the rest returns defaults. */
-    private class FakeStorage : PluginStorageProvider {
-        val map = ConcurrentHashMap<String, String>()
-        override fun getPluginId() = "test"
-        override suspend fun putJson(key: String, jsonValue: String) { map[key] = jsonValue }
-        override suspend fun getJson(key: String): String? = map[key]
-        override suspend fun contains(key: String): Boolean = map.containsKey(key)
-        override suspend fun remove(key: String) { map.remove(key) }
-        override suspend fun getAllKeys(): Set<String> = map.keys.toSet()
-        override suspend fun clear() { map.clear() }
-
-        override suspend fun putString(key: String, value: String) { map[key] = value }
-        override suspend fun getString(key: String, defaultValue: String?): String? = map[key] ?: defaultValue
-        override suspend fun putInt(key: String, value: Int) {}
-        override suspend fun getInt(key: String, defaultValue: Int): Int = defaultValue
-        override suspend fun putLong(key: String, value: Long) {}
-        override suspend fun getLong(key: String, defaultValue: Long): Long = defaultValue
-        override suspend fun putBoolean(key: String, value: Boolean) {}
-        override suspend fun getBoolean(key: String, defaultValue: Boolean): Boolean = defaultValue
-        override suspend fun putFloat(key: String, value: Float) {}
-        override suspend fun getFloat(key: String, defaultValue: Float): Float = defaultValue
-        override fun observeString(key: String): Flow<String> = emptyFlow()
-        override fun observeChanges(): Flow<String> = emptyFlow()
-    }
-
     private fun sample(id: String = "p1") = Prompt(
         id = id,
         name = "Router",
@@ -58,7 +29,7 @@ class PromptRegistryTest {
 
     @Test
     fun `upsert then get round-trips the whole prompt`() = runBlocking {
-        val reg = PromptRegistry(FakeStorage())
+        val reg = PromptRegistry(DesktopStorage())
         val p = sample()
         reg.upsert(p)
         assertEquals(p, reg.get("p1"))
@@ -66,7 +37,7 @@ class PromptRegistryTest {
 
     @Test
     fun `index tracks upserted ids and list returns them`() = runBlocking {
-        val reg = PromptRegistry(FakeStorage())
+        val reg = PromptRegistry(DesktopStorage())
         reg.upsert(sample("a"))
         reg.upsert(sample("b"))
         assertEquals(setOf("a", "b"), reg.list().map { it.id }.toSet())
@@ -74,7 +45,7 @@ class PromptRegistryTest {
 
     @Test
     fun `re-upserting the same id does not duplicate the index`() = runBlocking {
-        val storage = FakeStorage()
+        val storage = DesktopStorage()
         val reg = PromptRegistry(storage)
         reg.upsert(sample("a"))
         reg.upsert(sample("a").copy(name = "Renamed"))
@@ -84,11 +55,13 @@ class PromptRegistryTest {
 
     @Test
     fun `delete removes both the blob and the index entry`() = runBlocking {
-        val reg = PromptRegistry(FakeStorage())
+        val storage = DesktopStorage()
+        val reg = PromptRegistry(storage)
         reg.upsert(sample("a"))
         reg.upsert(sample("b"))
         reg.delete("a")
         assertNull(reg.get("a"))
+        assertTrue(!storage.map.containsKey("json:prompt:a"))
         assertEquals(listOf("b"), reg.list().map { it.id })
     }
 
