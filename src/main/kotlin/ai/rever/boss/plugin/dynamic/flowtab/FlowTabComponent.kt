@@ -145,6 +145,7 @@ class FlowTabComponent(
     private var realistic by mutableStateOf(false)
     // The visible browser tab this flow opened; closed at the start of the next run
     // so each Run opens a fresh tab (no stale reuse, no stacked splits).
+    @Volatile
     private var visibleTabId: String? = null
 
     init {
@@ -256,7 +257,7 @@ class FlowTabComponent(
             val runToken = runStatePersistence.beginRun()
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
-            runJobs.launch(Dispatchers.Default) {
+            val job = runJobs.launch(Dispatchers.Default) {
                 try {
                     // Write status straight from the run thread. These are observable
                     // snapshot-state writes, so Compose picks them up on the next frame
@@ -271,7 +272,9 @@ class FlowTabComponent(
                                 visibleTabId = id
                             } else {
                                 id?.let { staleId ->
-                                    runCatching { context.activeTabsProvider?.closeTab(staleId) }
+                                    coroutineScope.launch(Dispatchers.Main) {
+                                        runCatching { context.activeTabsProvider?.closeTab(staleId) }
+                                    }
                                 }
                             }
                         },
@@ -290,7 +293,6 @@ class FlowTabComponent(
                         state.runError = e.message ?: e.toString()
                     }
                 } finally {
-                    if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
                     // Persist the run results (capped) so they survive reopening.
                     try {
                         runStatePersistence.persistIfCurrent(runToken) {
@@ -305,6 +307,10 @@ class FlowTabComponent(
                         // Run-state persistence is best-effort, as before.
                     }
                 }
+            }
+            // This also runs when a queued job is cancelled before its block starts.
+            job.invokeOnCompletion {
+                if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
             }
         }
 

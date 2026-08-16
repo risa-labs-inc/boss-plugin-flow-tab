@@ -92,4 +92,19 @@ class RunStatePersistenceGateTest {
 
         assertTrue(gate.isCurrent(newerToken))
     }
+
+    @Test
+    fun `queued clear does not delete a newer persisted run`() = runBlocking {
+        val gate = RunStatePersistenceGate()
+        gate.beginRun()
+        val invalidation = gate.invalidateRun()
+        val newerToken = gate.beginRun()
+        var saved: String? = null
+        gate.persistIfCurrent(newerToken) { saved = "newer run" }
+
+        val cleared = gate.clearAfterInvalidation(invalidation) { saved = null }
+
+        assertFalse(cleared)
+        assertTrue(saved == "newer run")
+    }
 }

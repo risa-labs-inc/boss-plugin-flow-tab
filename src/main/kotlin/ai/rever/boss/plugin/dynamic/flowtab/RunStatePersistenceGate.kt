@@ -4,6 +4,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicLong
 
 /** Proof that a run generation was invalidated before its destructive clear was scheduled. */
@@ -23,6 +24,7 @@ internal class RunInvalidation internal constructor(
 internal class RunStatePersistenceGate {
     private val generation = AtomicLong(0)
     private val persistenceMutex = Mutex()
+    private var lastPersistedGeneration = 0L
 
     fun beginRun(): Long = generation.incrementAndGet()
 
@@ -32,11 +34,14 @@ internal class RunStatePersistenceGate {
 
     suspend fun persistIfCurrent(token: Long, persist: suspend () -> Unit): Boolean =
         withContext(NonCancellable) {
-            persistenceMutex.withLock {
-                if (!isCurrent(token)) return@withLock false
-                persist()
-                true
-            }
+            withTimeoutOrNull(PERSIST_TIMEOUT_MS) {
+                persistenceMutex.withLock {
+                    if (!isCurrent(token)) return@withLock false
+                    persist()
+                    lastPersistedGeneration = token
+                    true
+                }
+            } ?: false
         }
 
     /**
@@ -47,12 +52,22 @@ internal class RunStatePersistenceGate {
     suspend fun clearAfterInvalidation(
         invalidation: RunInvalidation,
         clearPersisted: suspend () -> Unit,
-    ) {
+    ): Boolean {
         check(invalidation.owner === this && generation.get() >= invalidation.generation) {
             "Run was not invalidated by this gate before clear"
         }
-        withContext(NonCancellable) {
-            persistenceMutex.withLock { clearPersisted() }
+        return withContext(NonCancellable) {
+            persistenceMutex.withLock {
+                // If a newer run already saved while this async clear was queued, its
+                // snapshot owns the shared key and must not be removed.
+                if (lastPersistedGeneration > invalidation.generation) return@withLock false
+                clearPersisted()
+                true
+            }
         }
+    }
+
+    private companion object {
+        const val PERSIST_TIMEOUT_MS = 5_000L
     }
 }

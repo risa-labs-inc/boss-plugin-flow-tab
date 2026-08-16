@@ -2,9 +2,9 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.NonCancellable
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 import kotlin.test.Test
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -25,11 +25,43 @@ class RunJobFenceTest {
 
         fence.cancelCurrent()
         val second = fence.launch { secondStarted.complete(Unit) }
-        delay(20)
+        yield()
 
         assertFalse(secondStarted.isCompleted)
         releaseFirst.complete(Unit)
         second.join()
         assertTrue(secondStarted.isCompleted)
+    }
+
+    @Test
+    fun `cancelling a queued run completes it after the prior run unwinds`() = runBlocking {
+        val fence = RunJobFence(this)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        var queuedBlockStarted = false
+        fence.launch {
+            firstStarted.complete(Unit)
+            withContext(NonCancellable) { releaseFirst.await() }
+        }
+        firstStarted.await()
+
+        val queued = fence.launch { queuedBlockStarted = true }
+        var completionCalled = false
+        queued.invokeOnCompletion { completionCalled = true }
+        // Let the queued coroutine enter its non-cancellable fence wait before
+        // cancelling it; otherwise it may be cancelled before its body starts.
+        yield()
+        fence.cancelCurrent()
+        yield()
+
+        try {
+            assertFalse(completionCalled)
+            assertFalse(queuedBlockStarted)
+        } finally {
+            releaseFirst.complete(Unit)
+        }
+        queued.join()
+        assertTrue(completionCalled)
+        assertFalse(queuedBlockStarted)
     }
 }
