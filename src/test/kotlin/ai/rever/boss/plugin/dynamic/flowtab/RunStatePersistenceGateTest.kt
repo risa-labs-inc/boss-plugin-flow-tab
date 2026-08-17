@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
@@ -131,6 +133,27 @@ class RunStatePersistenceGateTest {
         assertFalse(persisted)
         finishClear.complete(Unit)
         clearJob.join()
+    }
+
+    @Test
+    fun `cancelled run still executes final persistence on IO`() = runTimedTest {
+        val gate = RunStatePersistenceGate()
+        val token = gate.beginRun()
+        val started = CompletableDeferred<Unit>()
+        var persisted = false
+        val run = launch {
+            try {
+                started.complete(Unit)
+                awaitCancellation()
+            } finally {
+                persistRunStateOnIo(gate, token) { persisted = true }
+            }
+        }
+        started.await()
+
+        run.cancelAndJoin()
+
+        assertTrue(persisted)
     }
 
     private fun runTimedTest(block: suspend CoroutineScope.() -> Unit) = runBlocking {

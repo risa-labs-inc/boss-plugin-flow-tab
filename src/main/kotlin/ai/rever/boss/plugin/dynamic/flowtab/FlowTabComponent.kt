@@ -77,7 +77,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.atomic.AtomicReference
@@ -327,13 +326,11 @@ class FlowTabComponent(
                     if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
                     // Persist the run results (capped) so they survive reopening.
                     try {
-                        val persisted = withContext(Dispatchers.IO) {
-                            runStatePersistence.persistIfCurrent(runToken) {
-                                storage?.putJson(
-                                    "$RUN_STATE_PREFIX${config.id}",
-                                    json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
-                                )
-                            }
+                        val persisted = persistRunStateOnIo(runStatePersistence, runToken) {
+                            storage?.putJson(
+                                "$RUN_STATE_PREFIX${config.id}",
+                                json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
+                            )
                         }
                         if (!persisted && runStatePersistence.isCurrent(runToken)) {
                             state.notice = "Run completed, but its saved state timed out"
@@ -428,9 +425,13 @@ class FlowTabComponent(
                     val result = runStatePersistence.clearAfterInvalidation(invalidation) {
                         clearPersistedRunState(storage, config.id)
                     }
-                    if (result == RunStateClearResult.TIMED_OUT) {
-                        state.notice = "Flow cleared, but saved run-state cleanup timed out"
-                        Snapshot.sendApplyNotifications()
+                    when (result) {
+                        RunStateClearResult.TIMED_OUT -> {
+                            state.notice = "Flow cleared, but saved run-state cleanup timed out"
+                            Snapshot.sendApplyNotifications()
+                        }
+                        RunStateClearResult.CLEARED,
+                        RunStateClearResult.PRESERVED_NEWER -> Unit
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled

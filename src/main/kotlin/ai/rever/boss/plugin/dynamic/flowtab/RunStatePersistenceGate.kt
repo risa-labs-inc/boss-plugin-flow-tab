@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -17,6 +18,15 @@ internal enum class RunStateClearResult {
     CLEARED,
     PRESERVED_NEWER,
     TIMED_OUT,
+}
+
+/** Switch to blocking-I/O capacity without letting run cancellation skip the final save. */
+internal suspend fun persistRunStateOnIo(
+    gate: RunStatePersistenceGate,
+    token: Long,
+    persist: suspend () -> Unit,
+): Boolean = withContext(NonCancellable + Dispatchers.IO) {
+    gate.persistIfCurrent(token, persist)
 }
 
 /**
