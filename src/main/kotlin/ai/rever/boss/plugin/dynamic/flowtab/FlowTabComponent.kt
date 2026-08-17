@@ -72,7 +72,6 @@ import com.arkivanov.essenty.lifecycle.Lifecycle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -268,16 +267,20 @@ class FlowTabComponent(
                     // Do not erase the preceding run's results or close its browser tab
                     // until the fence actually admits this run. A wedged predecessor
                     // therefore rejects Restart without destructively changing the UI.
-                    withContext(NonCancellable + Dispatchers.Main) {
-                        if (runStatePersistence.isCurrent(runToken)) {
-                            visibleTabId.getAndSet(null)?.let { id ->
-                                runCatching { context.activeTabsProvider?.closeTab(id) }
-                            }
-                            state.clearRun()
-                            state.notice = null
-                            admitted = true
-                            Snapshot.sendApplyNotifications()
+                    admitted = admitRun(
+                        token = runToken,
+                        context = Dispatchers.Main,
+                        isCurrent = runStatePersistence::isCurrent,
+                    ) {
+                        // Host tab operations are Main-thread confined. Keeping the
+                        // synchronous state reset in the same admission block makes
+                        // tab cleanup and visible run-state replacement atomic.
+                        visibleTabId.getAndSet(null)?.let { id ->
+                            runCatching { context.activeTabsProvider?.closeTab(id) }
                         }
+                        state.clearRun()
+                        state.notice = null
+                        Snapshot.sendApplyNotifications()
                     }
                     coroutineContext.ensureActive()
                     if (!admitted) return@launch
