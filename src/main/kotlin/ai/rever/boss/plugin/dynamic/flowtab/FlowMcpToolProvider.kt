@@ -9,6 +9,7 @@ import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
@@ -85,10 +86,23 @@ class FlowMcpToolProvider(
             val job = controller.runStatus(runId) ?: return@def err("Unknown runId '$runId'")
             McpToolResult(json.encodeToString(RunJob.serializer(), job), false)
         },
-        def("flow_list", "List every stored flow's tabId. Returns {flows:[...]}.",
-            schema("{}"), readOnly = true) { _ ->
+        def("flow_list", "List every stored flow's tabId. Pass detail=true to also return " +
+            "flowDetails with names, descriptions, node counts, and readability.",
+            schema("""{"detail":{"type":"boolean"}}"""), readOnly = true) { a ->
+            val detail = a.obj().bool("detail")
+            val details = if (detail) controller.listFlowDetails() else null
+            val flowIds = details?.map(FlowSummary::tabId) ?: controller.listFlows()
             ok(buildJsonObject {
-                put("flows", json.encodeToJsonElement(ListSerializer(String.serializer()), controller.listFlows()))
+                put("flows", json.encodeToJsonElement(ListSerializer(String.serializer()), flowIds))
+                if (details != null) {
+                    put(
+                        "flowDetails",
+                        json.encodeToJsonElement(
+                            ListSerializer(FlowSummary.serializer()),
+                            details,
+                        ),
+                    )
+                }
             })
         },
         def("flow_get", "Get a flow's full GraphSnapshot JSON.",
@@ -146,6 +160,8 @@ class FlowMcpToolProvider(
     private fun JsonObject.str(key: String): String? = (this[key] as? kotlinx.serialization.json.JsonPrimitive)?.content
     private fun JsonObject.int(key: String, default: Int = 0): Int =
         runCatching { this[key]?.jsonPrimitive?.int }.getOrNull() ?: default
+    private fun JsonObject.bool(key: String): Boolean =
+        (this[key] as? kotlinx.serialization.json.JsonPrimitive)?.booleanOrNull ?: false
 
     private fun JsonObject.metaOrNull(): FlowMeta? {
         val name = str("name")

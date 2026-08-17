@@ -158,7 +158,7 @@ enum class ImportKind { FLOW, TEMPLATE }
  * (Named distinctly from the RPA-recording [ImportResult] in the same package.)
  */
 sealed interface TemplateImportResult {
-    /** A loadable graph — a plain [ImportKind.FLOW] or a [ImportKind.TEMPLATE] (has metadata). */
+    /** A loadable graph — unnamed imports are flows; metadata-bearing imports use template UX. */
     data class Graph(val kind: ImportKind, val snapshot: GraphSnapshot) : TemplateImportResult
 
     /** Not a flow graph (no `nodes`) — hand to the RPA-recording importer. */
@@ -176,9 +176,10 @@ private val importJson = Json { ignoreUnknownKeys = true; isLenient = true }
 
 /**
  * Classify [text] for import: a JSON object with a `nodes` array is a flow graph — a
- * template when it also carries non-null `metadata`; anything else is treated as an
- * RPA recording. A graph is decoded and schema-gated: a newer [GraphSnapshot.schemaVersion]
- * yields [TemplateImportResult.RefusedNewer] instead of a broken load.
+ * metadata-bearing graph uses the named/template import UX; anything else is treated
+ * as an RPA recording. A graph is decoded and schema-gated: a newer
+ * [GraphSnapshot.schemaVersion] yields [TemplateImportResult.RefusedNewer] instead of
+ * a broken load.
  */
 fun classifyImport(text: String): TemplateImportResult {
     val obj = runCatching { importJson.parseToJsonElement(text) as? JsonObject }.getOrNull()

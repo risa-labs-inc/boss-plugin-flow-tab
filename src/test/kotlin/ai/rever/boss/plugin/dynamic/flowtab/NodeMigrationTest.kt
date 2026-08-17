@@ -63,6 +63,20 @@ class NodeMigrationTest {
     }
 
     @Test
+    fun `loaded metadata survives the next save`() {
+        val metadata = FlowMeta(
+            name = "Claims intake",
+            description = "Triage incoming claims",
+            inputs = listOf("claimId"),
+        )
+        val state = FlowGraphState()
+
+        assertTrue(state.load(GraphSnapshot(metadata = metadata, schemaVersion = SUPPORTED_SCHEMA_VERSION)))
+
+        assertEquals(metadata, state.toSnapshot().metadata)
+    }
+
+    @Test
     fun `a newer-schema graph is refused gracefully, leaving the canvas untouched`() {
         val state = FlowGraphState()
         state.addNode("TRIGGER", androidx.compose.ui.geometry.Offset(0f, 0f))

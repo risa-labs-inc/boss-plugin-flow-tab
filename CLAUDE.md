@@ -103,6 +103,7 @@ build.gradle.kts   → Build config + version (single source of truth)
 ### Source files
 - `FlowTabDynamicPlugin.kt` - entry point, registers the tab type.
 - `FlowTabType.kt` / `FlowTabData.kt` - tab type + tab config.
+- `FlowLauncherPanel.kt` - sidebar browser for creating, listing, and reopening persisted flows.
 - `FlowModel.kt` - serializable graph model (NodeType, NodeModel, EdgeModel, GraphSnapshot) + port geometry.
 - `FlowGraphState.kt` - runtime state: nodes/edges, pan/zoom transform, selection, pending connection.
 - `FlowCanvas.kt` - grid + edge rendering (Canvas) and pan/zoom/tap gestures.
@@ -131,6 +132,10 @@ raw backing keys. Consequently, normalize the optional `json:` prefix when enume
 `removeJsonValue` when deleting JSON so both desktop-shaped and logical providers are supported.
 Tests that exercise this behavior should use `DesktopStorage`; `TestStorage` intentionally models
 a provider that exposes logical keys.
+
+`flow_list` keeps its legacy `{ "flows": [tabId, ...] }` result by default. Passing
+`{ "detail": true }` additionally returns `flowDetails` entries with metadata, node count, and
+readability. The launcher uses the same controller and storage namespace as this MCP contract.
 
 ## Version Management
 

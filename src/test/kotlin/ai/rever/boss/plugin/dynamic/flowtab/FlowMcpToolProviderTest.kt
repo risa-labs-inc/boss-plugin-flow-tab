@@ -115,7 +115,8 @@ class FlowMcpToolProviderTest {
 
     @Test
     fun `create add connect get round-trips a flow`() = runBlocking {
-        val p = provider()
+        val storage = FakeStorage()
+        val p = provider(storage)
         val tabId = obj(call(p, "flow_create", """{"name":"Router"}""")).getValue("tabId").jsonPrimitive.content
         val trig = obj(call(p, "flow_add_node", """{"tabId":"$tabId","kind":"TRIGGER"}""")).getValue("nodeId").jsonPrimitive.content
         val set = obj(call(p, "flow_add_node",
@@ -126,8 +127,31 @@ class FlowMcpToolProviderTest {
         assertEquals(2, snap.getValue("nodes").jsonArray.size)
         assertEquals(1, snap.getValue("edges").jsonArray.size)
 
-        val list = obj(call(p, "flow_list")).getValue("flows").jsonArray.map { it.jsonPrimitive.content }
+        val legacyListResult = obj(call(p, "flow_list"))
+        val list = legacyListResult.getValue("flows").jsonArray.map { it.jsonPrimitive.content }
         assertTrue(tabId in list)
+        assertFalse("flowDetails" in legacyListResult)
+
+        val detailed = obj(call(p, "flow_list", """{"detail":true}"""))
+        val detail = detailed.getValue("flowDetails").jsonArray
+            .map { it.jsonObject }
+            .single { it.getValue("tabId").jsonPrimitive.content == tabId }
+        assertEquals("Router", detail.getValue("name").jsonPrimitive.content)
+        assertEquals(2, detail.getValue("nodeCount").jsonPrimitive.content.toInt())
+        assertEquals("true", detail.getValue("readable").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `detailed flow list exposes corrupt flows as unreadable`() = runBlocking {
+        val storage = FakeStorage()
+        val p = provider(storage)
+
+        storage.putJson("${FlowController.GRAPH_PREFIX}flow-corrupt", "{not-json")
+        val corrupt = obj(call(p, "flow_list", """{"detail":true}"""))
+            .getValue("flowDetails").jsonArray
+            .map { it.jsonObject }
+            .single { it.getValue("tabId").jsonPrimitive.content == "flow-corrupt" }
+        assertEquals("false", corrupt.getValue("readable").jsonPrimitive.content)
     }
 
     @Test

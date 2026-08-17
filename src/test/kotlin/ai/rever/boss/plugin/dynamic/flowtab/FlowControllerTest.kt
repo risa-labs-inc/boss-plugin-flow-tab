@@ -30,6 +30,7 @@ import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -184,6 +185,25 @@ class FlowControllerTest {
         val fc = controller(storage)
         val tabId = fc.createFlow()
         assertEquals(listOf(tabId), fc.listFlows())
+    }
+
+    @Test
+    fun `listFlowDetails includes metadata and keeps corrupt graphs visible`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow(FlowMeta(name = "Claims intake", description = "Triage claims"))
+        fc.addNode(tabId, "TRIGGER")
+        storage.putJson("${FlowController.GRAPH_PREFIX}flow-corrupt", "{not-json")
+
+        val details = fc.listFlowDetails()
+        val saved = details.single { it.tabId == tabId }
+        val corrupt = details.single { it.tabId == "flow-corrupt" }
+
+        assertEquals("Claims intake", saved.name)
+        assertEquals("Triage claims", saved.description)
+        assertEquals(1, saved.nodeCount)
+        assertTrue(saved.readable)
+        assertFalse(corrupt.readable)
     }
 
     @Test
