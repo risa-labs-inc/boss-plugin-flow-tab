@@ -187,6 +187,25 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `listFlowDetails includes metadata and keeps corrupt graphs visible`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow(FlowMeta(name = "Claims intake", description = "Triage claims"))
+        fc.addNode(tabId, "TRIGGER")
+        storage.putJson("${FlowController.GRAPH_PREFIX}flow-corrupt", "{not-json")
+
+        val details = fc.listFlowDetails()
+        val saved = details.single { it.tabId == tabId }
+        val corrupt = details.single { it.tabId == "flow-corrupt" }
+
+        assertEquals("Claims intake", saved.name)
+        assertEquals("Triage claims", saved.description)
+        assertEquals(1, saved.nodeCount)
+        assertTrue(saved.readable)
+        assertTrue(!corrupt.readable)
+    }
+
+    @Test
     fun `getFlow returns null for an unknown tabId`() = runBlocking {
         assertNull(controller().getFlow("flow-does-not-exist"))
     }

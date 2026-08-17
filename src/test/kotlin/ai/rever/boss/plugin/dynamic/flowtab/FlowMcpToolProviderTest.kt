@@ -126,8 +126,18 @@ class FlowMcpToolProviderTest {
         assertEquals(2, snap.getValue("nodes").jsonArray.size)
         assertEquals(1, snap.getValue("edges").jsonArray.size)
 
-        val list = obj(call(p, "flow_list")).getValue("flows").jsonArray.map { it.jsonPrimitive.content }
+        val legacyListResult = obj(call(p, "flow_list"))
+        val list = legacyListResult.getValue("flows").jsonArray.map { it.jsonPrimitive.content }
         assertTrue(tabId in list)
+        assertFalse("flowDetails" in legacyListResult)
+
+        val detailed = obj(call(p, "flow_list", """{"detail":true}"""))
+        val detail = detailed.getValue("flowDetails").jsonArray
+            .map { it.jsonObject }
+            .single { it.getValue("tabId").jsonPrimitive.content == tabId }
+        assertEquals("Router", detail.getValue("name").jsonPrimitive.content)
+        assertEquals(2, detail.getValue("nodeCount").jsonPrimitive.content.toInt())
+        assertEquals("true", detail.getValue("readable").jsonPrimitive.content)
     }
 
     @Test

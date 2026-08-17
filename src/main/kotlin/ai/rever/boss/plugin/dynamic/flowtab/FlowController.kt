@@ -39,6 +39,16 @@ data class RunJob(
     val isTerminal: Boolean get() = state != RunJobState.RUNNING
 }
 
+/** Lightweight discovery record used by the launcher and detailed MCP listing. */
+@Serializable
+data class FlowSummary(
+    val tabId: String,
+    val name: String = "",
+    val description: String = "",
+    val nodeCount: Int = 0,
+    val readable: Boolean = true,
+)
+
 /**
  * Headless, UI-independent authoring + running of flows, seated entirely at the
  * **storage** layer (red-team F5): it reads and patches the `graph:<tabId>`
@@ -146,6 +156,21 @@ class FlowController(
             .filter { it.isNotEmpty() }
             .distinct()
             .sorted()
+
+    /**
+     * Metadata for every discovered graph key. A corrupt graph remains represented
+     * with [FlowSummary.readable] false so the launcher does not silently hide data.
+     */
+    suspend fun listFlowDetails(): List<FlowSummary> = listFlows().map { tabId ->
+        val snapshot = getFlow(tabId)
+        FlowSummary(
+            tabId = tabId,
+            name = snapshot?.metadata?.name.orEmpty(),
+            description = snapshot?.metadata?.description.orEmpty(),
+            nodeCount = snapshot?.nodes?.size ?: 0,
+            readable = snapshot != null,
+        )
+    }
 
     // ---- async run jobs (F1) ------------------------------------------------
 

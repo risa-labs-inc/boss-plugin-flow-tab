@@ -53,19 +53,6 @@ class FlowTabDynamicPlugin : DynamicPlugin {
             FlowTabComponent(ctx, tabInfo, context, external)
         }
 
-        // Clicking the "Flow" sidebar item opens a Flow tab *directly* — the
-        // host runs this onLaunch instead of toggling the docked pane. The panel
-        // is still registered so the sidebar shows a "Flow" entry to click; its
-        // FlowLauncherComponent only renders if the pane is opened manually.
-        FlowLauncherInfo.onLaunch = {
-            context.splitViewOperations?.openTab(
-                FlowTabData(id = "flow-${java.util.UUID.randomUUID()}", title = "Flow")
-            )
-        }
-        context.panelRegistry.registerPanel(FlowLauncherInfo) { ctx, panelInfo ->
-            FlowLauncherComponent(ctx, panelInfo, context)
-        }
-
         // Register the fixed, generic Flow MCP tool set into the host `boss` server so
         // an attached agent can headlessly author and run flows/prompts (P2, F1/F5/F7).
         // Storage-seated: the controller and prompt store share the tab's namespace, so
@@ -89,6 +76,14 @@ class FlowTabDynamicPlugin : DynamicPlugin {
                 println("[flow-tab] MCP server controller unavailable; flow_ tools registered, will surface when the boss MCP server is enabled")
             }
         }.onFailure { println("[flow-tab] failed to register MCP tool provider: ${it.message}") }
+
+        // Use the host's normal sidebar behavior so clicking Flow opens this browser
+        // instead of silently creating another canvas. The same storage-seated
+        // controller powers both the launcher list and MCP discovery.
+        FlowLauncherInfo.onLaunch = null
+        context.panelRegistry.registerPanel(FlowLauncherInfo) { ctx, panelInfo ->
+            FlowLauncherComponent(ctx, panelInfo, context, headlessController)
+        }
     }
 
     override fun dispose() {

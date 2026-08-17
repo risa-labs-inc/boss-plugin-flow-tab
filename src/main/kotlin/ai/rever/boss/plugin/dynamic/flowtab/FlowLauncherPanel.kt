@@ -10,6 +10,8 @@ import ai.rever.boss.plugin.api.SidebarItem
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,8 +26,15 @@ import androidx.compose.material.Icon
 import androidx.compose.material.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -34,6 +43,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.arkivanov.decompose.ComponentContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.util.UUID
 
 /** Sidebar panel info for the Flow launcher. */
@@ -43,12 +55,7 @@ object FlowLauncherInfo : PanelInfo {
     override val icon = Icons.Outlined.AccountTree
     override val defaultSlotPosition = left.bottom
 
-    /**
-     * Set by the plugin at register() time (it captures the PluginContext, which
-     * this object can't see on its own). When non-null, the host runs this on a
-     * sidebar click *instead of* toggling the docked pane — so clicking "Flow"
-     * opens a tab directly rather than popping open the bottom split.
-     */
+    /** Null uses the host's normal sidebar behavior and toggles this launcher panel. */
     var onLaunch: (() -> Unit)? = null
 
     override val sidebarItem: SidebarItem
@@ -56,21 +63,46 @@ object FlowLauncherInfo : PanelInfo {
 }
 
 /**
- * A small sidebar panel that launches Flow canvas tabs.
+ * Sidebar browser for opening saved flows or launching a new canvas.
  *
  * Tab types registered by plugins aren't listed in the host's built-in New Tab
- * dialog, so this panel is the entry point: its button opens a fresh Flow tab
- * via the generic [ai.rever.boss.plugin.api.SplitViewOperations.openTab] API.
+ * dialog, so this panel is the entry point for both stored and new flow tabs via
+ * the generic [ai.rever.boss.plugin.api.SplitViewOperations.openTab] API.
  */
 class FlowLauncherComponent(
     ctx: ComponentContext,
     override val panelInfo: PanelInfo,
-    private val context: PluginContext
+    private val context: PluginContext,
+    private val controller: FlowController?,
 ) : PanelComponentWithUI, ComponentContext by ctx {
 
     @Composable
     override fun Content() {
         val splitView = context.splitViewOperations
+        var savedFlows by remember { mutableStateOf<List<FlowSummary>>(emptyList()) }
+        var loading by remember { mutableStateOf(true) }
+        var loadError by remember { mutableStateOf<String?>(null) }
+        var refreshGeneration by remember { mutableIntStateOf(0) }
+
+        LaunchedEffect(controller, refreshGeneration) {
+            if (controller == null) {
+                loading = false
+                loadError = "Saved-flow storage is unavailable in this context."
+                return@LaunchedEffect
+            }
+            loading = true
+            loadError = null
+            try {
+                savedFlows = withContext(Dispatchers.IO) { controller.listFlowDetails() }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                loadError = failure.message ?: failure.toString()
+            } finally {
+                loading = false
+            }
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -85,7 +117,7 @@ class FlowLauncherComponent(
                 fontWeight = FontWeight.SemiBold
             )
             Text(
-                text = "Node-based canvas. Open a new flow to start wiring nodes together.",
+                text = "Open a saved flow or start a new canvas.",
                 color = Color(0xFF9A9AA4),
                 fontSize = 12.sp
             )
@@ -103,8 +135,101 @@ class FlowLauncherComponent(
                     fontSize = 11.sp
                 )
             }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Saved flows",
+                    color = Color.White,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Spacer(Modifier.weight(1f))
+                RefreshButton(enabled = !loading) { refreshGeneration++ }
+            }
+
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                when {
+                    loading -> LauncherMessage("Loading saved flows…")
+                    loadError != null -> LauncherMessage(
+                        "Could not load saved flows: $loadError",
+                        Color(0xFFE5935B),
+                    )
+                    savedFlows.isEmpty() -> LauncherMessage("No saved flows yet.")
+                    else -> savedFlows.forEach { flow ->
+                        SavedFlowRow(
+                            flow = flow,
+                            enabled = flow.readable && splitView != null,
+                        ) {
+                            val title = flow.name.ifBlank { "Flow" }
+                            splitView?.openTab(FlowTabData(id = flow.tabId, title = title))
+                        }
+                    }
+                }
+            }
         }
     }
+}
+
+@Composable
+private fun RefreshButton(enabled: Boolean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            Icons.Filled.Refresh,
+            contentDescription = "Refresh saved flows",
+            tint = if (enabled) Color(0xFFCDCDD4) else Color(0xFF66666F),
+            modifier = Modifier.size(15.dp),
+        )
+    }
+}
+
+@Composable
+private fun SavedFlowRow(flow: FlowSummary, enabled: Boolean, onClick: () -> Unit) {
+    val title = flow.name.ifBlank { "Untitled Flow" }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(if (enabled) Color(0xFF29292F) else Color(0xFF242429))
+            .border(1.dp, Color(0xFF383840), RoundedCornerShape(8.dp))
+            .clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 10.dp, vertical = 9.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Text(
+            text = if (flow.readable) title else "$title · unreadable",
+            color = if (flow.readable) Color.White else Color(0xFFE5935B),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+        )
+        if (flow.description.isNotBlank()) {
+            Text(flow.description, color = Color(0xFFB0B0B8), fontSize = 11.sp)
+        }
+        Text(
+            text = if (flow.readable) "${flow.nodeCount} node(s) · ${flow.tabId}" else flow.tabId,
+            color = Color(0xFF7E7E88),
+            fontSize = 10.sp,
+        )
+    }
+}
+
+@Composable
+private fun LauncherMessage(text: String, color: Color = Color(0xFF8C8C96)) {
+    Text(text = text, color = color, fontSize = 11.sp)
 }
 
 @Composable
