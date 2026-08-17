@@ -19,6 +19,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -420,6 +421,40 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `renameFlow reads after a concurrent autosave and preserves its graph changes`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow(FlowMeta(name = "Old name"))
+        val liveSnapshot = fc.getFlow(tabId)!!.copy(
+            nodes = listOf(NodeModel("n-live", "TRIGGER", "Live node", 10f, 20f)),
+        )
+        val autosaveHasLock = CompletableDeferred<Unit>()
+        val releaseAutosave = CompletableDeferred<Unit>()
+
+        val autosave = launch {
+            FlowRenameCoordinator.persistAutosave(tabId, liveSnapshot) { snapshot ->
+                autosaveHasLock.complete(Unit)
+                releaseAutosave.await()
+                storage.putJson(
+                    "${FlowController.GRAPH_PREFIX}$tabId",
+                    kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), snapshot),
+                )
+            }
+        }
+        autosaveHasLock.await()
+        val rename = async { fc.renameFlow(tabId, "New name") }
+        assertFalse(rename.isCompleted, "rename must wait for the in-flight autosave")
+
+        releaseAutosave.complete(Unit)
+        autosave.join()
+        rename.await()
+
+        val saved = fc.getFlow(tabId)!!
+        assertEquals("New name", saved.metadata?.name)
+        assertEquals(listOf("n-live"), saved.nodes.map { it.id })
+    }
+
+    @Test
     fun `renameFlow rejects blank names and unreadable flows`() = runBlocking {
         val storage = DesktopStorage()
         val fc = controller(storage)
@@ -436,12 +471,14 @@ class FlowControllerTest {
         val fc = controller(storage)
         val tabId = fc.createFlow(FlowMeta(name = "Disposable"))
         storage.putJson("$RUN_STATE_PREFIX$tabId", "{}")
+        FlowRenameCoordinator.publish(tabId, "Disposable renamed")
 
         assertTrue(fc.deleteFlow(tabId))
 
         assertNull(storage.getJson("${FlowController.GRAPH_PREFIX}$tabId"))
         assertNull(storage.getJson("$RUN_STATE_PREFIX$tabId"))
         assertFalse(tabId in fc.listFlows())
+        assertNull(FlowRenameCoordinator.latestName(tabId))
     }
 
     @Test

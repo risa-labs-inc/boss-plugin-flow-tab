@@ -17,7 +17,12 @@ internal object FlowRenameCoordinator {
     private val locks = ConcurrentHashMap<String, Mutex>()
     private val mutableNames = MutableStateFlow<Map<String, String>>(emptyMap())
 
-    /** Latest successful rename per tab, replayed to tabs that start collecting later. */
+    /**
+     * Latest successful rename per tab, replayed to tabs that start collecting later.
+     * A closed tab has no autosave with which to acknowledge convergence, so its entry
+     * remains until reopen or delete. Any future metadata-name writer must coordinate
+     * here rather than bypassing this ordering guard.
+     */
     val names = mutableNames.asStateFlow()
 
     suspend fun <T> withFlowLock(tabId: String, block: suspend () -> T): T =

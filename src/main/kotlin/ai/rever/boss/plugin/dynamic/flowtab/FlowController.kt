@@ -174,10 +174,10 @@ class FlowController(
     }
 
     /** Rename a readable flow without changing any other metadata or graph content. */
-    suspend fun renameFlow(tabId: String, name: String): FlowSummary {
-        val snapshot = getFlow(tabId) ?: throw IllegalArgumentException("No readable flow '$tabId'")
-        return persistRenamedFlow(tabId, name, snapshot)
-    }
+    suspend fun renameFlow(tabId: String, name: String): FlowSummary =
+        persistRenamedFlow(tabId, name) {
+            getFlow(tabId) ?: throw IllegalArgumentException("No readable flow '$tabId'")
+        }
 
     /**
      * Persist (and, when necessary, create) the currently open graph from its live
@@ -186,28 +186,32 @@ class FlowController(
      * replace a saved graph.
      */
     internal suspend fun renameOpenFlow(tabId: String, name: String, snapshot: GraphSnapshot): FlowSummary =
-        persistRenamedFlow(tabId, name, snapshot)
+        persistRenamedFlow(tabId, name) { snapshot }
 
     private suspend fun persistRenamedFlow(
         tabId: String,
         name: String,
-        snapshot: GraphSnapshot,
+        loadSnapshot: suspend () -> GraphSnapshot,
     ): FlowSummary {
-        check(storage != null) { "Flow storage is unavailable" }
         val normalizedName = name.trim()
         require(normalizedName.isNotEmpty()) { "Flow name cannot be blank" }
         require(normalizedName.length <= MAX_FLOW_NAME_LENGTH) {
             "Flow name cannot exceed $MAX_FLOW_NAME_LENGTH characters"
         }
-        val metadata = (snapshot.metadata ?: FlowMeta()).copy(name = normalizedName)
+        check(storage != null) { "Flow storage is unavailable" }
         // Once the user confirms, tab close/split recomposition must not cancel the
-        // durable write. Cancellation is observed again by the title-refresh step.
-        withContext(NonCancellable + Dispatchers.IO) {
+        // atomic read+write. Cancellation is observed again by the title-refresh step.
+        val (snapshot, metadata) = withContext(NonCancellable + Dispatchers.IO) {
             FlowRenameCoordinator.withFlowLock(tabId) {
-                write(tabId, snapshot.copy(metadata = metadata))
+                // Loading inside the same lock is essential: otherwise a sidebar rename
+                // can restore an older graph over a newer open-tab autosave.
+                val current = loadSnapshot()
+                val currentMetadata = (current.metadata ?: FlowMeta()).copy(name = normalizedName)
+                write(tabId, current.copy(metadata = currentMetadata))
                 // Publish only after the storage write succeeds. Open tabs replay this name
                 // into their live state, and their autosave consults it under the same lock.
                 FlowRenameCoordinator.publish(tabId, normalizedName)
+                current to currentMetadata
             }
         }
 

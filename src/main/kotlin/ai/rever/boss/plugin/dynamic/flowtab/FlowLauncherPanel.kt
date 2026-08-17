@@ -118,6 +118,18 @@ class FlowLauncherComponent(
             }
         }
 
+        // Canvas-originated renames publish through the same coordinator. Reflect them
+        // immediately instead of leaving the saved-flow list stale until Refresh.
+        LaunchedEffect(Unit) {
+            FlowRenameCoordinator.names.collect { renamed ->
+                if (renamed.isNotEmpty()) {
+                    savedFlows = savedFlows.map { flow ->
+                        renamed[flow.tabId]?.let { name -> flow.copy(name = name) } ?: flow
+                    }
+                }
+            }
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -311,12 +323,12 @@ class FlowLauncherComponent(
                             operationError = null
                             scope.launch {
                                 try {
-                                    val renamed = withContext(Dispatchers.IO) {
-                                        requireNotNull(controller).renameFlow(flow.tabId, newName)
-                                    }
+                                    val renamed = requireNotNull(controller).renameFlow(flow.tabId, newName)
                                     savedFlows = savedFlows.map { current ->
                                         if (current.tabId == flow.tabId) renamed else current
                                     }
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
                                 } catch (failure: Exception) {
                                     operationError = failure.message ?: failure.toString()
                                 } finally {
