@@ -75,7 +75,7 @@ class FlowTabDynamicPluginTest {
         assertEquals(
             setOf(
                 "flow_create", "flow_add_node", "flow_connect", "flow_run",
-                "flow_status", "flow_result", "flow_list", "flow_get",
+                "flow_status", "flow_result", "flow_list", "flow_get", "flow_delete",
                 "prompt_upsert", "prompt_get", "prompt_list",
             ),
             provider.tools().map { it.name }.toSet(),

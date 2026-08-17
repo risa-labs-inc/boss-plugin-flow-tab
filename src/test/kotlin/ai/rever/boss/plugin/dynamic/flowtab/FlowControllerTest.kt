@@ -211,6 +211,60 @@ class FlowControllerTest {
         assertNull(controller().getFlow("flow-does-not-exist"))
     }
 
+    @Test
+    fun `renameFlow preserves metadata and graph content`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(
+            FlowMeta(name = "Old name", description = "Keep me", version = 3, inputs = listOf("claimId"))
+        )
+        val nodeId = fc.addNode(tabId, "TRIGGER")
+
+        val summary = fc.renameFlow(tabId, "  Claims intake  ")
+        val renamed = fc.getFlow(tabId)!!
+
+        assertEquals("Claims intake", summary.name)
+        assertEquals("Claims intake", renamed.metadata?.name)
+        assertEquals("Keep me", renamed.metadata?.description)
+        assertEquals(3, renamed.metadata?.version)
+        assertEquals(listOf("claimId"), renamed.metadata?.inputs)
+        assertEquals(nodeId, renamed.nodes.single().id)
+    }
+
+    @Test
+    fun `renameFlow rejects blank names and unreadable flows`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        storage.putJson("${FlowController.GRAPH_PREFIX}flow-corrupt", "{not-json")
+
+        assertFailsWith<IllegalArgumentException> { fc.renameFlow(tabId, "   ") }
+        assertFailsWith<IllegalArgumentException> { fc.renameFlow("flow-corrupt", "New name") }
+    }
+
+    @Test
+    fun `deleteFlow removes graph and persisted UI run state`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow(FlowMeta(name = "Disposable"))
+        storage.putJson("$RUN_STATE_PREFIX$tabId", "{}")
+
+        assertTrue(fc.deleteFlow(tabId))
+
+        assertNull(storage.getJson("${FlowController.GRAPH_PREFIX}$tabId"))
+        assertNull(storage.getJson("$RUN_STATE_PREFIX$tabId"))
+        assertFalse(tabId in fc.listFlows())
+    }
+
+    @Test
+    fun `deleteFlow removes corrupt graphs and returns false for missing ids`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        storage.putJson("${FlowController.GRAPH_PREFIX}flow-corrupt", "{not-json")
+
+        assertTrue(fc.deleteFlow("flow-corrupt"))
+        assertFalse(fc.deleteFlow("flow-missing"))
+    }
+
     // ---- async run job ------------------------------------------------------
 
     private suspend fun awaitTerminal(fc: FlowController, runId: String): RunJob =

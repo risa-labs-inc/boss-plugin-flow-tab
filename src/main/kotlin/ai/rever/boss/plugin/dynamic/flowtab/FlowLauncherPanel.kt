@@ -22,12 +22,18 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.AlertDialog
 import androidx.compose.material.Icon
+import androidx.compose.material.IconButton
 import androidx.compose.material.Text
+import androidx.compose.material.TextButton
+import androidx.compose.material.TextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.AccountTree
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -85,6 +91,11 @@ class FlowLauncherComponent(
         var creatingFlow by remember { mutableStateOf(false) }
         var refreshGeneration by remember { mutableIntStateOf(0) }
         var openingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+        var deletingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+        var pendingDelete by remember { mutableStateOf<FlowSummary?>(null) }
+        var renamingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+        var pendingRename by remember { mutableStateOf<FlowSummary?>(null) }
+        var renameText by remember { mutableStateOf("") }
         val scope = rememberCoroutineScope()
 
         LaunchedEffect(controller, refreshGeneration) {
@@ -199,36 +210,128 @@ class FlowLauncherComponent(
                 items(savedFlows, key = { it.tabId }) { flow ->
                     SavedFlowRow(
                         flow = flow,
-                        enabled = flow.readable && splitView != null &&
+                        openEnabled = flow.readable && splitView != null &&
                             context.activeTabsProvider != null && flow.tabId !in openingFlowIds,
-                    ) {
-                        if (flow.tabId in openingFlowIds) return@SavedFlowRow
-                        openingFlowIds += flow.tabId
-                        operationError = null
-                        scope.launch {
-                            try {
-                                val activeTabs = requireNotNull(context.activeTabsProvider) {
-                                    "Saved-flow opening is unavailable because active-tab discovery is unavailable."
+                        deleteEnabled = controller != null && flow.tabId !in deletingFlowIds,
+                        renameEnabled = flow.readable && controller != null && flow.tabId !in renamingFlowIds,
+                        onOpen = {
+                            if (flow.tabId in openingFlowIds) return@SavedFlowRow
+                            openingFlowIds += flow.tabId
+                            operationError = null
+                            scope.launch {
+                                try {
+                                    val activeTabs = requireNotNull(context.activeTabsProvider) {
+                                        "Saved-flow opening is unavailable because active-tab discovery is unavailable."
+                                    }
+                                    // refreshTabs is a suspend contract: when it returns, value contains
+                                    // the host's latest snapshot and is safe to sample synchronously.
+                                    activeTabs.refreshTabs()
+                                    val alreadyOpen = activeTabs.activeTabs.value.firstOrNull { it.tabId == flow.tabId }
+                                    if (alreadyOpen != null) {
+                                        activeTabs.selectTab(alreadyOpen.tabId, alreadyOpen.panelId)
+                                    } else {
+                                        val title = flow.name.ifBlank { "Untitled Flow" }
+                                        splitView?.openTab(FlowTabData(id = flow.tabId, title = title))
+                                    }
+                                } catch (failure: Exception) {
+                                    operationError = failure.message ?: failure.toString()
+                                } finally {
+                                    openingFlowIds -= flow.tabId
                                 }
-                                // refreshTabs is a suspend contract: when it returns, value contains
-                                // the host's latest snapshot and is safe to sample synchronously.
-                                activeTabs.refreshTabs()
-                                val alreadyOpen = activeTabs.activeTabs.value.firstOrNull { it.tabId == flow.tabId }
-                                if (alreadyOpen != null) {
-                                    activeTabs.selectTab(alreadyOpen.tabId, alreadyOpen.panelId)
-                                } else {
-                                    val title = flow.name.ifBlank { "Untitled Flow" }
-                                    splitView?.openTab(FlowTabData(id = flow.tabId, title = title))
-                                }
-                            } catch (failure: Exception) {
-                                operationError = failure.message ?: failure.toString()
-                            } finally {
-                                openingFlowIds -= flow.tabId
                             }
-                        }
-                    }
+                        },
+                        onRename = {
+                            renameText = flow.name
+                            pendingRename = flow
+                        },
+                        onDelete = { pendingDelete = flow },
+                    )
                 }
             }
+        }
+
+        pendingDelete?.let { flow ->
+            val title = flow.name.ifBlank { flow.tabId }
+            AlertDialog(
+                onDismissRequest = { pendingDelete = null },
+                title = { Text("Delete \"$title\"?") },
+                text = { Text("This permanently removes the saved flow and closes it if it is open.") },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            pendingDelete = null
+                            if (flow.tabId in deletingFlowIds) return@TextButton
+                            deletingFlowIds += flow.tabId
+                            operationError = null
+                            scope.launch {
+                                try {
+                                    val deleted = withContext(Dispatchers.IO) {
+                                        requireNotNull(controller).deleteFlow(flow.tabId)
+                                    }
+                                    if (!deleted) error("Flow '${flow.tabId}' no longer exists")
+                                    savedFlows = savedFlows.filterNot { it.tabId == flow.tabId }
+                                    refreshGeneration++
+                                } catch (failure: Exception) {
+                                    operationError = failure.message ?: failure.toString()
+                                } finally {
+                                    deletingFlowIds -= flow.tabId
+                                }
+                            }
+                        },
+                    ) {
+                        Text("Delete", color = Color(0xFFE57373))
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingDelete = null }) { Text("Cancel") }
+                },
+            )
+        }
+
+        pendingRename?.let { flow ->
+            AlertDialog(
+                onDismissRequest = { pendingRename = null },
+                title = { Text("Rename saved flow") },
+                text = {
+                    TextField(
+                        value = renameText,
+                        onValueChange = { renameText = it.take(FlowController.MAX_FLOW_NAME_LENGTH) },
+                        label = { Text("Flow name") },
+                        singleLine = true,
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        enabled = renameText.isNotBlank(),
+                        onClick = {
+                            val newName = renameText.trim()
+                            pendingRename = null
+                            if (flow.tabId in renamingFlowIds) return@TextButton
+                            renamingFlowIds += flow.tabId
+                            operationError = null
+                            scope.launch {
+                                try {
+                                    val renamed = withContext(Dispatchers.IO) {
+                                        requireNotNull(controller).renameFlow(flow.tabId, newName)
+                                    }
+                                    savedFlows = savedFlows.map { current ->
+                                        if (current.tabId == flow.tabId) renamed else current
+                                    }
+                                } catch (failure: Exception) {
+                                    operationError = failure.message ?: failure.toString()
+                                } finally {
+                                    renamingFlowIds -= flow.tabId
+                                }
+                            }
+                        },
+                    ) {
+                        Text("Save")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingRename = null }) { Text("Cancel") }
+                },
+            )
         }
     }
 }
@@ -252,44 +355,75 @@ private fun RefreshButton(enabled: Boolean, onClick: () -> Unit) {
 }
 
 @Composable
-private fun SavedFlowRow(flow: FlowSummary, enabled: Boolean, onClick: () -> Unit) {
+private fun SavedFlowRow(
+    flow: FlowSummary,
+    openEnabled: Boolean,
+    deleteEnabled: Boolean,
+    renameEnabled: Boolean,
+    onOpen: () -> Unit,
+    onDelete: () -> Unit,
+    onRename: () -> Unit,
+) {
     val title = flow.name.ifBlank { "Untitled Flow" }
-    Column(
+    Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(8.dp))
-            .background(if (enabled) Color(0xFF29292F) else Color(0xFF242429))
+            .background(if (openEnabled) Color(0xFF29292F) else Color(0xFF242429))
             .border(1.dp, Color(0xFF383840), RoundedCornerShape(8.dp))
-            .clickable(enabled = enabled, onClick = onClick)
+            .clickable(enabled = openEnabled, onClick = onOpen)
             .padding(horizontal = 10.dp, vertical = 9.dp),
-        verticalArrangement = Arrangement.spacedBy(3.dp),
+        verticalAlignment = Alignment.Top,
     ) {
-        Text(
-            text = if (flow.readable) title else "$title · unreadable",
-            color = if (flow.readable) Color.White else Color(0xFFE5935B),
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Medium,
-        )
-        if (flow.description.isNotBlank()) {
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(3.dp),
+        ) {
             Text(
-                flow.description,
-                color = Color(0xFFB0B0B8),
-                fontSize = 11.sp,
-                maxLines = 2,
+                text = if (flow.readable) title else "$title · unreadable",
+                color = if (flow.readable) Color.White else Color(0xFFE5935B),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+            )
+            if (flow.description.isNotBlank()) {
+                Text(
+                    flow.description,
+                    color = Color(0xFFB0B0B8),
+                    fontSize = 11.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+            Text(
+                text = if (flow.readable) {
+                    "${flow.nodeCount} node(s) · ${flow.tabId.take(13)}…"
+                } else {
+                    flow.tabId
+                },
+                color = Color(0xFF7E7E88),
+                fontSize = 10.sp,
+                maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        Text(
-            text = if (flow.readable) {
-                "${flow.nodeCount} node(s) · ${flow.tabId.take(13)}…"
-            } else {
-                flow.tabId
-            },
-            color = Color(0xFF7E7E88),
-            fontSize = 10.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        Column {
+            IconButton(enabled = renameEnabled, onClick = onRename, modifier = Modifier.size(30.dp)) {
+                Icon(
+                    Icons.Outlined.Edit,
+                    contentDescription = "Rename $title",
+                    tint = if (renameEnabled) Color(0xFFB0B0B8) else Color(0xFF66666F),
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+            IconButton(enabled = deleteEnabled, onClick = onDelete, modifier = Modifier.size(30.dp)) {
+                Icon(
+                    Icons.Outlined.Delete,
+                    contentDescription = "Delete $title",
+                    tint = if (deleteEnabled) Color(0xFFB0B0B8) else Color(0xFF66666F),
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+        }
     }
 }
 

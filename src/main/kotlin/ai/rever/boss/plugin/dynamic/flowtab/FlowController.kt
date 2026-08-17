@@ -173,6 +173,48 @@ class FlowController(
         )
     }
 
+    /** Rename a readable flow without changing any other metadata or graph content. */
+    suspend fun renameFlow(tabId: String, name: String): FlowSummary {
+        val normalizedName = name.trim()
+        require(normalizedName.isNotEmpty()) { "Flow name cannot be blank" }
+        require(normalizedName.length <= MAX_FLOW_NAME_LENGTH) {
+            "Flow name cannot exceed $MAX_FLOW_NAME_LENGTH characters"
+        }
+        val snapshot = getFlow(tabId) ?: throw IllegalArgumentException("No readable flow '$tabId'")
+        val metadata = (snapshot.metadata ?: FlowMeta()).copy(name = normalizedName)
+        write(tabId, snapshot.copy(metadata = metadata))
+
+        context.tabUpdateProviderFactory?.let { factory ->
+            withContext(Dispatchers.Main.immediate) {
+                factory.createProvider(tabId, FlowTabType.typeId)?.updateTitle(normalizedName)
+            }
+        }
+        return FlowSummary(
+            tabId = tabId,
+            name = normalizedName,
+            description = metadata.description,
+            nodeCount = snapshot.nodes.size,
+        )
+    }
+
+    /**
+     * Permanently delete [tabId], including its UI run-state snapshot. Corrupt graphs
+     * are deletable because existence is checked without decoding the snapshot. Any
+     * live tabs with the same id are closed first so their autosave cannot recreate
+     * the graph after deletion. Returns false when the graph key does not exist.
+     */
+    suspend fun deleteFlow(tabId: String): Boolean {
+        val store = storage ?: throw IllegalStateException("Flow storage is unavailable")
+        if (store.getJson(graphKey(tabId)) == null) return false
+
+        closeOpenFlowTabs(tabId)
+        withContext(NonCancellable) {
+            store.removeJsonValue(graphKey(tabId))
+            store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
+        }
+        return true
+    }
+
     // ---- async run jobs (F1) ------------------------------------------------
 
     /**
@@ -403,11 +445,22 @@ class FlowController(
         return if (secondColon >= 0) substring(0, secondColon + 1) else "tool:"
     }
 
+    private suspend fun closeOpenFlowTabs(tabId: String) {
+        val activeTabs = context.activeTabsProvider ?: return
+        activeTabs.refreshTabs()
+        val openCount = activeTabs.activeTabs.value.count { it.tabId == tabId }
+        repeat(openCount) {
+            val closed = withContext(Dispatchers.Main.immediate) { activeTabs.closeTab(tabId) }
+            check(closed) { "Could not close open flow tab '$tabId'; deletion was cancelled" }
+        }
+    }
+
     private fun graphKey(tabId: String) = "$GRAPH_PREFIX$tabId"
     private fun runKey(runId: String) = "$RUN_PREFIX$runId"
 
     companion object {
         private const val MAX_KINDS_IN_ERROR = 30
+        const val MAX_FLOW_NAME_LENGTH = 100
         const val STORAGE_NAMESPACE = "ai.rever.boss.plugin.dynamic.flowtab"
         const val GRAPH_PREFIX = "graph:"
         const val RUN_PREFIX = "run:"
