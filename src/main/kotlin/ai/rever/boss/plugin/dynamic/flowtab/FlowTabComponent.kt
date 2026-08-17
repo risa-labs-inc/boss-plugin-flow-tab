@@ -91,7 +91,6 @@ private val ConfirmBg = Color(0xFF3A2E12)
 private val NoticeBg = Color(0xFF26456E)
 private val RunGreen = Color(0xFF2E7D32)
 private const val WAITING_FOR_PREVIOUS_NOTICE = "Waiting for the previous run to stop…"
-private const val STOPPING_PREVIOUS_NOTICE = "Stopping the previous run…"
 
 /**
  * Flow tab component: a node-based canvas where nodes are spawned from the left
@@ -248,6 +247,10 @@ class FlowTabComponent(
         // so an in-flight run survives the split-induced composition recreation)
         fun startRun() {
             if (state.isRunning) return
+            // Claim the next generation before touching shared UI state. This makes
+            // every late callback/finalizer from the previous run stale immediately;
+            // its last snapshot may be skipped because the new run now owns the key.
+            val runToken = runStatePersistence.beginRun()
             // Fresh start: close the browser tab a prior run opened (no-op if the user
             // already closed it) and clear tracking, so this run opens a new visible
             // tab rather than reusing a stale/closed one or stacking splits.
@@ -261,7 +264,6 @@ class FlowTabComponent(
             if (waitingForPrevious) {
                 state.notice = WAITING_FOR_PREVIOUS_NOTICE
             }
-            val runToken = runStatePersistence.beginRun()
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
             val job = runJobs.launch(Dispatchers.Default) {
@@ -350,8 +352,7 @@ class FlowTabComponent(
                     state.notice = when {
                         cause is PredecessorRunTimeoutException ->
                             "Previous run is not responding; queued run was cancelled"
-                        state.notice == WAITING_FOR_PREVIOUS_NOTICE ||
-                            state.notice == STOPPING_PREVIOUS_NOTICE -> null
+                        state.notice == WAITING_FOR_PREVIOUS_NOTICE -> null
                         else -> state.notice
                     }
                     Snapshot.sendApplyNotifications()
@@ -361,9 +362,6 @@ class FlowTabComponent(
 
         fun stopRun() {
             runJobs.cancelAll()
-            if (state.notice == WAITING_FOR_PREVIOUS_NOTICE) {
-                state.notice = STOPPING_PREVIOUS_NOTICE
-            }
         }
 
         // ---- export / import ----
