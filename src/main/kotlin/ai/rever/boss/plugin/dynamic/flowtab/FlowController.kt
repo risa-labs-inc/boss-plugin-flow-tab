@@ -173,6 +173,30 @@ class FlowController(
         )
     }
 
+    /** Rename a readable flow without changing any other metadata or graph content. */
+    suspend fun renameFlow(tabId: String, name: String): FlowSummary {
+        val normalizedName = name.trim()
+        require(normalizedName.isNotEmpty()) { "Flow name cannot be blank" }
+        require(normalizedName.length <= MAX_FLOW_NAME_LENGTH) {
+            "Flow name cannot exceed $MAX_FLOW_NAME_LENGTH characters"
+        }
+        val snapshot = getFlow(tabId) ?: throw IllegalArgumentException("No readable flow '$tabId'")
+        val metadata = (snapshot.metadata ?: FlowMeta()).copy(name = normalizedName)
+        write(tabId, snapshot.copy(metadata = metadata))
+
+        context.tabUpdateProviderFactory?.let { factory ->
+            withContext(Dispatchers.Main.immediate) {
+                factory.createProvider(tabId, FlowTabType.typeId)?.updateTitle(normalizedName)
+            }
+        }
+        return FlowSummary(
+            tabId = tabId,
+            name = normalizedName,
+            description = metadata.description,
+            nodeCount = snapshot.nodes.size,
+        )
+    }
+
     /**
      * Permanently delete [tabId], including its UI run-state snapshot. Corrupt graphs
      * are deletable because existence is checked without decoding the snapshot. Any
@@ -436,6 +460,7 @@ class FlowController(
 
     companion object {
         private const val MAX_KINDS_IN_ERROR = 30
+        const val MAX_FLOW_NAME_LENGTH = 100
         const val STORAGE_NAMESPACE = "ai.rever.boss.plugin.dynamic.flowtab"
         const val GRAPH_PREFIX = "graph:"
         const val RUN_PREFIX = "run:"

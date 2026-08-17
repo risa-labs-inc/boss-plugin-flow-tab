@@ -212,6 +212,36 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `renameFlow preserves metadata and graph content`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(
+            FlowMeta(name = "Old name", description = "Keep me", version = 3, inputs = listOf("claimId"))
+        )
+        val nodeId = fc.addNode(tabId, "TRIGGER")
+
+        val summary = fc.renameFlow(tabId, "  Claims intake  ")
+        val renamed = fc.getFlow(tabId)!!
+
+        assertEquals("Claims intake", summary.name)
+        assertEquals("Claims intake", renamed.metadata?.name)
+        assertEquals("Keep me", renamed.metadata?.description)
+        assertEquals(3, renamed.metadata?.version)
+        assertEquals(listOf("claimId"), renamed.metadata?.inputs)
+        assertEquals(nodeId, renamed.nodes.single().id)
+    }
+
+    @Test
+    fun `renameFlow rejects blank names and unreadable flows`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        storage.putJson("${FlowController.GRAPH_PREFIX}flow-corrupt", "{not-json")
+
+        assertFailsWith<IllegalArgumentException> { fc.renameFlow(tabId, "   ") }
+        assertFailsWith<IllegalArgumentException> { fc.renameFlow("flow-corrupt", "New name") }
+    }
+
+    @Test
     fun `deleteFlow removes graph and persisted UI run state`() = runBlocking {
         val storage = DesktopStorage()
         val fc = controller(storage)

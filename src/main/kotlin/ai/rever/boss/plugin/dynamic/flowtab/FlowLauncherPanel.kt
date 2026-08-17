@@ -27,11 +27,13 @@ import androidx.compose.material.Icon
 import androidx.compose.material.IconButton
 import androidx.compose.material.Text
 import androidx.compose.material.TextButton
+import androidx.compose.material.TextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -91,6 +93,9 @@ class FlowLauncherComponent(
         var openingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
         var deletingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
         var pendingDelete by remember { mutableStateOf<FlowSummary?>(null) }
+        var renamingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+        var pendingRename by remember { mutableStateOf<FlowSummary?>(null) }
+        var renameText by remember { mutableStateOf("") }
         val scope = rememberCoroutineScope()
 
         LaunchedEffect(controller, refreshGeneration) {
@@ -208,6 +213,7 @@ class FlowLauncherComponent(
                         openEnabled = flow.readable && splitView != null &&
                             context.activeTabsProvider != null && flow.tabId !in openingFlowIds,
                         deleteEnabled = controller != null && flow.tabId !in deletingFlowIds,
+                        renameEnabled = flow.readable && controller != null && flow.tabId !in renamingFlowIds,
                         onOpen = {
                             if (flow.tabId in openingFlowIds) return@SavedFlowRow
                             openingFlowIds += flow.tabId
@@ -233,6 +239,10 @@ class FlowLauncherComponent(
                                     openingFlowIds -= flow.tabId
                                 }
                             }
+                        },
+                        onRename = {
+                            renameText = flow.name
+                            pendingRename = flow
                         },
                         onDelete = { pendingDelete = flow },
                     )
@@ -277,6 +287,52 @@ class FlowLauncherComponent(
                 },
             )
         }
+
+        pendingRename?.let { flow ->
+            AlertDialog(
+                onDismissRequest = { pendingRename = null },
+                title = { Text("Rename saved flow") },
+                text = {
+                    TextField(
+                        value = renameText,
+                        onValueChange = { renameText = it.take(FlowController.MAX_FLOW_NAME_LENGTH) },
+                        label = { Text("Flow name") },
+                        singleLine = true,
+                    )
+                },
+                confirmButton = {
+                    TextButton(
+                        enabled = renameText.isNotBlank(),
+                        onClick = {
+                            val newName = renameText.trim()
+                            pendingRename = null
+                            if (flow.tabId in renamingFlowIds) return@TextButton
+                            renamingFlowIds += flow.tabId
+                            operationError = null
+                            scope.launch {
+                                try {
+                                    val renamed = withContext(Dispatchers.IO) {
+                                        requireNotNull(controller).renameFlow(flow.tabId, newName)
+                                    }
+                                    savedFlows = savedFlows.map { current ->
+                                        if (current.tabId == flow.tabId) renamed else current
+                                    }
+                                } catch (failure: Exception) {
+                                    operationError = failure.message ?: failure.toString()
+                                } finally {
+                                    renamingFlowIds -= flow.tabId
+                                }
+                            }
+                        },
+                    ) {
+                        Text("Save")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { pendingRename = null }) { Text("Cancel") }
+                },
+            )
+        }
     }
 }
 
@@ -303,8 +359,10 @@ private fun SavedFlowRow(
     flow: FlowSummary,
     openEnabled: Boolean,
     deleteEnabled: Boolean,
+    renameEnabled: Boolean,
     onOpen: () -> Unit,
     onDelete: () -> Unit,
+    onRename: () -> Unit,
 ) {
     val title = flow.name.ifBlank { "Untitled Flow" }
     Row(
@@ -348,13 +406,23 @@ private fun SavedFlowRow(
                 overflow = TextOverflow.Ellipsis,
             )
         }
-        IconButton(enabled = deleteEnabled, onClick = onDelete, modifier = Modifier.size(30.dp)) {
-            Icon(
-                Icons.Outlined.Delete,
-                contentDescription = "Delete $title",
-                tint = if (deleteEnabled) Color(0xFFB0B0B8) else Color(0xFF66666F),
-                modifier = Modifier.size(16.dp),
-            )
+        Column {
+            IconButton(enabled = renameEnabled, onClick = onRename, modifier = Modifier.size(30.dp)) {
+                Icon(
+                    Icons.Outlined.Edit,
+                    contentDescription = "Rename $title",
+                    tint = if (renameEnabled) Color(0xFFB0B0B8) else Color(0xFF66666F),
+                    modifier = Modifier.size(16.dp),
+                )
+            }
+            IconButton(enabled = deleteEnabled, onClick = onDelete, modifier = Modifier.size(30.dp)) {
+                Icon(
+                    Icons.Outlined.Delete,
+                    contentDescription = "Delete $title",
+                    tint = if (deleteEnabled) Color(0xFFB0B0B8) else Color(0xFF66666F),
+                    modifier = Modifier.size(16.dp),
+                )
+            }
         }
     }
 }

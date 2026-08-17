@@ -137,7 +137,7 @@ a provider that exposes logical keys.
 `{ "detail": true }` additionally returns `flowDetails` entries with metadata, node count, and
 readability. `flow_delete` permanently removes a graph and its UI run-state snapshot, closing a
 matching open tab first. The launcher uses the same controller and storage namespace as these MCP
-contracts and asks for confirmation before deletion.
+contracts, lets users rename readable flows, and asks for confirmation before deletion.
 
 ## Version Management
 
