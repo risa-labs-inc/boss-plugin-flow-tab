@@ -1,6 +1,8 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -96,5 +98,37 @@ class NodeExecutorsTest {
         assertFalse(missing)
         assertFalse(bothMissing)
         assertFailsWith<ExecError> { evaluate("10d > 5") }
+    }
+
+    @Test
+    fun `secret templates preserve normal interpolation and fetch repeated names once`() = runBlocking {
+        var lookups = 0
+        val resolver = SecretTemplateResolver(SecretResolver { name ->
+            lookups++
+            "resolved-$name"
+        })
+
+        val result = resolver.resolve(
+            "item={{ \$json.id }}; first={{ \$secret.token }}; second={{\$secret.token}}",
+        ) { fragment -> fragment.replace("{{ \$json.id }}", "42") }
+
+        assertEquals("item=42; first=resolved-token; second=resolved-token", result)
+        assertEquals(1, lookups)
+    }
+
+    @Test
+    fun `missing and malformed secret references fail without exposing provider errors`() = runBlocking {
+        val missing = assertFailsWith<ExecError> {
+            SecretTemplateResolver(SecretResolver { throw IllegalStateException("provider credential") })
+                .resolve("{{ \$secret.token }}") { it }
+        }
+        assertEquals("HTTP secret 'token' was not found", missing.message)
+        assertFalse(missing.message!!.contains("provider credential"))
+
+        val malformed = assertFailsWith<ExecError> {
+            SecretTemplateResolver(SecretResolver.constant("value"))
+                .resolve("{{ \$secret['token'] }}") { it }
+        }
+        assertTrue(malformed.message!!.contains("use {{ \$secret.name }}"))
     }
 }

@@ -12,9 +12,11 @@ import java.net.InetSocketAddress
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -45,14 +47,18 @@ class HttpNodeTest {
     private fun n(id: String, type: NodeType, vararg cfg: Pair<String, String>) =
         PlanNode(id, type.name, id, buildJsonObject { cfg.forEach { put(it.first, it.second) } })
 
-    private fun run(nodes: List<PlanNode>, edges: List<EdgeModel>): Map<String, NodeRun> {
+    private fun run(
+        nodes: List<PlanNode>,
+        edges: List<EdgeModel>,
+        secrets: SecretResolver = SecretResolver.constant(null),
+    ): Map<String, NodeRun> {
         val states = ConcurrentHashMap<String, NodeRun>()
         runBlocking(Dispatchers.Default) {
             FlowExecutor(object : ai.rever.boss.plugin.api.PluginContext {
                 override val panelRegistry = ai.rever.boss.plugin.api.PanelRegistry()
                 override val tabRegistry = ai.rever.boss.plugin.api.TabRegistry()
                 override val pluginScope = kotlinx.coroutines.CoroutineScope(Dispatchers.Default)
-            }).run(nodes, edges) { id, r -> states[id] = r }
+            }, secrets = secrets).run(nodes, edges) { id, r -> states[id] = r }
         }
         return states
     }
@@ -95,5 +101,76 @@ class HttpNodeTest {
         } finally {
             server.stop(0)
         }
+    }
+
+    @Test
+    fun `http resolves secrets at runtime without changing config or leaking logs`() {
+        val receivedPath = AtomicReference<String>()
+        val receivedAuth = AtomicReference<String>()
+        val receivedBody = AtomicReference<String>()
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
+            createContext("/") { exchange ->
+                receivedPath.set(exchange.requestURI.path)
+                receivedAuth.set(exchange.requestHeaders.getFirst("Authorization"))
+                receivedBody.set(exchange.requestBody.bufferedReader().readText())
+                val bytes = "ok".toByteArray()
+                exchange.sendResponseHeaders(200, bytes.size.toLong())
+                exchange.responseBody.use { it.write(bytes) }
+            }
+            start()
+        }
+        val token = "token-that-must-stay-private"
+        val path = "private-webhook-path"
+        val resolver = SecretResolver { name ->
+            when (name) {
+                "api_token" -> token
+                "webhook_path" -> path
+                else -> null
+            }
+        }
+        val http = n(
+            "h",
+            NodeType.HTTP,
+            "method" to "POST",
+            "url" to "http://127.0.0.1:${server.address.port}/{{ \$secret.webhook_path }}",
+            "headers" to "{\"Authorization\":\"Bearer {{ \$secret.api_token }}\"}",
+            "body" to "credential={{ \$secret.api_token }}",
+        )
+
+        try {
+            val states = run(
+                listOf(n("t", NodeType.TRIGGER), http),
+                listOf(EdgeModel("t-h", "t", 0, "h", 0)),
+                resolver,
+            )
+
+            assertEquals("/$path", receivedPath.get())
+            assertEquals("Bearer $token", receivedAuth.get())
+            assertEquals("credential=$token", receivedBody.get())
+            assertTrue(http.config.toString().contains("\$secret.api_token"))
+            assertFalse(http.config.toString().contains(token))
+            val report = states.getValue("h").let { it.logs.joinToString("\n") + it.error.orEmpty() }
+            assertFalse(report.contains(token))
+            assertFalse(report.contains(path))
+            assertEquals(listOf("POST HTTP request", "→ 200"), states.getValue("h").logs)
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `http request errors do not expose a resolved secret URL`() {
+        val secretUrl = "://credential-that-must-not-appear"
+        val http = n("h", NodeType.HTTP, "url" to "{{ \$secret.bad_url }}")
+
+        val states = run(
+            listOf(n("t", NodeType.TRIGGER), http),
+            listOf(EdgeModel("t-h", "t", 0, "h", 0)),
+            SecretResolver { name -> secretUrl.takeIf { name == "bad_url" } },
+        )
+
+        val report = states.getValue("h").let { it.logs.joinToString("\n") + it.error.orEmpty() }
+        assertFalse(report.contains(secretUrl))
+        assertEquals("HTTP request failed before a response was received", states.getValue("h").error)
     }
 }

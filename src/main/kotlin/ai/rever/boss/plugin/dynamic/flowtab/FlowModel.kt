@@ -123,9 +123,14 @@ enum class NodeType(
         )
         HTTP -> listOf(
             ConfigField("method", "Method", FieldType.SELECT, listOf("GET", "POST", "PUT", "DELETE", "PATCH"), default = "GET"),
-            ConfigField("url", "URL", FieldType.TEXT, placeholder = "https://api.example.com/x"),
-            ConfigField("headers", "Headers (JSON)", FieldType.TEXTAREA, placeholder = "{\"Authorization\":\"Bearer …\"}"),
-            ConfigField("body", "Body", FieldType.TEXTAREA, placeholder = "{{ \$json }} or raw text")
+            ConfigField("url", "URL", FieldType.TEXT, placeholder = "https://…/{{ \$secret.webhook_path }}"),
+            ConfigField(
+                "headers",
+                "Headers (JSON)",
+                FieldType.TEXTAREA,
+                placeholder = "{\"Authorization\":\"Bearer {{ \$secret.api_token }}\"}",
+            ),
+            ConfigField("body", "Body", FieldType.TEXTAREA, placeholder = "{{ \$json }} or {{ \$secret.api_token }}")
         )
         SET -> listOf(
             ConfigField("assignments", "Fields (JSON: key → value/expr)", FieldType.TEXTAREA, placeholder = "{\"name\":\"{{ \$json.first }}\"}")
