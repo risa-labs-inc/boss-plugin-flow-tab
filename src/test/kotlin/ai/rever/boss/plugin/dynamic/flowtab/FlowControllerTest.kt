@@ -23,6 +23,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
@@ -284,6 +285,50 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `renameOpenFlow reports unavailable storage instead of false success`() = runBlocking {
+        val noStorageContext = object : PluginContext {
+            override val panelRegistry = PanelRegistry()
+            override val tabRegistry = TabRegistry()
+            override val pluginScope = scope
+            override val mcpToolRegistry: McpToolRegistry? = null
+            override val pluginStorageFactory: PluginStorageFactory? = null
+        }
+        val fc = FlowController(noStorageContext, { scope })
+
+        val failure = assertFailsWith<IllegalStateException> {
+            fc.renameOpenFlow("flow-no-storage", "New name", GraphSnapshot())
+        }
+        assertEquals("Flow storage is unavailable", failure.message)
+    }
+
+    @Test
+    fun `renameOpenFlow finishes its durable write after caller cancellation`() = runBlocking {
+        val writeStarted = CompletableDeferred<Unit>()
+        val allowWrite = CompletableDeferred<Unit>()
+        val storage = object : DesktopStorage() {
+            override suspend fun putJson(key: String, jsonValue: String) {
+                writeStarted.complete(Unit)
+                allowWrite.await()
+                super.putJson(key, jsonValue)
+            }
+        }
+        val fc = controller(storage)
+        val tabId = "flow-close-during-rename"
+        val rename = launch {
+            fc.renameOpenFlow(tabId, "Durable name", GraphSnapshot())
+        }
+
+        writeStarted.await()
+        rename.cancel()
+        assertFalse(rename.isCompleted)
+        allowWrite.complete(Unit)
+        rename.join()
+
+        assertEquals("Durable name", fc.getFlow(tabId)?.metadata?.name)
+        assertTrue(rename.isCancelled)
+    }
+
+    @Test
     fun `renameFlow keeps the graph renamed when the host title refresh fails`() = runBlocking {
         val storage = DesktopStorage()
         val tabId = controller(storage).createFlow(FlowMeta(name = "Old name"))
@@ -346,8 +391,7 @@ class FlowControllerTest {
         val staleOpenTabSnapshot = fc.getFlow(tabId)!!
 
         fc.renameFlow(tabId, "New name")
-        FlowRenameCoordinator.withFlowLock(tabId) {
-            val safeAutosave = FlowRenameCoordinator.applyLatestName(tabId, staleOpenTabSnapshot)
+        FlowRenameCoordinator.persistAutosave(tabId, staleOpenTabSnapshot) { safeAutosave ->
             storage.putJson(
                 "${FlowController.GRAPH_PREFIX}$tabId",
                 kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), safeAutosave),
@@ -356,6 +400,23 @@ class FlowControllerTest {
 
         assertEquals("New name", fc.getFlow(tabId)?.metadata?.name)
         assertEquals("New name", FlowRenameCoordinator.latestName(tabId))
+
+        FlowRenameCoordinator.persistAutosave(tabId, fc.getFlow(tabId)!!) { convergedAutosave ->
+            storage.putJson(
+                "${FlowController.GRAPH_PREFIX}$tabId",
+                kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), convergedAutosave),
+            )
+        }
+        assertNull(FlowRenameCoordinator.latestName(tabId))
+
+        val importedSnapshot = fc.getFlow(tabId)!!.copy(metadata = FlowMeta(name = "Imported name"))
+        FlowRenameCoordinator.persistAutosave(tabId, importedSnapshot) { importAutosave ->
+            storage.putJson(
+                "${FlowController.GRAPH_PREFIX}$tabId",
+                kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), importAutosave),
+            )
+        }
+        assertEquals("Imported name", fc.getFlow(tabId)?.metadata?.name)
     }
 
     @Test

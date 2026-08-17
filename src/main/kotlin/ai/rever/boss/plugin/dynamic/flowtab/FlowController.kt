@@ -193,17 +193,22 @@ class FlowController(
         name: String,
         snapshot: GraphSnapshot,
     ): FlowSummary {
+        check(storage != null) { "Flow storage is unavailable" }
         val normalizedName = name.trim()
         require(normalizedName.isNotEmpty()) { "Flow name cannot be blank" }
         require(normalizedName.length <= MAX_FLOW_NAME_LENGTH) {
             "Flow name cannot exceed $MAX_FLOW_NAME_LENGTH characters"
         }
         val metadata = (snapshot.metadata ?: FlowMeta()).copy(name = normalizedName)
-        FlowRenameCoordinator.withFlowLock(tabId) {
-            write(tabId, snapshot.copy(metadata = metadata))
-            // Publish only after the storage write succeeds. Open tabs replay this name
-            // into their live state, and their autosave consults it under the same lock.
-            FlowRenameCoordinator.publish(tabId, normalizedName)
+        // Once the user confirms, tab close/split recomposition must not cancel the
+        // durable write. Cancellation is observed again by the title-refresh step.
+        withContext(NonCancellable + Dispatchers.IO) {
+            FlowRenameCoordinator.withFlowLock(tabId) {
+                write(tabId, snapshot.copy(metadata = metadata))
+                // Publish only after the storage write succeeds. Open tabs replay this name
+                // into their live state, and their autosave consults it under the same lock.
+                FlowRenameCoordinator.publish(tabId, normalizedName)
+            }
         }
 
         context.tabUpdateProviderFactory?.let { factory ->
@@ -417,6 +422,8 @@ class FlowController(
     // ---- internals ----------------------------------------------------------
 
     private suspend fun write(tabId: String, snapshot: GraphSnapshot) {
+        // TODO: Controller read-modify-write authoring operations are not yet serialized
+        // against full-snapshot UI autosaves; the rename path coordinates explicitly.
         storage?.putJson(graphKey(tabId), json.encodeToString(GraphSnapshot.serializer(), snapshot))
     }
 

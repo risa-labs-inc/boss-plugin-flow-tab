@@ -151,6 +151,7 @@ class FlowTabComponent(
     private val runJobs = RunJobFence(coroutineScope)
     private val runStatePersistence = RunStatePersistenceGate()
     private var initialized by mutableStateOf(false)
+    private var renameSyncRevision by mutableStateOf(0L)
     // "Realistic" mode: pace the run with human-like delays between steps, so it's
     // watchable and mimics a person driving the page. Observed by the toolbar.
     private var realistic by mutableStateOf(false)
@@ -231,6 +232,10 @@ class FlowTabComponent(
                 renamed[config.id]?.let { name ->
                     val metadata = (state.metadata ?: FlowMeta()).copy(name = name)
                     if (state.metadata != metadata) state.metadata = metadata
+                    // Force one autosave even when an in-tab optimistic update already
+                    // installed this name before the controller published it. That save
+                    // acknowledges convergence and releases the temporary rename guard.
+                    renameSyncRevision++
                 }
             }
         }
@@ -240,11 +245,10 @@ class FlowTabComponent(
         LaunchedEffect(config.id) {
             if (storage == null) return@LaunchedEffect
             while (!initialized) delay(20)
-            snapshotFlow { state.toSnapshot() }.collectLatest { snapshot ->
+            snapshotFlow { renameSyncRevision to state.toSnapshot() }.collectLatest { (_, snapshot) ->
                 delay(400)
                 runCatching {
-                    FlowRenameCoordinator.withFlowLock(config.id) {
-                        val current = FlowRenameCoordinator.applyLatestName(config.id, snapshot)
+                    FlowRenameCoordinator.persistAutosave(config.id, snapshot) { current ->
                         storage.putJson(storageKey, json.encodeToString(GraphSnapshot.serializer(), current))
                     }
                 }
@@ -704,13 +708,15 @@ class FlowTabComponent(
                                 state.metadata = renamedMetadata
                                 showRename = false
                                 renameInProgress = true
-                                uiScope.launch {
+                                // Component scope survives split-induced recomposition;
+                                // controller persistence itself survives final tab close.
+                                coroutineScope.launch {
                                     try {
-                                        withContext(Dispatchers.IO) {
-                                            controller.renameOpenFlow(config.id, newName, renamedSnapshot)
-                                        }
+                                        controller.renameOpenFlow(config.id, newName, renamedSnapshot)
                                         state.notice = "Renamed flow to '$newName'"
                                     } catch (cancelled: CancellationException) {
+                                        // The controller's durable write is non-cancellable; a
+                                        // surviving/recreated composition replays its published name.
                                         state.metadata = previousMetadata
                                         throw cancelled
                                     } catch (failure: Exception) {

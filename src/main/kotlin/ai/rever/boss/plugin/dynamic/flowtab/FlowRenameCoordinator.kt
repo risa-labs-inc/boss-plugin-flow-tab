@@ -23,20 +23,41 @@ internal object FlowRenameCoordinator {
     suspend fun <T> withFlowLock(tabId: String, block: suspend () -> T): T =
         locks.computeIfAbsent(tabId) { Mutex() }.withLock { block() }
 
+    /**
+     * Serialize an open tab's full-snapshot write against rename and replace only a
+     * stale name. Once the live tab has saved the published name, the guard has
+     * converged and is removed so a later import may intentionally change metadata.
+     */
+    suspend fun persistAutosave(
+        tabId: String,
+        snapshot: GraphSnapshot,
+        persist: suspend (GraphSnapshot) -> Unit,
+    ) = withFlowLock(tabId) {
+        val name = latestName(tabId)
+        when {
+            name == null -> persist(snapshot)
+            snapshot.metadata?.name == name -> {
+                persist(snapshot)
+                // Clear only after the converged snapshot is durable. A failed save
+                // must leave the stale-write protection in place for the next attempt.
+                forget(tabId)
+            }
+            else -> {
+                val metadata = (snapshot.metadata ?: FlowMeta()).copy(name = name)
+                persist(snapshot.copy(metadata = metadata))
+            }
+        }
+    }
+
     fun publish(tabId: String, name: String) {
         mutableNames.update { current -> current + (tabId to name) }
     }
 
     fun latestName(tabId: String): String? = mutableNames.value[tabId]
 
-    /** Preserve a newer rename when an autosave was captured from stale open-tab state. */
-    fun applyLatestName(tabId: String, snapshot: GraphSnapshot): GraphSnapshot {
-        val name = latestName(tabId) ?: return snapshot
-        val metadata = (snapshot.metadata ?: FlowMeta()).copy(name = name)
-        return if (snapshot.metadata == metadata) snapshot else snapshot.copy(metadata = metadata)
-    }
-
     fun forget(tabId: String) {
         mutableNames.update { current -> current - tabId }
+        // Keep the mutex entry for the plugin lifetime. Removing a held mutex could
+        // let an already-waiting writer and a new writer acquire different locks.
     }
 }
