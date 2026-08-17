@@ -72,16 +72,14 @@ import com.arkivanov.essenty.lifecycle.Lifecycle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.roundToInt
 
 private val ToolbarBg = Color(0xFF202024)
@@ -92,6 +90,7 @@ private val IconTint = Color(0xFFCDCDD4)
 private val ConfirmBg = Color(0xFF3A2E12)
 private val NoticeBg = Color(0xFF26456E)
 private val RunGreen = Color(0xFF2E7D32)
+private const val WAITING_FOR_PREVIOUS_NOTICE = "Waiting for the previous run to stop…"
 
 /**
  * Flow tab component: a node-based canvas where nodes are spawned from the left
@@ -140,14 +139,15 @@ class FlowTabComponent(
     // Bundled starter templates (scrape / agent), enumerated from resources/templates
     // via its index. Read-only; instantiated into a new tab from the gallery overlay.
     private val templateCatalog = TemplateCatalog()
-    private var runJob: Job? = null
+    private val runJobs = RunJobFence(coroutineScope)
+    private val runStatePersistence = RunStatePersistenceGate()
     private var initialized = false
     // "Realistic" mode: pace the run with human-like delays between steps, so it's
     // watchable and mimics a person driving the page. Observed by the toolbar.
     private var realistic by mutableStateOf(false)
     // The visible browser tab this flow opened; closed at the start of the next run
     // so each Run opens a fresh tab (no stale reuse, no stacked splits).
-    private var visibleTabId: String? = null
+    private val visibleTabId = AtomicReference<String?>(null)
 
     init {
         // Surface the host registry's tools as live palette nodes, re-deriving whenever
@@ -243,22 +243,38 @@ class FlowTabComponent(
         fun viewCenterScreen(): Offset =
             Offset(viewportSize.width / 2f, viewportSize.height / 2f)
 
-        // ---- run wiring ---- (state/executor/runJob/toggles are component fields,
+        // ---- run wiring ---- (state/executor/runJobs/toggles are component fields,
         // so an in-flight run survives the split-induced composition recreation)
         fun startRun() {
             if (state.isRunning) return
+            // Claim the next generation before touching shared UI state. This makes
+            // every late callback/finalizer from the previous run stale immediately;
+            // its last snapshot may be skipped because the new run now owns the key.
+            val runToken = runStatePersistence.beginRun()
             // Fresh start: close the browser tab a prior run opened (no-op if the user
             // already closed it) and clear tracking, so this run opens a new visible
             // tab rather than reusing a stale/closed one or stacking splits.
-            visibleTabId?.let { id -> runCatching { context.activeTabsProvider?.closeTab(id) } }
-            visibleTabId = null
+            visibleTabId.getAndSet(null)?.let { id ->
+                runCatching { context.activeTabsProvider?.closeTab(id) }
+            }
             state.clearRun()
             state.notice = null
             state.isRunning = true
+            val waitingForPrevious = runJobs.hasActiveRun()
+            if (waitingForPrevious) {
+                state.notice = WAITING_FOR_PREVIOUS_NOTICE
+            }
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
-            runJob = coroutineScope.launch(Dispatchers.Default) {
+            val job = runJobs.launch(Dispatchers.Default) {
                 try {
+                    if (waitingForPrevious &&
+                        runStatePersistence.isCurrent(runToken) &&
+                        state.notice == WAITING_FOR_PREVIOUS_NOTICE
+                    ) {
+                        state.notice = null
+                        Snapshot.sendApplyNotifications()
+                    }
                     // Write status straight from the run thread. These are observable
                     // snapshot-state writes, so Compose picks them up on the next frame
                     // and the canvas updates live. (Marshalling them onto the Main scope
@@ -267,32 +283,85 @@ class FlowTabComponent(
                     executor.run(
                         plan, edges,
                         humanize = realistic,
-                        onVisibleTab = { id -> visibleTabId = id },
+                        onVisibleTab = { id ->
+                            if (id == null) {
+                                if (runStatePersistence.isCurrent(runToken)) {
+                                    visibleTabId.set(null)
+                                }
+                            } else {
+                                val tabId = id
+                                if (runStatePersistence.isCurrent(runToken)) {
+                                    visibleTabId.set(tabId)
+                                    // Close a tab published across a concurrent Clear
+                                    // after the first generation check passed.
+                                    if (!runStatePersistence.isCurrent(runToken) &&
+                                        visibleTabId.compareAndSet(tabId, null)
+                                    ) {
+                                        coroutineScope.launch(Dispatchers.Main) {
+                                            runCatching { context.activeTabsProvider?.closeTab(tabId) }
+                                        }
+                                    }
+                                } else {
+                                    coroutineScope.launch(Dispatchers.Main) {
+                                        runCatching { context.activeTabsProvider?.closeTab(tabId) }
+                                    }
+                                }
+                            }
+                        },
                         // Seed this flow's own id so a lanager pointing back at it is caught
                         // as a cycle at depth 0, not only one level deeper (red-team S7).
                         ancestry = setOf(config.id),
-                    ) { id, run -> state.runStates[id] = run }
+                    ) { id, run ->
+                        // A check/write can straddle Clear, but orphaned ids do not render
+                        // and the separately gated finalizer cannot persist them.
+                        if (runStatePersistence.isCurrent(runToken)) state.runStates[id] = run
+                    }
                 } catch (ce: CancellationException) {
                     // stopped by user
                 } catch (e: Exception) {
-                    state.runError = e.message ?: e.toString()
+                    if (runStatePersistence.isCurrent(runToken)) {
+                        state.runError = e.message ?: e.toString()
+                    }
                 } finally {
-                    state.isRunning = false
+                    // Give ordinary Stop immediate feedback. invokeOnCompletion below
+                    // remains the fallback for a queued job cancelled before this block.
+                    if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
                     // Persist the run results (capped) so they survive reopening.
-                    withContext(NonCancellable) {
-                        runCatching {
+                    try {
+                        val persisted = persistRunStateOnIo(runStatePersistence, runToken) {
                             storage?.putJson(
                                 "$RUN_STATE_PREFIX${config.id}",
                                 json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
                             )
                         }
+                        if (!persisted && runStatePersistence.isCurrent(runToken)) {
+                            state.notice = "Run completed, but its saved state timed out"
+                            Snapshot.sendApplyNotifications()
+                        }
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        // Run-state persistence is best-effort, as before.
                     }
+                }
+            }
+            // This also runs when a queued job is cancelled before its block starts.
+            job.invokeOnCompletion { cause ->
+                if (runStatePersistence.isCurrent(runToken)) {
+                    state.isRunning = false
+                    state.notice = when {
+                        cause is PredecessorRunTimeoutException ->
+                            "Previous run is not responding; queued run was cancelled"
+                        state.notice == WAITING_FOR_PREVIOUS_NOTICE -> null
+                        else -> state.notice
+                    }
+                    Snapshot.sendApplyNotifications()
                 }
             }
         }
 
         fun stopRun() {
-            runJob?.cancel()
+            runJobs.cancelAll()
         }
 
         // ---- export / import ----
@@ -334,17 +403,35 @@ class FlowTabComponent(
         }
 
         fun doClear() {
+            // Invalidate before cancelling or mutating state so late executor callbacks
+            // and the run finalizer cannot repopulate the cleared snapshot.
+            val invalidation = runStatePersistence.invalidateRun()
+            runJobs.cancelAll()
+            state.isRunning = false
+            state.notice = null
+            visibleTabId.getAndSet(null)?.let { id ->
+                runCatching { context.activeTabsProvider?.closeTab(id) }
+            }
             state.nodes.clear()
             state.edges.clear()
             state.clearRun()
             state.selection = null
-            uiScope.launch {
+            // Component scope survives split-collapse recomposition. Closing the Flow
+            // tab itself still cancels this scope before an undispatched clear can start.
+            coroutineScope.launch(Dispatchers.IO) {
                 try {
-                    clearPersistedRunState(storage, config.id)
+                    val result = runStatePersistence.clearAfterInvalidation(invalidation) {
+                        clearPersistedRunState(storage, config.id)
+                    }
+                    when (result) {
+                        RunStateClearResult.CLEARED,
+                        RunStateClearResult.PRESERVED_NEWER -> Unit
+                    }
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {
                     state.notice = "Flow cleared, but saved run state could not be removed: ${failure.message}"
+                    Snapshot.sendApplyNotifications()
                 }
             }
         }
