@@ -41,8 +41,9 @@ internal class RunStatePersistenceGate(
 
     fun isCurrent(token: Long): Boolean = generation.get() == token
 
-    suspend fun persistIfCurrent(token: Long, persist: suspend () -> Unit): Boolean =
-        withContext(NonCancellable) {
+    suspend fun persistIfCurrent(token: Long, persist: suspend () -> Unit): Boolean {
+        if (!isCurrent(token)) return false
+        return withContext(NonCancellable) {
             // This bounds mutex contention and suspending provider calls. A host API
             // that blocks its thread without suspending cannot be pre-empted.
             withTimeoutOrNull(persistTimeoutMs) {
@@ -54,6 +55,7 @@ internal class RunStatePersistenceGate(
                 }
             } ?: false
         }
+    }
 
     /**
      * Run a destructive clear that was preceded synchronously by [invalidateRun].

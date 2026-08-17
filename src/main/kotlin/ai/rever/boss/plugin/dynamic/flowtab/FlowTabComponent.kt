@@ -77,6 +77,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.atomic.AtomicReference
@@ -266,8 +267,12 @@ class FlowTabComponent(
             val edges = state.edges.toList()
             val job = runJobs.launch(Dispatchers.Default) {
                 try {
-                    if (waitingForPrevious && runStatePersistence.isCurrent(runToken)) {
+                    if (waitingForPrevious &&
+                        runStatePersistence.isCurrent(runToken) &&
+                        state.notice == WAITING_FOR_PREVIOUS_NOTICE
+                    ) {
                         state.notice = null
+                        Snapshot.sendApplyNotifications()
                     }
                     // Write status straight from the run thread. These are observable
                     // snapshot-state writes, so Compose picks them up on the next frame
@@ -322,11 +327,13 @@ class FlowTabComponent(
                     if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
                     // Persist the run results (capped) so they survive reopening.
                     try {
-                        val persisted = runStatePersistence.persistIfCurrent(runToken) {
-                            storage?.putJson(
-                                "$RUN_STATE_PREFIX${config.id}",
-                                json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
-                            )
+                        val persisted = withContext(Dispatchers.IO) {
+                            runStatePersistence.persistIfCurrent(runToken) {
+                                storage?.putJson(
+                                    "$RUN_STATE_PREFIX${config.id}",
+                                    json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
+                                )
+                            }
                         }
                         if (!persisted && runStatePersistence.isCurrent(runToken)) {
                             state.notice = "Run completed, but its saved state timed out"
@@ -429,6 +436,7 @@ class FlowTabComponent(
                     throw cancelled
                 } catch (failure: Exception) {
                     state.notice = "Flow cleared, but saved run state could not be removed: ${failure.message}"
+                    Snapshot.sendApplyNotifications()
                 }
             }
         }

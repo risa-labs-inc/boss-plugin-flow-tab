@@ -3,11 +3,9 @@ package ai.rever.boss.plugin.dynamic.flowtab
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.CoroutineContext
@@ -31,14 +29,12 @@ internal class RunJobFence(
     ): Job {
         val predecessors = active.filterNot(Job::isCompleted)
         val job = scope.launch(context) {
-            // Cancelling a queued run must not break the dependency chain and let a
-            // third run overlap the still-unwinding first run.
-            val predecessorsFinished = withContext(NonCancellable) {
-                withTimeoutOrNull(predecessorTimeoutMs) {
-                    predecessors.joinAll()
-                    true
-                } ?: false
-            }
+            // Every incomplete predecessor is snapshotted, so cancelling this queued
+            // job is immediate without letting a later run skip an older active one.
+            val predecessorsFinished = withTimeoutOrNull(predecessorTimeoutMs) {
+                predecessors.joinAll()
+                true
+            } ?: false
             if (!predecessorsFinished) throw PredecessorRunTimeoutException()
             coroutineContext.ensureActive()
             block()

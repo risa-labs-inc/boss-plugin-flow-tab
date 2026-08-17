@@ -50,7 +50,7 @@ class RunJobFenceTest {
     }
 
     @Test
-    fun `cancelling a queued run completes it after the prior run unwinds`() = runTimedTest {
+    fun `cancelling a queued run completes immediately`() = runTimedTest {
         val fence = RunJobFence(this)
         val firstStarted = CompletableDeferred<Unit>()
         val releaseFirst = CompletableDeferred<Unit>()
@@ -71,7 +71,7 @@ class RunJobFenceTest {
         yield()
 
         try {
-            assertFalse(completionCalled)
+            assertTrue(completionCalled)
             assertFalse(queuedBlockStarted)
         } finally {
             releaseFirst.complete(Unit)
@@ -79,6 +79,34 @@ class RunJobFenceTest {
         queued.join()
         assertTrue(completionCalled)
         assertFalse(queuedBlockStarted)
+    }
+
+    @Test
+    fun `third run still waits for oldest active run after middle run is cancelled`() = runTimedTest {
+        val fence = RunJobFence(this)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        fence.launch {
+            firstStarted.complete(Unit)
+            withContext(NonCancellable) { releaseFirst.await() }
+        }
+        firstStarted.await()
+
+        val middle = fence.launch { }
+        yield()
+        middle.cancel()
+        middle.join()
+        var thirdStarted = false
+        val third = fence.launch { thirdStarted = true }
+        yield()
+
+        try {
+            assertFalse(thirdStarted)
+        } finally {
+            releaseFirst.complete(Unit)
+        }
+        third.join()
+        assertTrue(thirdStarted)
     }
 
     @Test
