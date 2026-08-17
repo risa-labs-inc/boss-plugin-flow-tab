@@ -108,12 +108,7 @@ class FlowControllerTest {
         }
 
         assertContains(failure.message.orEmpty(), "__invalid_probe_kind__")
-        assertContains(failure.message.orEmpty(), "Valid kinds:")
-        val validKinds = failure.message.orEmpty()
-            .substringAfter("Valid kinds: ")
-            .removeSuffix(".")
-            .split(", ")
-        assertEquals(validKinds.sorted(), validKinds)
+        assertContains(failure.message.orEmpty(), "Valid kinds: CLICK, CODE")
         assertTrue(fc.getFlow(tabId)!!.nodes.isEmpty())
     }
 
@@ -129,6 +124,27 @@ class FlowControllerTest {
 
         assertContains(dynamicFailure.message.orEmpty(), "may still be synchronizing")
         assertTrue(fc.getFlow(tabId)!!.nodes.isEmpty())
+    }
+
+    @Test
+    fun `unknown dynamic kind caps suggestions within its namespace`() = runBlocking {
+        val registry = builtinNodeRegistry().also { reg ->
+            repeat(40) { index ->
+                val id = "tool:ext:server/tool-${index.toString().padStart(2, '0')}"
+                reg.register(NodeSpec.unavailable(id))
+            }
+        }
+        val fc = controller(registry = registry)
+        val tabId = fc.createFlow()
+
+        val failure = assertFailsWith<IllegalArgumentException> {
+            fc.addNode(tabId, "tool:ext:server/missing")
+        }
+
+        assertContains(failure.message.orEmpty(), "tool:ext:server/tool-00")
+        assertContains(failure.message.orEmpty(), "… and 10 more")
+        assertContains(failure.message.orEmpty(), "40 tool kinds currently registered")
+        assertTrue("TRIGGER" !in failure.message.orEmpty())
     }
 
     @Test

@@ -11,15 +11,13 @@ package ai.rever.boss.plugin.dynamic.flowtab
  */
 class NodeRegistry {
     private val specs = LinkedHashMap<String, NodeSpec>()
+    private val lock = Any()
 
-    @Synchronized
-    fun register(spec: NodeSpec) { specs[spec.id] = spec }
+    fun register(spec: NodeSpec) = synchronized(lock) { specs[spec.id] = spec }
 
-    @Synchronized
-    fun unregister(id: String) { specs.remove(id) }
+    fun unregister(id: String) = synchronized(lock) { specs.remove(id) }
 
-    @Synchronized
-    operator fun get(id: String): NodeSpec? = specs[id]
+    operator fun get(id: String): NodeSpec? = synchronized(lock) { specs[id] }
 
     /**
      * The spec for [id], or a first-class [NodeSpec.unavailable] placeholder when no
@@ -27,9 +25,9 @@ class NodeRegistry {
      * the canvas, the inspector) use this so an unknown kind degrades gracefully rather
      * than crashing; the placeholder's null executor produces a clear error at run.
      */
-    @Synchronized
-    fun resolve(id: String): NodeSpec = specs[id] ?: NodeSpec.unavailable(id)
+    fun resolve(id: String): NodeSpec = synchronized(lock) {
+        specs[id] ?: NodeSpec.unavailable(id)
+    }
 
-    @Synchronized
-    fun all(): List<NodeSpec> = specs.values.toList()
+    fun all(): List<NodeSpec> = synchronized(lock) { specs.values.toList() }
 }

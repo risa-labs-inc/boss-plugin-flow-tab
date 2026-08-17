@@ -1,8 +1,11 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 /**
  * The registry is the keystone that replaces the closed [NodeType] enum: an open,
@@ -55,5 +58,35 @@ class NodeRegistryTest {
         reg.register(spec("A"))
         reg.unregister("A")
         assertNull(reg["A"])
+    }
+
+    @Test
+    fun `snapshots stay safe while registrations change concurrently`() {
+        val reg = NodeRegistry()
+        repeat(100) { reg.register(spec("seed-$it")) }
+        val failures = ConcurrentLinkedQueue<Throwable>()
+
+        val writer = thread(name = "registry-writer") {
+            repeat(10_000) { index ->
+                runCatching {
+                    val id = "dynamic-${index % 200}"
+                    reg.register(spec(id))
+                    if (index % 2 == 0) reg.unregister(id)
+                }.onFailure(failures::add)
+            }
+        }
+        val reader = thread(name = "registry-reader") {
+            repeat(10_000) { index ->
+                runCatching {
+                    reg.all()
+                    reg.resolve("dynamic-${index % 200}")
+                }.onFailure(failures::add)
+            }
+        }
+
+        writer.join()
+        reader.join()
+
+        assertTrue(failures.isEmpty(), failures.joinToString("\n"))
     }
 }
