@@ -80,7 +80,6 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         // Use the host's normal sidebar behavior so clicking Flow opens this browser
         // instead of silently creating another canvas. The same storage-seated
         // controller powers both the launcher list and MCP discovery.
-        FlowLauncherInfo.onLaunch = null
         context.panelRegistry.registerPanel(FlowLauncherInfo) { ctx, panelInfo ->
             FlowLauncherComponent(ctx, panelInfo, context, headlessController)
         }
@@ -99,7 +98,6 @@ class FlowTabDynamicPlugin : DynamicPlugin {
             runCatching { runBlocking { withTimeoutOrNull(5_000) { mgr.disposeAll() } } }
         }
         externalMcp = null
-        FlowLauncherInfo.onLaunch = null // drop the captured context to avoid a leak
         pluginContext = null
     }
 }

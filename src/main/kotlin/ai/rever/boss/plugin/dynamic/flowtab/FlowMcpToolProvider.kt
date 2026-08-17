@@ -160,7 +160,8 @@ class FlowMcpToolProvider(
     private fun JsonObject.str(key: String): String? = (this[key] as? kotlinx.serialization.json.JsonPrimitive)?.content
     private fun JsonObject.int(key: String, default: Int = 0): Int =
         runCatching { this[key]?.jsonPrimitive?.int }.getOrNull() ?: default
-    private fun JsonObject.bool(key: String): Boolean = this[key]?.jsonPrimitive?.booleanOrNull ?: false
+    private fun JsonObject.bool(key: String): Boolean =
+        (this[key] as? kotlinx.serialization.json.JsonPrimitive)?.booleanOrNull ?: false
 
     private fun JsonObject.metaOrNull(): FlowMeta? {
         val name = str("name")

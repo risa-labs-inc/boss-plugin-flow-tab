@@ -10,8 +10,6 @@ import ai.rever.boss.plugin.api.SidebarItem
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -21,6 +19,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.Icon
 import androidx.compose.material.Text
@@ -34,6 +34,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,6 +46,8 @@ import androidx.compose.ui.unit.sp
 import com.arkivanov.decompose.ComponentContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
@@ -55,11 +58,8 @@ object FlowLauncherInfo : PanelInfo {
     override val icon = Icons.Outlined.AccountTree
     override val defaultSlotPosition = left.bottom
 
-    /** Null uses the host's normal sidebar behavior and toggles this launcher panel. */
-    var onLaunch: (() -> Unit)? = null
-
     override val sidebarItem: SidebarItem
-        get() = SidebarItem(id, icon, displayName, onClick = onLaunch)
+        get() = SidebarItem(id, icon, displayName, onClick = null)
 }
 
 /**
@@ -83,8 +83,11 @@ class FlowLauncherComponent(
         var loading by remember { mutableStateOf(true) }
         var loadError by remember { mutableStateOf<String?>(null) }
         var refreshGeneration by remember { mutableIntStateOf(0) }
+        var openingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+        val scope = rememberCoroutineScope()
 
         LaunchedEffect(controller, refreshGeneration) {
+            val requestGeneration = refreshGeneration
             if (controller == null) {
                 loading = false
                 loadError = "Saved-flow storage is unavailable in this context."
@@ -99,7 +102,7 @@ class FlowLauncherComponent(
             } catch (failure: Exception) {
                 loadError = failure.message ?: failure.toString()
             } finally {
-                loading = false
+                if (refreshGeneration == requestGeneration) loading = false
             }
         }
 
@@ -126,6 +129,10 @@ class FlowLauncherComponent(
                 splitView?.openTab(
                     FlowTabData(id = "flow-${UUID.randomUUID()}", title = "Flow")
                 )
+                scope.launch {
+                    delay(700)
+                    refreshGeneration++
+                }
             }
 
             if (splitView == null) {
@@ -150,27 +157,44 @@ class FlowLauncherComponent(
                 RefreshButton(enabled = !loading) { refreshGeneration++ }
             }
 
-            Column(
+            LazyColumn(
                 modifier = Modifier
                     .weight(1f)
-                    .fillMaxWidth()
-                    .verticalScroll(rememberScrollState()),
+                    .fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 when {
-                    loading -> LauncherMessage("Loading saved flows…")
-                    loadError != null -> LauncherMessage(
-                        "Could not load saved flows: $loadError",
-                        Color(0xFFE5935B),
-                    )
-                    savedFlows.isEmpty() -> LauncherMessage("No saved flows yet.")
-                    else -> savedFlows.forEach { flow ->
+                    loading -> item { LauncherMessage("Loading saved flows…") }
+                    loadError != null -> item {
+                        LauncherMessage(
+                            "Could not load saved flows: $loadError",
+                            Color(0xFFE5935B),
+                        )
+                    }
+                    savedFlows.isEmpty() -> item { LauncherMessage("No saved flows yet.") }
+                    else -> items(savedFlows, key = { it.tabId }) { flow ->
                         SavedFlowRow(
                             flow = flow,
-                            enabled = flow.readable && splitView != null,
+                            enabled = flow.readable && splitView != null && flow.tabId !in openingFlowIds,
                         ) {
-                            val title = flow.name.ifBlank { "Flow" }
-                            splitView?.openTab(FlowTabData(id = flow.tabId, title = title))
+                            if (flow.tabId in openingFlowIds) return@SavedFlowRow
+                            openingFlowIds += flow.tabId
+                            scope.launch {
+                                try {
+                                    val activeTabs = context.activeTabsProvider
+                                    activeTabs?.refreshTabs()
+                                    val alreadyOpen = activeTabs?.activeTabs?.value
+                                        ?.firstOrNull { it.tabId == flow.tabId }
+                                    if (alreadyOpen != null) {
+                                        activeTabs.selectTab(alreadyOpen.tabId, alreadyOpen.panelId)
+                                    } else {
+                                        val title = flow.name.ifBlank { "Untitled Flow" }
+                                        splitView?.openTab(FlowTabData(id = flow.tabId, title = title))
+                                    }
+                                } finally {
+                                    openingFlowIds -= flow.tabId
+                                }
+                            }
                         }
                     }
                 }

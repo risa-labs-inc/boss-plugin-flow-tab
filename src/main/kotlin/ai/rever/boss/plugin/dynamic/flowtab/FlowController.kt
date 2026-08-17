@@ -161,6 +161,7 @@ class FlowController(
      * Metadata for every discovered graph key. A corrupt graph remains represented
      * with [FlowSummary.readable] false so the launcher does not silently hide data.
      */
+    // Discovery intentionally reads each graph: storage has no secondary summary index yet.
     suspend fun listFlowDetails(): List<FlowSummary> = listFlows().map { tabId ->
         val snapshot = getFlow(tabId)
         FlowSummary(

@@ -85,6 +85,9 @@ class FlowGraphState(
     val nodes = mutableStateListOf<FlowNode>()
     val edges = mutableStateListOf<EdgeModel>()
 
+    /** Descriptive data loaded with the graph and preserved by every autosave. */
+    var metadata: FlowMeta? = null
+
     var scale by mutableStateOf(1f)
     var panOffset by mutableStateOf(Offset.Zero)
 
@@ -341,6 +344,7 @@ class FlowGraphState(
         edges = edges.toList(),
         nextId = idCounter,
         schemaVersion = SUPPORTED_SCHEMA_VERSION,
+        metadata = metadata,
     )
 
     /**
@@ -360,6 +364,7 @@ class FlowGraphState(
         }
         nodes.clear()
         edges.clear()
+        metadata = snapshot.metadata
         snapshot.nodes.forEach { nodes.add(FlowNode(it.id, registry.resolve(it.type), it.title, it.x, it.y, it.config)) }
         edges.addAll(snapshot.edges)
         // Keep the counter ahead of any restored id to avoid collisions.

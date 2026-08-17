@@ -30,6 +30,7 @@ import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -202,7 +203,7 @@ class FlowControllerTest {
         assertEquals("Triage claims", saved.description)
         assertEquals(1, saved.nodeCount)
         assertTrue(saved.readable)
-        assertTrue(!corrupt.readable)
+        assertFalse(corrupt.readable)
     }
 
     @Test
