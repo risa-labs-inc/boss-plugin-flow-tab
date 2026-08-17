@@ -87,7 +87,7 @@ class FlowController(
     /** Create an empty flow, persist it at `graph:<tabId>`, and return the new tabId. */
     suspend fun createFlow(meta: FlowMeta? = null): String {
         val tabId = "flow-${UUID.randomUUID()}"
-        write(tabId, GraphSnapshot(schemaVersion = SUPPORTED_SCHEMA_VERSION, metadata = meta))
+        writeUnlocked(tabId, GraphSnapshot(schemaVersion = SUPPORTED_SCHEMA_VERSION, metadata = meta))
         return tabId
     }
 
@@ -115,7 +115,7 @@ class FlowController(
             y = 200f,
             config = JsonObject(spec.defaultConfig + config),
         )
-        write(tabId, snap.copy(nodes = snap.nodes + node, nextId = snap.nextId + 1))
+        writeUnlocked(tabId, snap.copy(nodes = snap.nodes + node, nextId = snap.nextId + 1))
         return nodeId
     }
 
@@ -134,7 +134,7 @@ class FlowController(
             "duplicate edge"
         }
         val edgeId = "e${snap.nextId}"
-        write(tabId, snap.copy(edges = snap.edges + EdgeModel(edgeId, from, fromPort, to, toPort), nextId = snap.nextId + 1))
+        writeUnlocked(tabId, snap.copy(edges = snap.edges + EdgeModel(edgeId, from, fromPort, to, toPort), nextId = snap.nextId + 1))
         return edgeId
     }
 
@@ -207,7 +207,7 @@ class FlowController(
                 // can restore an older graph over a newer open-tab autosave.
                 val current = loadSnapshot()
                 val currentMetadata = (current.metadata ?: FlowMeta()).copy(name = normalizedName)
-                write(tabId, current.copy(metadata = currentMetadata))
+                writeUnlocked(tabId, current.copy(metadata = currentMetadata))
                 // Publish only after the storage write succeeds. Open tabs replay this name
                 // into their live state, and their autosave consults it under the same lock.
                 FlowRenameCoordinator.publish(tabId, normalizedName)
@@ -425,9 +425,10 @@ class FlowController(
 
     // ---- internals ----------------------------------------------------------
 
-    private suspend fun write(tabId: String, snapshot: GraphSnapshot) {
+    private suspend fun writeUnlocked(tabId: String, snapshot: GraphSnapshot) {
         // TODO: Controller read-modify-write authoring operations are not yet serialized
         // against full-snapshot UI autosaves; the rename path coordinates explicitly.
+        // Callers may already hold the per-flow mutex, so never acquire it in this helper.
         storage?.putJson(graphKey(tabId), json.encodeToString(GraphSnapshot.serializer(), snapshot))
     }
 

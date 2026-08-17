@@ -31,6 +31,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -422,36 +423,39 @@ class FlowControllerTest {
 
     @Test
     fun `renameFlow reads after a concurrent autosave and preserves its graph changes`() = runBlocking {
-        val storage = DesktopStorage()
-        val fc = controller(storage)
-        val tabId = fc.createFlow(FlowMeta(name = "Old name"))
-        val liveSnapshot = fc.getFlow(tabId)!!.copy(
-            nodes = listOf(NodeModel("n-live", "TRIGGER", "Live node", 10f, 20f)),
-        )
-        val autosaveHasLock = CompletableDeferred<Unit>()
-        val releaseAutosave = CompletableDeferred<Unit>()
+        withTimeout(5_000) {
+            val storage = DesktopStorage()
+            val fc = controller(storage)
+            val tabId = fc.createFlow(FlowMeta(name = "Old name"))
+            val liveSnapshot = fc.getFlow(tabId)!!.copy(
+                nodes = listOf(NodeModel("n-live", "TRIGGER", "Live node", 10f, 20f)),
+            )
+            val autosaveHasLock = CompletableDeferred<Unit>()
+            val releaseAutosave = CompletableDeferred<Unit>()
 
-        val autosave = launch {
-            FlowRenameCoordinator.persistAutosave(tabId, liveSnapshot) { snapshot ->
-                autosaveHasLock.complete(Unit)
-                releaseAutosave.await()
-                storage.putJson(
-                    "${FlowController.GRAPH_PREFIX}$tabId",
-                    kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), snapshot),
-                )
+            val autosave = launch {
+                FlowRenameCoordinator.persistAutosave(tabId, liveSnapshot) { snapshot ->
+                    autosaveHasLock.complete(Unit)
+                    releaseAutosave.await()
+                    storage.putJson(
+                        "${FlowController.GRAPH_PREFIX}$tabId",
+                        kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), snapshot),
+                    )
+                }
             }
+            autosaveHasLock.await()
+            val rename = async { fc.renameFlow(tabId, "New name") }
+            yield()
+            assertFalse(rename.isCompleted, "rename must wait for the in-flight autosave")
+
+            releaseAutosave.complete(Unit)
+            autosave.join()
+            rename.await()
+
+            val saved = fc.getFlow(tabId)!!
+            assertEquals("New name", saved.metadata?.name)
+            assertEquals(listOf("n-live"), saved.nodes.map { it.id })
         }
-        autosaveHasLock.await()
-        val rename = async { fc.renameFlow(tabId, "New name") }
-        assertFalse(rename.isCompleted, "rename must wait for the in-flight autosave")
-
-        releaseAutosave.complete(Unit)
-        autosave.join()
-        rename.await()
-
-        val saved = fc.getFlow(tabId)!!
-        assertEquals("New name", saved.metadata?.name)
-        assertEquals(listOf("n-live"), saved.nodes.map { it.id })
     }
 
     @Test
