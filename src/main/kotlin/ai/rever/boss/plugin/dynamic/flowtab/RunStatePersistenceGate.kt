@@ -41,6 +41,7 @@ internal class RunStatePersistenceGate(
 ) {
     private val generation = AtomicLong(0)
     private val persistenceMutex = Mutex()
+    // Guarded by persistenceMutex; every read and write occurs inside withLock.
     private var lastPersistedGeneration = 0L
 
     fun beginRun(): Long = generation.incrementAndGet()

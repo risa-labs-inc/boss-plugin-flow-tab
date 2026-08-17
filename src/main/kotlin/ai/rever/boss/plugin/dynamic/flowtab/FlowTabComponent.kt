@@ -72,14 +72,18 @@ import com.arkivanov.essenty.lifecycle.Lifecycle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.coroutineContext
 import kotlin.math.roundToInt
 
 private val ToolbarBg = Color(0xFF202024)
@@ -251,14 +255,6 @@ class FlowTabComponent(
             // every late callback/finalizer from the previous run stale immediately;
             // its last snapshot may be skipped because the new run now owns the key.
             val runToken = runStatePersistence.beginRun()
-            // Fresh start: close the browser tab a prior run opened (no-op if the user
-            // already closed it) and clear tracking, so this run opens a new visible
-            // tab rather than reusing a stale/closed one or stacking splits.
-            visibleTabId.getAndSet(null)?.let { id ->
-                runCatching { context.activeTabsProvider?.closeTab(id) }
-            }
-            state.clearRun()
-            state.notice = null
             state.isRunning = true
             val waitingForPrevious = runJobs.hasActiveRun()
             if (waitingForPrevious) {
@@ -267,14 +263,24 @@ class FlowTabComponent(
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
             val job = runJobs.launch(Dispatchers.Default) {
+                var admitted = false
                 try {
-                    if (waitingForPrevious &&
-                        runStatePersistence.isCurrent(runToken) &&
-                        state.notice == WAITING_FOR_PREVIOUS_NOTICE
-                    ) {
-                        state.notice = null
-                        Snapshot.sendApplyNotifications()
+                    // Do not erase the preceding run's results or close its browser tab
+                    // until the fence actually admits this run. A wedged predecessor
+                    // therefore rejects Restart without destructively changing the UI.
+                    withContext(NonCancellable + Dispatchers.Main) {
+                        if (runStatePersistence.isCurrent(runToken)) {
+                            visibleTabId.getAndSet(null)?.let { id ->
+                                runCatching { context.activeTabsProvider?.closeTab(id) }
+                            }
+                            state.clearRun()
+                            state.notice = null
+                            admitted = true
+                            Snapshot.sendApplyNotifications()
+                        }
                     }
+                    coroutineContext.ensureActive()
+                    if (!admitted) return@launch
                     // Write status straight from the run thread. These are observable
                     // snapshot-state writes, so Compose picks them up on the next frame
                     // and the canvas updates live. (Marshalling them onto the Main scope
@@ -323,25 +329,27 @@ class FlowTabComponent(
                         state.runError = e.message ?: e.toString()
                     }
                 } finally {
-                    // Give ordinary Stop immediate feedback. invokeOnCompletion below
-                    // remains the fallback for a queued job cancelled before this block.
-                    if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
-                    // Persist the run results (capped) so they survive reopening.
-                    try {
-                        val persisted = persistRunStateOnIo(runStatePersistence, runToken) {
-                            storage?.putJson(
-                                "$RUN_STATE_PREFIX${config.id}",
-                                json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
-                            )
+                    if (admitted) {
+                        // Give ordinary Stop immediate feedback. invokeOnCompletion below
+                        // remains the fallback for a queued job cancelled before this block.
+                        if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
+                        // Persist the run results (capped) so they survive reopening.
+                        try {
+                            val persisted = persistRunStateOnIo(runStatePersistence, runToken) {
+                                storage?.putJson(
+                                    "$RUN_STATE_PREFIX${config.id}",
+                                    json.encodeToString(RunSnapshot.serializer(), state.runStates.toRunSnapshot())
+                                )
+                            }
+                            if (!persisted && runStatePersistence.isCurrent(runToken)) {
+                                state.notice = "Run completed, but its saved state timed out"
+                                Snapshot.sendApplyNotifications()
+                            }
+                        } catch (cancelled: CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            // Run-state persistence is best-effort, as before.
                         }
-                        if (!persisted && runStatePersistence.isCurrent(runToken)) {
-                            state.notice = "Run completed, but its saved state timed out"
-                            Snapshot.sendApplyNotifications()
-                        }
-                    } catch (cancelled: CancellationException) {
-                        throw cancelled
-                    } catch (_: Exception) {
-                        // Run-state persistence is best-effort, as before.
                     }
                 }
             }
@@ -423,6 +431,7 @@ class FlowTabComponent(
                     val result = runStatePersistence.clearAfterInvalidation(invalidation) {
                         clearPersistedRunState(storage, config.id)
                     }
+                    // Exhaustiveness tripwire: a future result must choose explicit UI behavior.
                     when (result) {
                         RunStateClearResult.CLEARED,
                         RunStateClearResult.PRESERVED_NEWER -> Unit
@@ -430,8 +439,17 @@ class FlowTabComponent(
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {
-                    state.notice = "Flow cleared, but saved run state could not be removed: ${failure.message}"
-                    Snapshot.sendApplyNotifications()
+                    // A newer run owns both the persistence key and the status bar.
+                    // Do not let a late failure from this Clear overwrite its notice.
+                    if (runStatePersistence.isCurrent(invalidation.generation)) {
+                        withContext(Dispatchers.Main) {
+                            if (runStatePersistence.isCurrent(invalidation.generation)) {
+                                state.notice =
+                                    "Flow cleared, but saved run state could not be removed: ${failure.message}"
+                                Snapshot.sendApplyNotifications()
+                            }
+                        }
+                    }
                 }
             }
         }
