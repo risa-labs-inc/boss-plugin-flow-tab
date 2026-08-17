@@ -146,6 +146,7 @@ class RunJobFenceTest {
         firstStarted.await()
 
         var admissionReset = false
+        var completionCause: Throwable? = null
         val queued = fence.launch {
             admitRun(
                 token = 1,
@@ -153,9 +154,11 @@ class RunJobFenceTest {
                 isCurrent = { true },
             ) { admissionReset = true }
         }
+        queued.invokeOnCompletion { completionCause = it }
         try {
             queued.join()
             assertFalse(admissionReset)
+            assertIs<PredecessorRunTimeoutException>(completionCause)
         } finally {
             releaseFirst.complete(Unit)
         }

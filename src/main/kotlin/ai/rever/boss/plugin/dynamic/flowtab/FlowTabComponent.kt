@@ -81,6 +81,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
 import kotlin.math.roundToInt
@@ -262,12 +263,12 @@ class FlowTabComponent(
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
             val job = runJobs.launch(Dispatchers.Default) {
-                var admitted = false
+                val admitted = AtomicBoolean(false)
                 try {
                     // Do not erase the preceding run's results or close its browser tab
                     // until the fence actually admits this run. A wedged predecessor
                     // therefore rejects Restart without destructively changing the UI.
-                    if (!admitRun(
+                    val admissionAccepted = admitRun(
                         token = runToken,
                         admissionContext = Dispatchers.Main,
                         isCurrent = runStatePersistence::isCurrent,
@@ -283,9 +284,12 @@ class FlowTabComponent(
                         state.notice = null
                         // Set this where the reset becomes observable. withContext can
                         // be cancelled while resuming on Default after this block ends.
-                        admitted = true
+                        admitted.set(true)
                         Snapshot.sendApplyNotifications()
-                    }) return@launch
+                    }
+                    if (!admissionAccepted) return@launch
+                    // Catches Stop arriving while withContext resumes from Main back
+                    // onto Default, after the destructive admission reset already ran.
                     coroutineContext.ensureActive()
                     // Write status straight from the run thread. These are observable
                     // snapshot-state writes, so Compose picks them up on the next frame
@@ -335,7 +339,7 @@ class FlowTabComponent(
                         state.runError = e.message ?: e.toString()
                     }
                 } finally {
-                    if (admitted) {
+                    if (admitted.get()) {
                         // Give ordinary Stop immediate feedback. invokeOnCompletion below
                         // remains the fallback for a queued job cancelled before this block.
                         if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
@@ -445,9 +449,12 @@ class FlowTabComponent(
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {
-                    println("[flow-tab] clear: saved run state could not be removed: ${failure.message}")
+                    // A newer run suppresses the stale UI notice below, so retain the
+                    // storage failure in logs as the only diagnostic in that branch.
+                    println("[flow-tab] clear: saved run state could not be removed: $failure")
                     // A newer run owns both the persistence key and the status bar.
                     // Do not let a late failure from this Clear overwrite its notice.
+                    // Fast path only; the check after the Main hop is authoritative.
                     if (runStatePersistence.isCurrent(invalidation.generation)) {
                         withContext(Dispatchers.Main) {
                             if (runStatePersistence.isCurrent(invalidation.generation)) {
