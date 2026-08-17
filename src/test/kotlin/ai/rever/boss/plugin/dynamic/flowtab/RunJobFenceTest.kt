@@ -8,6 +8,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import kotlin.test.Test
+import kotlin.test.assertIs
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -33,6 +34,7 @@ class RunJobFenceTest {
             withContext(NonCancellable) { releaseFirst.await() }
         }
         firstStarted.await()
+        assertTrue(fence.hasActiveRun())
 
         fence.cancelAll()
         val second = fence.launch { secondStarted.complete(Unit) }
@@ -77,6 +79,30 @@ class RunJobFenceTest {
         queued.join()
         assertTrue(completionCalled)
         assertFalse(queuedBlockStarted)
+    }
+
+    @Test
+    fun `wedged predecessor times out queued run without starting it`() = runTimedTest {
+        val fence = RunJobFence(this, predecessorTimeoutMs = 20)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        fence.launch {
+            firstStarted.complete(Unit)
+            withContext(NonCancellable) { releaseFirst.await() }
+        }
+        firstStarted.await()
+
+        var queuedBlockStarted = false
+        var completionCause: Throwable? = null
+        val queued = fence.launch { queuedBlockStarted = true }
+        queued.invokeOnCompletion { completionCause = it }
+        try {
+            queued.join()
+            assertFalse(queuedBlockStarted)
+            assertIs<PredecessorRunTimeoutException>(completionCause)
+        } finally {
+            releaseFirst.complete(Unit)
+        }
     }
 
     private fun runTimedTest(block: suspend CoroutineScope.() -> Unit) = runBlocking {

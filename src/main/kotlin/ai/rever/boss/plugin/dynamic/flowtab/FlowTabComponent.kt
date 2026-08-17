@@ -91,6 +91,7 @@ private val ConfirmBg = Color(0xFF3A2E12)
 private val NoticeBg = Color(0xFF26456E)
 private val RunGreen = Color(0xFF2E7D32)
 private const val WAITING_FOR_PREVIOUS_NOTICE = "Waiting for the previous run to stop…"
+private const val STOPPING_PREVIOUS_NOTICE = "Stopping the previous run…"
 
 /**
  * Flow tab component: a node-based canvas where nodes are spawned from the left
@@ -278,7 +279,9 @@ class FlowTabComponent(
                         humanize = realistic,
                         onVisibleTab = { id ->
                             if (id == null) {
-                                visibleTabId.set(null)
+                                if (runStatePersistence.isCurrent(runToken)) {
+                                    visibleTabId.set(null)
+                                }
                             } else {
                                 val tabId = id
                                 if (runStatePersistence.isCurrent(runToken)) {
@@ -327,6 +330,7 @@ class FlowTabComponent(
                         }
                         if (!persisted && runStatePersistence.isCurrent(runToken)) {
                             state.notice = "Run completed, but its saved state timed out"
+                            Snapshot.sendApplyNotifications()
                         }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
@@ -336,17 +340,26 @@ class FlowTabComponent(
                 }
             }
             // This also runs when a queued job is cancelled before its block starts.
-            job.invokeOnCompletion {
+            job.invokeOnCompletion { cause ->
                 if (runStatePersistence.isCurrent(runToken)) {
                     state.isRunning = false
-                    if (state.notice == WAITING_FOR_PREVIOUS_NOTICE) state.notice = null
+                    state.notice = when {
+                        cause is PredecessorRunTimeoutException ->
+                            "Previous run is not responding; queued run was cancelled"
+                        state.notice == WAITING_FOR_PREVIOUS_NOTICE ||
+                            state.notice == STOPPING_PREVIOUS_NOTICE -> null
+                        else -> state.notice
+                    }
+                    Snapshot.sendApplyNotifications()
                 }
             }
         }
 
         fun stopRun() {
             runJobs.cancelAll()
-            if (state.notice == WAITING_FOR_PREVIOUS_NOTICE) state.notice = null
+            if (state.notice == WAITING_FOR_PREVIOUS_NOTICE) {
+                state.notice = STOPPING_PREVIOUS_NOTICE
+            }
         }
 
         // ---- export / import ----
@@ -401,8 +414,8 @@ class FlowTabComponent(
             state.edges.clear()
             state.clearRun()
             state.selection = null
-            // Component scope survives split collapse when closing the visible browser
-            // tab disposes and recreates this composition; deletion must survive too.
+            // Component scope survives split-collapse recomposition. Closing the Flow
+            // tab itself still cancels this scope before an undispatched clear can start.
             coroutineScope.launch(Dispatchers.IO) {
                 try {
                     val result = runStatePersistence.clearAfterInvalidation(invalidation) {
@@ -410,6 +423,7 @@ class FlowTabComponent(
                     }
                     if (result == RunStateClearResult.TIMED_OUT) {
                         state.notice = "Flow cleared, but saved run-state cleanup timed out"
+                        Snapshot.sendApplyNotifications()
                     }
                 } catch (cancelled: CancellationException) {
                     throw cancelled

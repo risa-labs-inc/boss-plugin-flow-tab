@@ -1,44 +1,50 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 
 /**
  * Launches runs serially even when cancellation of the preceding run is cooperative.
- * The predecessor wait is intentionally unbounded to prevent side-effect overlap, so
- * a non-cooperative predecessor can still block the queue. [cancelAll] reaches every
- * job in the chain, while callers surface the queued state until they unwind.
+ * Calls are confined to the UI thread; launched jobs and completion cleanup may run
+ * elsewhere. [cancelAll] reaches every job in the chain. A non-cooperative predecessor
+ * times out the queued attempt instead of allowing executor side effects to overlap.
  */
-internal class RunJobFence(private val scope: CoroutineScope) {
-    private val current = AtomicReference<Job?>(null)
+internal class RunJobFence(
+    private val scope: CoroutineScope,
+    private val predecessorTimeoutMs: Long = DEFAULT_PREDECESSOR_TIMEOUT_MS,
+) {
     private val active = ConcurrentHashMap.newKeySet<Job>()
 
     fun launch(
         context: CoroutineContext = EmptyCoroutineContext,
         block: suspend () -> Unit,
     ): Job {
-        val previous = current.get()
+        val predecessors = active.filterNot(Job::isCompleted)
         val job = scope.launch(context) {
             // Cancelling a queued run must not break the dependency chain and let a
             // third run overlap the still-unwinding first run.
-            withContext(NonCancellable) { previous?.join() }
+            val predecessorsFinished = withContext(NonCancellable) {
+                withTimeoutOrNull(predecessorTimeoutMs) {
+                    predecessors.joinAll()
+                    true
+                } ?: false
+            }
+            if (!predecessorsFinished) throw PredecessorRunTimeoutException()
             coroutineContext.ensureActive()
             block()
         }
         active += job
-        current.set(job)
-        job.invokeOnCompletion {
-            active -= job
-            current.compareAndSet(job, null)
-        }
+        job.invokeOnCompletion { active -= job }
         return job
     }
 
@@ -47,4 +53,11 @@ internal class RunJobFence(private val scope: CoroutineScope) {
     }
 
     fun hasActiveRun(): Boolean = active.any { !it.isCompleted }
+
+    private companion object {
+        const val DEFAULT_PREDECESSOR_TIMEOUT_MS = 15_000L
+    }
 }
+
+internal class PredecessorRunTimeoutException :
+    CancellationException("Previous run did not stop before the queue timeout")
