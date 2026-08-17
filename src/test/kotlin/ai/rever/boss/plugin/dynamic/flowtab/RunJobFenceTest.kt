@@ -7,6 +7,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
+import kotlin.coroutines.EmptyCoroutineContext
 import kotlin.test.Test
 import kotlin.test.assertIs
 import kotlin.test.assertFalse
@@ -127,6 +128,36 @@ class RunJobFenceTest {
         try {
             queued.join()
             assertFalse(queuedBlockStarted)
+            assertIs<PredecessorRunTimeoutException>(completionCause)
+        } finally {
+            releaseFirst.complete(Unit)
+        }
+    }
+
+    @Test
+    fun `wedged predecessor rejects restart without performing admission reset`() = runTimedTest {
+        val fence = RunJobFence(this, predecessorTimeoutMs = 20)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        fence.launch {
+            firstStarted.complete(Unit)
+            withContext(NonCancellable) { releaseFirst.await() }
+        }
+        firstStarted.await()
+
+        var admissionReset = false
+        var completionCause: Throwable? = null
+        val queued = fence.launch {
+            admitRun(
+                token = 1,
+                admissionContext = EmptyCoroutineContext,
+                isCurrent = { true },
+            ) { admissionReset = true }
+        }
+        queued.invokeOnCompletion { completionCause = it }
+        try {
+            queued.join()
+            assertFalse(admissionReset)
             assertIs<PredecessorRunTimeoutException>(completionCause)
         } finally {
             releaseFirst.complete(Unit)
