@@ -27,7 +27,9 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -94,6 +96,55 @@ class FlowControllerTest {
         fc.addNode(tabId, "SET", JsonObject(emptyMap()))
         val titles = fc.getFlow(tabId)!!.nodes.map { it.title }
         assertEquals(titles.toSet().size, titles.size) // all unique (D3)
+    }
+
+    @Test
+    fun `addNode rejects an unregistered kind without changing the flow`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+
+        val failure = assertFailsWith<IllegalArgumentException> {
+            fc.addNode(tabId, "__invalid_probe_kind__")
+        }
+
+        assertContains(failure.message.orEmpty(), "__invalid_probe_kind__")
+        assertContains(failure.message.orEmpty(), "Valid kinds: CLICK, CODE")
+        assertTrue(fc.getFlow(tabId)!!.nodes.isEmpty())
+    }
+
+    @Test
+    fun `addNode is case-sensitive and gives dynamic kinds a synchronization hint`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+
+        assertFailsWith<IllegalArgumentException> { fc.addNode(tabId, "set") }
+        val dynamicFailure = assertFailsWith<IllegalArgumentException> {
+            fc.addNode(tabId, "tool:ext:server/missing")
+        }
+
+        assertContains(dynamicFailure.message.orEmpty(), "may still be synchronizing")
+        assertTrue(fc.getFlow(tabId)!!.nodes.isEmpty())
+    }
+
+    @Test
+    fun `unknown dynamic kind caps suggestions within its namespace`() = runBlocking {
+        val registry = builtinNodeRegistry().also { reg ->
+            repeat(40) { index ->
+                val id = "tool:ext:server/tool-${index.toString().padStart(2, '0')}"
+                reg.register(NodeSpec.unavailable(id))
+            }
+        }
+        val fc = controller(registry = registry)
+        val tabId = fc.createFlow()
+
+        val failure = assertFailsWith<IllegalArgumentException> {
+            fc.addNode(tabId, "tool:ext:server/missing")
+        }
+
+        assertContains(failure.message.orEmpty(), "tool:ext:server/tool-00")
+        assertContains(failure.message.orEmpty(), "… and 10 more")
+        assertContains(failure.message.orEmpty(), "40 tool kinds currently registered")
+        assertTrue("TRIGGER" !in failure.message.orEmpty())
     }
 
     @Test
@@ -217,10 +268,15 @@ class FlowControllerTest {
 
     @Test
     fun `a node error fails the run but reaches a terminal state`() = runBlocking {
-        val fc = controller()
+        val registry = builtinNodeRegistry().also {
+            // Model a kind that was registered when authored but is unavailable now;
+            // entirely unknown kinds are rejected by addNode.
+            it.register(NodeSpec.unavailable("tool:boss:gone"))
+        }
+        val fc = controller(registry = registry)
         val tabId = fc.createFlow()
         val trig = fc.addNode(tabId, "TRIGGER", JsonObject(emptyMap()))
-        val gone = fc.addNode(tabId, "tool:boss:gone", JsonObject(emptyMap())) // unavailable
+        val gone = fc.addNode(tabId, "tool:boss:gone", JsonObject(emptyMap()))
         fc.connect(tabId, trig, 0, gone, 0)
         val job = awaitTerminal(fc, fc.startRun(tabId))
         assertEquals(RunJobState.FAILED, job.state)

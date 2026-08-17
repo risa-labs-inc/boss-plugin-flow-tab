@@ -85,11 +85,15 @@ class FlowController(
      * Append a node of [kind] to flow [tabId] and return its id. The kind's
      * [NodeSpec.defaultConfig] is seeded first (so tool nodes keep their cached
      * ref/schema — F4) and [config] merged over it. Title is de-duplicated so
-     * title-based `{{ }}` refs stay unambiguous (D3). Throws if the flow is absent.
+     * title-based `{{ }}` refs stay unambiguous (D3). Throws if the flow is absent
+     * or [kind] is not currently registered. Dynamic `tool:*` kinds synchronize
+     * asynchronously, so their rejection message tells callers that retrying may help.
      */
     suspend fun addNode(tabId: String, kind: String, config: JsonObject = JsonObject(emptyMap())): String {
         val snap = getFlow(tabId) ?: throw IllegalArgumentException("No flow '$tabId'")
-        val spec = registry.resolve(kind)
+        // Saved graphs still resolve missing kinds to placeholders so they round-trip,
+        // but new authoring requests must not create nodes that can never execute.
+        val spec = requireNotNull(registry[kind]) { unknownKindMessage(kind) }
         val nodeId = "n${snap.nextId}"
         val title = uniqueTitle(spec.label, snap.nodes.map { it.title }.toSet())
         val idx = snap.nodes.size
@@ -345,10 +349,39 @@ class FlowController(
         return "$base $n"
     }
 
+    private fun unknownKindMessage(kind: String): String {
+        val registered = registry.all().map(NodeSpec::id).sorted()
+        // For dynamic tools, spend the capped error budget on the relevant source
+        // namespace (tool:boss: or tool:ext:) instead of unrelated built-ins.
+        val namespace = kind.dynamicToolNamespace()
+        val relevant = namespace
+            ?.let { prefix -> registered.filter { it.startsWith(prefix) } }
+            .orEmpty()
+            .ifEmpty { registered }
+        val shown = relevant.take(MAX_KINDS_IN_ERROR)
+        val remainder = relevant.size - shown.size
+        val suffix = if (remainder > 0) ", … and $remainder more" else ""
+        val syncHint = if (namespace != null) {
+            val registeredToolCount = registered.count { it.startsWith("tool:") }
+            " Dynamic tool kinds may still be synchronizing " +
+                "($registeredToolCount tool kinds currently registered); retry shortly."
+        } else {
+            ""
+        }
+        return "Unknown node kind '$kind'. Valid kinds: ${shown.joinToString(", ")}$suffix.$syncHint"
+    }
+
+    private fun String.dynamicToolNamespace(): String? {
+        if (!startsWith("tool:")) return null
+        val secondColon = indexOf(':', startIndex = "tool:".length)
+        return if (secondColon >= 0) substring(0, secondColon + 1) else "tool:"
+    }
+
     private fun graphKey(tabId: String) = "$GRAPH_PREFIX$tabId"
     private fun runKey(runId: String) = "$RUN_PREFIX$runId"
 
     companion object {
+        private const val MAX_KINDS_IN_ERROR = 30
         const val STORAGE_NAMESPACE = "ai.rever.boss.plugin.dynamic.flowtab"
         const val GRAPH_PREFIX = "graph:"
         const val RUN_PREFIX = "run:"

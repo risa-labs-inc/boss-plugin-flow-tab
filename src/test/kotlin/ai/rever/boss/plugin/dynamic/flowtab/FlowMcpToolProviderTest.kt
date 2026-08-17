@@ -23,6 +23,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -213,6 +214,23 @@ class FlowMcpToolProviderTest {
     @Test
     fun `flow_add_node without tabId is an error result`() = runBlocking {
         assertTrue(call(provider(), "flow_add_node", """{"kind":"SET"}""").isError)
+    }
+
+    @Test
+    fun `flow_add_node rejects an unregistered kind and names valid kinds`() = runBlocking {
+        val p = provider()
+        val tabId = obj(call(p, "flow_create")).getValue("tabId").jsonPrimitive.content
+
+        val result = call(
+            p,
+            "flow_add_node",
+            """{"tabId":"$tabId","kind":"__invalid_probe_kind__"}""",
+        )
+
+        assertTrue(result.isError)
+        assertContains(result.text, "__invalid_probe_kind__")
+        assertContains(result.text, "Valid kinds:")
+        assertTrue(obj(call(p, "flow_get", """{"tabId":"$tabId"}""")).getValue("nodes").jsonArray.isEmpty())
     }
 
     @Test
