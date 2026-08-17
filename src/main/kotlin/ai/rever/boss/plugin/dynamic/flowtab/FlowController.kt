@@ -175,18 +175,41 @@ class FlowController(
 
     /** Rename a readable flow without changing any other metadata or graph content. */
     suspend fun renameFlow(tabId: String, name: String): FlowSummary {
+        val snapshot = getFlow(tabId) ?: throw IllegalArgumentException("No readable flow '$tabId'")
+        return persistRenamedFlow(tabId, name, snapshot)
+    }
+
+    /**
+     * Rename the currently open flow from its live canvas snapshot. Unlike [renameFlow],
+     * this does not require the debounced autosave to have created the storage entry yet,
+     * so a brand-new tab can be named immediately after it opens.
+     */
+    suspend fun renameOpenFlow(tabId: String, name: String, snapshot: GraphSnapshot): FlowSummary =
+        persistRenamedFlow(tabId, name, snapshot)
+
+    private suspend fun persistRenamedFlow(
+        tabId: String,
+        name: String,
+        snapshot: GraphSnapshot,
+    ): FlowSummary {
         val normalizedName = name.trim()
         require(normalizedName.isNotEmpty()) { "Flow name cannot be blank" }
         require(normalizedName.length <= MAX_FLOW_NAME_LENGTH) {
             "Flow name cannot exceed $MAX_FLOW_NAME_LENGTH characters"
         }
-        val snapshot = getFlow(tabId) ?: throw IllegalArgumentException("No readable flow '$tabId'")
         val metadata = (snapshot.metadata ?: FlowMeta()).copy(name = normalizedName)
         write(tabId, snapshot.copy(metadata = metadata))
 
         context.tabUpdateProviderFactory?.let { factory ->
-            withContext(Dispatchers.Main.immediate) {
-                factory.createProvider(tabId, FlowTabType.typeId)?.updateTitle(normalizedName)
+            runCatching {
+                withContext(Dispatchers.Main.immediate) {
+                    factory.createProvider(tabId, FlowTabType.typeId)?.updateTitle(normalizedName)
+                }
+            }.onFailure {
+                // The graph has already been renamed successfully. A host tab-title
+                // refresh failure must not report the whole rename as failed and make
+                // the live metadata diverge from the persisted snapshot.
+                println("[flow-tab] renamed '$tabId', but its tab title could not be refreshed: ${it.message}")
             }
         }
         return FlowSummary(

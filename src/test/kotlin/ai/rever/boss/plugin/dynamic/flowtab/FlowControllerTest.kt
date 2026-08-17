@@ -231,6 +231,27 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `renameOpenFlow persists a live snapshot before autosave creates the flow`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = "flow-new-tab"
+        val snapshot = GraphSnapshot(
+            nodes = listOf(NodeModel("n1", "TRIGGER", "Trigger", 10f, 20f)),
+            metadata = FlowMeta(description = "Keep me", inputs = listOf("claimId")),
+            schemaVersion = SUPPORTED_SCHEMA_VERSION,
+        )
+
+        val summary = fc.renameOpenFlow(tabId, "  Intake monitor  ", snapshot)
+        val renamed = fc.getFlow(tabId)!!
+
+        assertEquals("Intake monitor", summary.name)
+        assertEquals("Intake monitor", renamed.metadata?.name)
+        assertEquals("Keep me", renamed.metadata?.description)
+        assertEquals(listOf("claimId"), renamed.metadata?.inputs)
+        assertEquals("n1", renamed.nodes.single().id)
+    }
+
+    @Test
     fun `renameFlow rejects blank names and unreadable flows`() = runBlocking {
         val storage = DesktopStorage()
         val fc = controller(storage)

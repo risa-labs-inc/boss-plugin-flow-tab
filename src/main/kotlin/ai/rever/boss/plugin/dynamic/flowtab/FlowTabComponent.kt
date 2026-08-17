@@ -22,14 +22,19 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.AlertDialog
 import androidx.compose.material.Icon
 import androidx.compose.material.IconButton
 import androidx.compose.material.Text
+import androidx.compose.material.TextButton
+import androidx.compose.material.TextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.FitScreen
 import androidx.compose.material.icons.filled.GridView
@@ -65,6 +70,7 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.arkivanov.decompose.ComponentContext
@@ -530,10 +536,15 @@ class FlowTabComponent(
         val selectedNode = (state.selection as? Selection.Node)?.let { state.nodeById(it.id) }
         var confirmClear by remember { mutableStateOf(false) }
         var showGallery by remember { mutableStateOf(false) }
+        var showRename by remember { mutableStateOf(false) }
+        var renameInProgress by remember { mutableStateOf(false) }
+        val currentFlowName = state.metadata?.name?.ifBlank { null }
+            ?: config.title.ifBlank { "Flow" }
 
         Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().background(CanvasBackground)) {
             Toolbar(
+                flowName = currentFlowName,
                 scale = state.scale,
                 isRunning = state.isRunning,
                 realistic = realistic,
@@ -547,6 +558,7 @@ class FlowTabComponent(
                         FlowTabData(id = "flow-${java.util.UUID.randomUUID()}", title = "Flow")
                     )
                 },
+                onRename = { if (!renameInProgress) showRename = true },
                 onTemplates = { showGallery = true },
                 onZoomIn = { state.zoomBy(1.2f, viewCenterScreen()) },
                 onZoomOut = { state.zoomBy(1f / 1.2f, viewCenterScreen()) },
@@ -642,12 +654,68 @@ class FlowTabComponent(
                     onDismiss = { showGallery = false },
                 )
             }
+
+            if (showRename) {
+                var renameText by remember(currentFlowName) { mutableStateOf(currentFlowName) }
+                AlertDialog(
+                    onDismissRequest = { showRename = false },
+                    title = { Text("Rename flow") },
+                    text = {
+                        TextField(
+                            value = renameText,
+                            onValueChange = {
+                                renameText = it.take(FlowController.MAX_FLOW_NAME_LENGTH)
+                            },
+                            label = { Text("Flow name") },
+                            singleLine = true,
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(
+                            enabled = renameText.isNotBlank(),
+                            onClick = {
+                                val newName = renameText.trim()
+                                val previousMetadata = state.metadata
+                                val renamedMetadata = (previousMetadata ?: FlowMeta()).copy(name = newName)
+                                val renamedSnapshot = state.toSnapshot().copy(metadata = renamedMetadata)
+                                // Update the visible toolbar immediately and keep autosave from
+                                // racing a stale name over the explicit controller write.
+                                state.metadata = renamedMetadata
+                                showRename = false
+                                renameInProgress = true
+                                uiScope.launch {
+                                    try {
+                                        withContext(Dispatchers.IO) {
+                                            controller.renameOpenFlow(config.id, newName, renamedSnapshot)
+                                        }
+                                        state.notice = "Renamed flow to '$newName'"
+                                    } catch (cancelled: CancellationException) {
+                                        state.metadata = previousMetadata
+                                        throw cancelled
+                                    } catch (failure: Exception) {
+                                        state.metadata = previousMetadata
+                                        state.runError = "Rename failed: ${failure.message ?: failure}"
+                                    } finally {
+                                        renameInProgress = false
+                                    }
+                                }
+                            },
+                        ) {
+                            Text("Save")
+                        }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { showRename = false }) { Text("Cancel") }
+                    },
+                )
+            }
         }
     }
 }
 
 @Composable
 private fun Toolbar(
+    flowName: String,
     scale: Float,
     isRunning: Boolean,
     realistic: Boolean,
@@ -657,6 +725,7 @@ private fun Toolbar(
     onRun: () -> Unit,
     onStop: () -> Unit,
     onNewFlow: () -> Unit,
+    onRename: () -> Unit,
     onTemplates: () -> Unit,
     onZoomIn: () -> Unit,
     onZoomOut: () -> Unit,
@@ -682,9 +751,18 @@ private fun Toolbar(
             modifier = Modifier.size(18.dp)
         )
         Spacer(Modifier.width(8.dp))
-        Text("Flow", color = Color.White, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+        Text(
+            text = flowName,
+            color = Color.White,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.widthIn(max = 180.dp),
+        )
+        ToolbarButton(Icons.Filled.Edit, "Rename flow", onRename)
 
-        Spacer(Modifier.width(12.dp))
+        Spacer(Modifier.width(4.dp))
         // Run / Stop
         Row(
             modifier = Modifier
