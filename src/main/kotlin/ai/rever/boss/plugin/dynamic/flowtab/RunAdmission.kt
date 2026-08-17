@@ -11,10 +11,10 @@ import kotlin.coroutines.coroutineContext
  */
 internal suspend fun admitRun(
     token: Long,
-    context: CoroutineContext,
+    admissionContext: CoroutineContext,
     isCurrent: (Long) -> Boolean,
     onAdmit: () -> Unit,
-): Boolean = withContext(context) {
+): Boolean = withContext(admissionContext) {
     coroutineContext.ensureActive()
     if (!isCurrent(token)) return@withContext false
     onAdmit()

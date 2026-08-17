@@ -267,23 +267,26 @@ class FlowTabComponent(
                     // Do not erase the preceding run's results or close its browser tab
                     // until the fence actually admits this run. A wedged predecessor
                     // therefore rejects Restart without destructively changing the UI.
-                    admitted = admitRun(
+                    if (!admitRun(
                         token = runToken,
-                        context = Dispatchers.Main,
+                        admissionContext = Dispatchers.Main,
                         isCurrent = runStatePersistence::isCurrent,
                     ) {
                         // Host tab operations are Main-thread confined. Keeping the
                         // synchronous state reset in the same admission block makes
-                        // tab cleanup and visible run-state replacement atomic.
+                        // tab cleanup and visible run-state replacement atomic; the
+                        // extra Main hop is accepted to preserve that ordering.
                         visibleTabId.getAndSet(null)?.let { id ->
                             runCatching { context.activeTabsProvider?.closeTab(id) }
                         }
                         state.clearRun()
                         state.notice = null
+                        // Set this where the reset becomes observable. withContext can
+                        // be cancelled while resuming on Default after this block ends.
+                        admitted = true
                         Snapshot.sendApplyNotifications()
-                    }
+                    }) return@launch
                     coroutineContext.ensureActive()
-                    if (!admitted) return@launch
                     // Write status straight from the run thread. These are observable
                     // snapshot-state writes, so Compose picks them up on the next frame
                     // and the canvas updates live. (Marshalling them onto the Main scope
@@ -442,6 +445,7 @@ class FlowTabComponent(
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (failure: Exception) {
+                    println("[flow-tab] clear: saved run state could not be removed: ${failure.message}")
                     // A newer run owns both the persistence key and the status bar.
                     // Do not let a late failure from this Clear overwrite its notice.
                     if (runStatePersistence.isCurrent(invalidation.generation)) {
