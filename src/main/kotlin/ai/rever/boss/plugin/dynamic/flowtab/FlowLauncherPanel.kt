@@ -121,7 +121,7 @@ class FlowLauncherComponent(
         // Canvas-originated renames publish through the same coordinator. Reflect them
         // immediately instead of leaving the saved-flow list stale until Refresh.
         LaunchedEffect(Unit) {
-            FlowRenameCoordinator.names.collect { renamed ->
+            FlowPersistenceCoordinator.names.collect { renamed ->
                 if (renamed.isNotEmpty()) {
                     savedFlows = savedFlows.map { flow ->
                         renamed[flow.tabId]?.let { name -> flow.copy(name = name) } ?: flow

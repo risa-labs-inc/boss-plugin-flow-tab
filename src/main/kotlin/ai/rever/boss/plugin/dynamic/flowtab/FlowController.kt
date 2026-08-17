@@ -100,23 +100,29 @@ class FlowController(
      * asynchronously, so their rejection message tells callers that retrying may help.
      */
     suspend fun addNode(tabId: String, kind: String, config: JsonObject = JsonObject(emptyMap())): String {
-        val snap = getFlow(tabId) ?: throw IllegalArgumentException("No flow '$tabId'")
-        // Saved graphs still resolve missing kinds to placeholders so they round-trip,
-        // but new authoring requests must not create nodes that can never execute.
-        val spec = requireNotNull(registry[kind]) { unknownKindMessage(kind) }
-        val nodeId = "n${snap.nextId}"
-        val title = uniqueTitle(spec.label, snap.nodes.map { it.title }.toSet())
-        val idx = snap.nodes.size
-        val node = NodeModel(
-            id = nodeId,
-            type = spec.id,
-            title = title,
-            x = 320f + idx * (nodeOuterWidth() + 120f),
-            y = 200f,
-            config = JsonObject(spec.defaultConfig + config),
-        )
-        writeUnlocked(tabId, snap.copy(nodes = snap.nodes + node, nextId = snap.nextId + 1))
-        return nodeId
+        return FlowPersistenceCoordinator.withFlowLock(tabId) {
+            val snap = FlowPersistenceCoordinator.latestLiveSnapshot(tabId)
+                ?: getFlow(tabId)
+                ?: throw IllegalArgumentException("No flow '$tabId'")
+            // Saved graphs still resolve missing kinds to placeholders so they round-trip,
+            // but new authoring requests must not create nodes that can never execute.
+            val spec = requireNotNull(registry[kind]) { unknownKindMessage(kind) }
+            val nodeId = "n${snap.nextId}"
+            val title = uniqueTitle(spec.label, snap.nodes.map { it.title }.toSet())
+            val idx = snap.nodes.size
+            val node = NodeModel(
+                id = nodeId,
+                type = spec.id,
+                title = title,
+                x = 320f + idx * (nodeOuterWidth() + 120f),
+                y = 200f,
+                config = JsonObject(spec.defaultConfig + config),
+            )
+            val updated = snap.copy(nodes = snap.nodes + node, nextId = snap.nextId + 1)
+            writeUnlocked(tabId, updated)
+            FlowPersistenceCoordinator.publishGraphUpdate(tabId, updated)
+            nodeId
+        }
     }
 
     /**
@@ -125,17 +131,26 @@ class FlowController(
      * duplicates (mirroring [FlowGraphState.connect]). Throws if the flow is absent.
      */
     suspend fun connect(tabId: String, from: String, fromPort: Int, to: String, toPort: Int): String {
-        val snap = getFlow(tabId) ?: throw IllegalArgumentException("No flow '$tabId'")
-        require(from != to) { "cannot connect a node to itself" }
-        val ids = snap.nodes.map { it.id }.toSet()
-        require(from in ids) { "unknown source node '$from'" }
-        require(to in ids) { "unknown target node '$to'" }
-        require(snap.edges.none { it.fromNode == from && it.fromPort == fromPort && it.toNode == to && it.toPort == toPort }) {
-            "duplicate edge"
+        return FlowPersistenceCoordinator.withFlowLock(tabId) {
+            val snap = FlowPersistenceCoordinator.latestLiveSnapshot(tabId)
+                ?: getFlow(tabId)
+                ?: throw IllegalArgumentException("No flow '$tabId'")
+            require(from != to) { "cannot connect a node to itself" }
+            val ids = snap.nodes.map { it.id }.toSet()
+            require(from in ids) { "unknown source node '$from'" }
+            require(to in ids) { "unknown target node '$to'" }
+            require(snap.edges.none { it.fromNode == from && it.fromPort == fromPort && it.toNode == to && it.toPort == toPort }) {
+                "duplicate edge"
+            }
+            val edgeId = "e${snap.nextId}"
+            val updated = snap.copy(
+                edges = snap.edges + EdgeModel(edgeId, from, fromPort, to, toPort),
+                nextId = snap.nextId + 1,
+            )
+            writeUnlocked(tabId, updated)
+            FlowPersistenceCoordinator.publishGraphUpdate(tabId, updated)
+            edgeId
         }
-        val edgeId = "e${snap.nextId}"
-        writeUnlocked(tabId, snap.copy(edges = snap.edges + EdgeModel(edgeId, from, fromPort, to, toPort), nextId = snap.nextId + 1))
-        return edgeId
     }
 
     /** The [GraphSnapshot] for [tabId], or null if absent/corrupt. */
@@ -175,8 +190,10 @@ class FlowController(
 
     /** Rename a readable flow without changing any other metadata or graph content. */
     suspend fun renameFlow(tabId: String, name: String): FlowSummary =
-        persistRenamedFlow(tabId, name) {
-            getFlow(tabId) ?: throw IllegalArgumentException("No readable flow '$tabId'")
+        persistRenamedFlow(tabId, name, notifyOpenCanvas = true) {
+            FlowPersistenceCoordinator.latestLiveSnapshot(tabId)
+                ?: getFlow(tabId)
+                ?: throw IllegalArgumentException("No readable flow '$tabId'")
         }
 
     /**
@@ -186,11 +203,12 @@ class FlowController(
      * replace a saved graph.
      */
     internal suspend fun renameOpenFlow(tabId: String, name: String, snapshot: GraphSnapshot): FlowSummary =
-        persistRenamedFlow(tabId, name) { snapshot }
+        persistRenamedFlow(tabId, name, notifyOpenCanvas = false) { snapshot }
 
     private suspend fun persistRenamedFlow(
         tabId: String,
         name: String,
+        notifyOpenCanvas: Boolean,
         loadSnapshot: suspend () -> GraphSnapshot,
     ): FlowSummary {
         val normalizedName = name.trim()
@@ -199,18 +217,22 @@ class FlowController(
             "Flow name cannot exceed $MAX_FLOW_NAME_LENGTH characters"
         }
         check(storage != null) { "Flow storage is unavailable" }
-        // Once the user confirms, tab close/split recomposition must not cancel the
-        // atomic read+write. Cancellation is observed again by the title-refresh step.
-        val (snapshot, metadata) = withContext(NonCancellable + Dispatchers.IO) {
-            FlowRenameCoordinator.withFlowLock(tabId) {
+        // Waiting for a busy flow lock remains cancellable. Once acquired, tab close
+        // must not interrupt the atomic read+write.
+        val (snapshot, metadata) = FlowPersistenceCoordinator.withFlowLock(tabId) {
+            withContext(NonCancellable + Dispatchers.IO) {
                 // Loading inside the same lock is essential: otherwise a sidebar rename
                 // can restore an older graph over a newer open-tab autosave.
                 val current = loadSnapshot()
                 val currentMetadata = (current.metadata ?: FlowMeta()).copy(name = normalizedName)
-                writeUnlocked(tabId, current.copy(metadata = currentMetadata))
+                val updated = current.copy(metadata = currentMetadata)
+                writeUnlocked(tabId, updated)
                 // Publish only after the storage write succeeds. Open tabs replay this name
                 // into their live state, and their autosave consults it under the same lock.
-                FlowRenameCoordinator.publish(tabId, normalizedName)
+                FlowPersistenceCoordinator.publishRename(tabId, normalizedName)
+                if (notifyOpenCanvas) {
+                    FlowPersistenceCoordinator.publishGraphUpdate(tabId, updated)
+                }
                 current to currentMetadata
             }
         }
@@ -252,7 +274,7 @@ class FlowController(
             store.removeJsonValue(graphKey(tabId))
             store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
         }
-        FlowRenameCoordinator.forget(tabId)
+        FlowPersistenceCoordinator.forget(tabId)
         return true
     }
 
@@ -426,9 +448,8 @@ class FlowController(
     // ---- internals ----------------------------------------------------------
 
     private suspend fun writeUnlocked(tabId: String, snapshot: GraphSnapshot) {
-        // TODO: Controller read-modify-write authoring operations are not yet serialized
-        // against full-snapshot UI autosaves; the rename path coordinates explicitly.
-        // Callers may already hold the per-flow mutex, so never acquire it in this helper.
+        // Read-modify-write callers already hold the per-flow mutex. Never acquire it
+        // in this helper: kotlinx Mutex is non-reentrant and would deadlock.
         storage?.putJson(graphKey(tabId), json.encodeToString(GraphSnapshot.serializer(), snapshot))
     }
 

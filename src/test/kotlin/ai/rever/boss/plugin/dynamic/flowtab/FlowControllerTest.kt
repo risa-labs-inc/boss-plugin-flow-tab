@@ -15,6 +15,7 @@ import ai.rever.boss.plugin.api.TabUpdateProviderFactory
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
@@ -393,7 +394,7 @@ class FlowControllerTest {
         val staleOpenTabSnapshot = fc.getFlow(tabId)!!
 
         fc.renameFlow(tabId, "New name")
-        FlowRenameCoordinator.persistAutosave(tabId, staleOpenTabSnapshot) { safeAutosave ->
+        FlowPersistenceCoordinator.persistAutosave(tabId, staleOpenTabSnapshot) { safeAutosave ->
             storage.putJson(
                 "${FlowController.GRAPH_PREFIX}$tabId",
                 kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), safeAutosave),
@@ -401,18 +402,23 @@ class FlowControllerTest {
         }
 
         assertEquals("New name", fc.getFlow(tabId)?.metadata?.name)
-        assertEquals("New name", FlowRenameCoordinator.latestName(tabId))
+        assertEquals("New name", FlowPersistenceCoordinator.latestName(tabId))
 
-        FlowRenameCoordinator.persistAutosave(tabId, fc.getFlow(tabId)!!) { convergedAutosave ->
+        val renameUpdate = FlowPersistenceCoordinator.latestGraphUpdate(tabId)!!
+        FlowPersistenceCoordinator.persistAutosave(
+            tabId,
+            fc.getFlow(tabId)!!,
+            appliedGraphRevision = renameUpdate.revision,
+        ) { convergedAutosave ->
             storage.putJson(
                 "${FlowController.GRAPH_PREFIX}$tabId",
                 kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), convergedAutosave),
             )
         }
-        assertNull(FlowRenameCoordinator.latestName(tabId))
+        assertNull(FlowPersistenceCoordinator.latestName(tabId))
 
         val importedSnapshot = fc.getFlow(tabId)!!.copy(metadata = FlowMeta(name = "Imported name"))
-        FlowRenameCoordinator.persistAutosave(tabId, importedSnapshot) { importAutosave ->
+        FlowPersistenceCoordinator.persistAutosave(tabId, importedSnapshot) { importAutosave ->
             storage.putJson(
                 "${FlowController.GRAPH_PREFIX}$tabId",
                 kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), importAutosave),
@@ -434,7 +440,7 @@ class FlowControllerTest {
             val releaseAutosave = CompletableDeferred<Unit>()
 
             val autosave = launch {
-                FlowRenameCoordinator.persistAutosave(tabId, liveSnapshot) { snapshot ->
+                FlowPersistenceCoordinator.persistAutosave(tabId, liveSnapshot) { snapshot ->
                     autosaveHasLock.complete(Unit)
                     releaseAutosave.await()
                     storage.putJson(
@@ -459,6 +465,113 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `controller updates replace stale canvas state and reject its pending autosave`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow(FlowMeta(name = "MCP-authored"))
+        val staleCanvas = fc.getFlow(tabId)!!
+
+        val trigger = fc.addNode(tabId, "TRIGGER")
+        val set = fc.addNode(tabId, "SET")
+        val edge = fc.connect(tabId, trigger, 0, set, 0)
+        val update = FlowPersistenceCoordinator.latestGraphUpdate(tabId)!!
+
+        val canvasState = FlowGraphState()
+        assertTrue(canvasState.load(staleCanvas))
+        val appliedRevision = canvasState.applyExternalGraphUpdate(update, appliedRevision = 0L)
+        assertEquals(update.revision, appliedRevision)
+        assertEquals(setOf(trigger, set), canvasState.nodes.map { it.id }.toSet())
+        assertEquals(edge, canvasState.edges.single().id)
+
+        var staleWriteAttempted = false
+        FlowPersistenceCoordinator.persistAutosave(
+            tabId = tabId,
+            snapshot = staleCanvas,
+            appliedGraphRevision = 0L,
+        ) {
+            staleWriteAttempted = true
+            storage.putJson("${FlowController.GRAPH_PREFIX}$tabId", "should-not-be-written")
+        }
+        assertFalse(staleWriteAttempted)
+        assertEquals(setOf(trigger, set), fc.getFlow(tabId)!!.nodes.map { it.id }.toSet())
+
+        FlowPersistenceCoordinator.persistAutosave(
+            tabId = tabId,
+            snapshot = canvasState.toSnapshot(),
+            appliedGraphRevision = appliedRevision,
+        ) { converged ->
+            storage.putJson(
+                "${FlowController.GRAPH_PREFIX}$tabId",
+                kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), converged),
+            )
+        }
+        assertNull(FlowPersistenceCoordinator.latestGraphUpdate(tabId))
+    }
+
+    @Test
+    fun `controller mutations include debounced canvas edits without losing rapid external writes`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        val localNode = NodeModel("n0", "TRIGGER", "Unsaved local trigger", 10f, 20f)
+        val liveSnapshot = fc.getFlow(tabId)!!.copy(nodes = listOf(localNode), nextId = 1L)
+        val canvas = object : LiveFlowCanvas {
+            override val isInitialized: Boolean = true
+            override val appliedGraphRevision: Long = 0L
+            override fun snapshot(): GraphSnapshot = liveSnapshot
+        }
+
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        FlowPersistenceCoordinator.registerLiveCanvas(tabId, canvas)
+        try {
+            val firstAddedNode = fc.addNode(tabId, "SET")
+            val secondAddedNode = fc.addNode(tabId, "CODE")
+            val saved = fc.getFlow(tabId)!!
+
+            assertEquals(setOf("n0", firstAddedNode, secondAddedNode), saved.nodes.map { it.id }.toSet())
+            assertEquals(3L, saved.nextId)
+        } finally {
+            FlowPersistenceCoordinator.unregisterLiveCanvas(tabId, canvas)
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun `addNode waits for an in-flight canvas autosave and preserves both changes`() = runBlocking {
+        withTimeout(5_000) {
+            val storage = DesktopStorage()
+            val fc = controller(storage)
+            val tabId = fc.createFlow()
+            val localNode = NodeModel("n0", "TRIGGER", "Local trigger", 10f, 20f)
+            val liveCanvas = fc.getFlow(tabId)!!.copy(nodes = listOf(localNode), nextId = 1L)
+            val autosaveHasLock = CompletableDeferred<Unit>()
+            val releaseAutosave = CompletableDeferred<Unit>()
+
+            val autosave = launch {
+                FlowPersistenceCoordinator.persistAutosave(tabId, liveCanvas) { snapshot ->
+                    autosaveHasLock.complete(Unit)
+                    releaseAutosave.await()
+                    storage.putJson(
+                        "${FlowController.GRAPH_PREFIX}$tabId",
+                        kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), snapshot),
+                    )
+                }
+            }
+            autosaveHasLock.await()
+            val addition = async(start = CoroutineStart.UNDISPATCHED) { fc.addNode(tabId, "SET") }
+            assertFalse(addition.isCompleted, "controller mutation must wait for canvas autosave")
+
+            releaseAutosave.complete(Unit)
+            autosave.join()
+            val addedNode = addition.await()
+
+            val saved = fc.getFlow(tabId)!!
+            assertEquals(setOf("n0", addedNode), saved.nodes.map { it.id }.toSet())
+            assertEquals(2L, saved.nextId)
+        }
+    }
+
+    @Test
     fun `renameFlow rejects blank names and unreadable flows`() = runBlocking {
         val storage = DesktopStorage()
         val fc = controller(storage)
@@ -475,14 +588,15 @@ class FlowControllerTest {
         val fc = controller(storage)
         val tabId = fc.createFlow(FlowMeta(name = "Disposable"))
         storage.putJson("$RUN_STATE_PREFIX$tabId", "{}")
-        FlowRenameCoordinator.publish(tabId, "Disposable renamed")
+        FlowPersistenceCoordinator.publishRename(tabId, "Disposable renamed")
 
         assertTrue(fc.deleteFlow(tabId))
 
         assertNull(storage.getJson("${FlowController.GRAPH_PREFIX}$tabId"))
         assertNull(storage.getJson("$RUN_STATE_PREFIX$tabId"))
         assertFalse(tabId in fc.listFlows())
-        assertNull(FlowRenameCoordinator.latestName(tabId))
+        assertNull(FlowPersistenceCoordinator.latestName(tabId))
+        assertNull(FlowPersistenceCoordinator.latestGraphUpdate(tabId))
     }
 
     @Test

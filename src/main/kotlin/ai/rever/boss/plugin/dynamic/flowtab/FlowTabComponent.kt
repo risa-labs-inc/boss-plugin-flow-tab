@@ -151,7 +151,13 @@ class FlowTabComponent(
     private val runJobs = RunJobFence(coroutineScope)
     private val runStatePersistence = RunStatePersistenceGate()
     private var initialized by mutableStateOf(false)
-    private var renameSyncRevision by mutableStateOf(0L)
+    private var persistenceSyncRevision by mutableStateOf(0L)
+    private var appliedGraphRevision by mutableStateOf(0L)
+    private val liveCanvas = object : LiveFlowCanvas {
+        override val isInitialized: Boolean get() = initialized
+        override val appliedGraphRevision: Long get() = this@FlowTabComponent.appliedGraphRevision
+        override fun snapshot(): GraphSnapshot = state.toSnapshot()
+    }
     // "Realistic" mode: pace the run with human-like delays between steps, so it's
     // watchable and mimics a person driving the page. Observed by the toolbar.
     private var realistic by mutableStateOf(false)
@@ -160,6 +166,7 @@ class FlowTabComponent(
     private val visibleTabId = AtomicReference<String?>(null)
 
     init {
+        FlowPersistenceCoordinator.registerLiveCanvas(config.id, liveCanvas)
         // Surface the host registry's tools as live palette nodes, re-deriving whenever
         // the RBAC-filtered tool set changes. A null registry (older/sandboxed host)
         // degrades cleanly to built-ins only. The collector is tied to [coroutineScope]
@@ -176,6 +183,7 @@ class FlowTabComponent(
         lifecycle.subscribe(
             object : Lifecycle.Callbacks {
                 override fun onDestroy() {
+                    FlowPersistenceCoordinator.unregisterLiveCanvas(config.id, liveCanvas)
                     controller.dispose()
                     coroutineScope.cancel()
                 }
@@ -204,6 +212,11 @@ class FlowTabComponent(
                         state.load(json.decodeFromString(GraphSnapshot.serializer(), saved))
                     }
                 }
+                // A controller/MCP mutation may have landed while the tab was closed or
+                // loading. Replay the newest published snapshot before autosave starts.
+                FlowPersistenceCoordinator.latestGraphUpdate(config.id)?.let { update ->
+                    appliedGraphRevision = state.applyExternalGraphUpdate(update, appliedGraphRevision)
+                }
                 if (state.nodes.isEmpty()) {
                     state.addNode(NodeType.TRIGGER.name, Offset(320f, 200f))
                     state.selection = null
@@ -216,7 +229,7 @@ class FlowTabComponent(
                 }
                 // A launcher/sidebar rename may have completed while this graph was
                 // loading. The replayed name wins over the older stored snapshot.
-                FlowRenameCoordinator.latestName(config.id)?.let { name ->
+                FlowPersistenceCoordinator.latestName(config.id)?.let { name ->
                     state.metadata = (state.metadata ?: FlowMeta()).copy(name = name)
                 }
                 initialized = true
@@ -228,14 +241,29 @@ class FlowTabComponent(
         // Keep the component state in sync so its close-time autosave cannot restore
         // the previous name.
         LaunchedEffect(config.id) {
-            FlowRenameCoordinator.names.collect { renamed ->
+            FlowPersistenceCoordinator.names.collect { renamed ->
                 renamed[config.id]?.let { name ->
                     val metadata = (state.metadata ?: FlowMeta()).copy(name = name)
                     if (state.metadata != metadata) state.metadata = metadata
                     // Force one autosave even when an in-tab optimistic update already
                     // installed this name before the controller published it. That save
                     // acknowledges convergence and releases the temporary rename guard.
-                    renameSyncRevision++
+                    persistenceSyncRevision++
+                }
+            }
+        }
+
+        // Controller/MCP authoring publishes a revisioned full snapshot. Load it into
+        // the live canvas so subsequent local edits build on the external change.
+        LaunchedEffect(config.id) {
+            while (!initialized) delay(20)
+            FlowPersistenceCoordinator.graphUpdates.collect { updates ->
+                updates[config.id]?.let { update ->
+                    val applied = state.applyExternalGraphUpdate(update, appliedGraphRevision)
+                    if (applied != appliedGraphRevision) {
+                        appliedGraphRevision = applied
+                        persistenceSyncRevision++
+                    }
                 }
             }
         }
@@ -245,10 +273,16 @@ class FlowTabComponent(
         LaunchedEffect(config.id) {
             if (storage == null) return@LaunchedEffect
             while (!initialized) delay(20)
-            snapshotFlow { renameSyncRevision to state.toSnapshot() }.collectLatest { (_, snapshot) ->
+            snapshotFlow {
+                Triple(persistenceSyncRevision, appliedGraphRevision, state.toSnapshot())
+            }.collectLatest { (_, appliedRevision, snapshot) ->
                 delay(400)
                 runCatching {
-                    FlowRenameCoordinator.persistAutosave(config.id, snapshot) { current ->
+                    FlowPersistenceCoordinator.persistAutosave(
+                        tabId = config.id,
+                        snapshot = snapshot,
+                        appliedGraphRevision = appliedRevision,
+                    ) { current ->
                         storage.putJson(storageKey, json.encodeToString(GraphSnapshot.serializer(), current))
                     }
                 }
