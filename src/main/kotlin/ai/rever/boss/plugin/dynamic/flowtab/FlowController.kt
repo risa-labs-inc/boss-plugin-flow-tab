@@ -175,18 +175,54 @@ class FlowController(
 
     /** Rename a readable flow without changing any other metadata or graph content. */
     suspend fun renameFlow(tabId: String, name: String): FlowSummary {
+        val snapshot = getFlow(tabId) ?: throw IllegalArgumentException("No readable flow '$tabId'")
+        return persistRenamedFlow(tabId, name, snapshot)
+    }
+
+    /**
+     * Persist (and, when necessary, create) the currently open graph from its live
+     * canvas snapshot with a new name. This is deliberately internal to the tab UI;
+     * storage-seated callers must use [renameFlow] so a stale supplied snapshot cannot
+     * replace a saved graph.
+     */
+    internal suspend fun renameOpenFlow(tabId: String, name: String, snapshot: GraphSnapshot): FlowSummary =
+        persistRenamedFlow(tabId, name, snapshot)
+
+    private suspend fun persistRenamedFlow(
+        tabId: String,
+        name: String,
+        snapshot: GraphSnapshot,
+    ): FlowSummary {
+        check(storage != null) { "Flow storage is unavailable" }
         val normalizedName = name.trim()
         require(normalizedName.isNotEmpty()) { "Flow name cannot be blank" }
         require(normalizedName.length <= MAX_FLOW_NAME_LENGTH) {
             "Flow name cannot exceed $MAX_FLOW_NAME_LENGTH characters"
         }
-        val snapshot = getFlow(tabId) ?: throw IllegalArgumentException("No readable flow '$tabId'")
         val metadata = (snapshot.metadata ?: FlowMeta()).copy(name = normalizedName)
-        write(tabId, snapshot.copy(metadata = metadata))
+        // Once the user confirms, tab close/split recomposition must not cancel the
+        // durable write. Cancellation is observed again by the title-refresh step.
+        withContext(NonCancellable + Dispatchers.IO) {
+            FlowRenameCoordinator.withFlowLock(tabId) {
+                write(tabId, snapshot.copy(metadata = metadata))
+                // Publish only after the storage write succeeds. Open tabs replay this name
+                // into their live state, and their autosave consults it under the same lock.
+                FlowRenameCoordinator.publish(tabId, normalizedName)
+            }
+        }
 
         context.tabUpdateProviderFactory?.let { factory ->
-            withContext(Dispatchers.Main.immediate) {
-                factory.createProvider(tabId, FlowTabType.typeId)?.updateTitle(normalizedName)
+            try {
+                withContext(Dispatchers.Main.immediate) {
+                    factory.createProvider(tabId, FlowTabType.typeId)?.updateTitle(normalizedName)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                // The graph has already been renamed successfully. A host tab-title
+                // refresh failure must not report the whole rename as failed and make
+                // the live metadata diverge from the persisted snapshot.
+                println("[flow-tab] renamed '$tabId', but its tab title could not be refreshed: ${failure.message}")
             }
         }
         return FlowSummary(
@@ -212,6 +248,7 @@ class FlowController(
             store.removeJsonValue(graphKey(tabId))
             store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
         }
+        FlowRenameCoordinator.forget(tabId)
         return true
     }
 
@@ -385,6 +422,8 @@ class FlowController(
     // ---- internals ----------------------------------------------------------
 
     private suspend fun write(tabId: String, snapshot: GraphSnapshot) {
+        // TODO: Controller read-modify-write authoring operations are not yet serialized
+        // against full-snapshot UI autosaves; the rename path coordinates explicitly.
         storage?.putJson(graphKey(tabId), json.encodeToString(GraphSnapshot.serializer(), snapshot))
     }
 
