@@ -111,6 +111,12 @@ class FlowMcpToolProvider(
             val snap = controller.getFlow(tabId) ?: return@def err("No flow '$tabId'")
             McpToolResult(json.encodeToString(GraphSnapshot.serializer(), snap), false)
         },
+        def("flow_delete", "Permanently delete a flow by tabId, closing an open tab first. Returns {ok,tabId}.",
+            schema("""{"tabId":{"type":"string"}}""", required = listOf("tabId")), readOnly = false) { a ->
+            val tabId = a.obj().str("tabId") ?: return@def err("flow_delete requires 'tabId'")
+            if (!controller.deleteFlow(tabId)) return@def err("No flow '$tabId'")
+            ok(buildJsonObject { put("ok", true); put("tabId", tabId) })
+        },
         def("prompt_upsert", "Insert or replace a composable prompt. Body is the full Prompt JSON " +
             "(id, name required; base, rules[], glossary[], goals[], toolAllowlist[]).",
             schema("""{"id":{"type":"string"},"name":{"type":"string"},"base":{"type":"string"},"rules":{"type":"array"},"glossary":{"type":"array"},"goals":{"type":"array"}}""",

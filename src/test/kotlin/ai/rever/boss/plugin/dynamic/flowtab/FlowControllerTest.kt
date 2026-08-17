@@ -211,6 +211,30 @@ class FlowControllerTest {
         assertNull(controller().getFlow("flow-does-not-exist"))
     }
 
+    @Test
+    fun `deleteFlow removes graph and persisted UI run state`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow(FlowMeta(name = "Disposable"))
+        storage.putJson("$RUN_STATE_PREFIX$tabId", "{}")
+
+        assertTrue(fc.deleteFlow(tabId))
+
+        assertNull(storage.getJson("${FlowController.GRAPH_PREFIX}$tabId"))
+        assertNull(storage.getJson("$RUN_STATE_PREFIX$tabId"))
+        assertFalse(tabId in fc.listFlows())
+    }
+
+    @Test
+    fun `deleteFlow removes corrupt graphs and returns false for missing ids`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        storage.putJson("${FlowController.GRAPH_PREFIX}flow-corrupt", "{not-json")
+
+        assertTrue(fc.deleteFlow("flow-corrupt"))
+        assertFalse(fc.deleteFlow("flow-missing"))
+    }
+
     // ---- async run job ------------------------------------------------------
 
     private suspend fun awaitTerminal(fc: FlowController, runId: String): RunJob =

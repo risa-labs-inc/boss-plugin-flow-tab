@@ -173,6 +173,24 @@ class FlowController(
         )
     }
 
+    /**
+     * Permanently delete [tabId], including its UI run-state snapshot. Corrupt graphs
+     * are deletable because existence is checked without decoding the snapshot. Any
+     * live tabs with the same id are closed first so their autosave cannot recreate
+     * the graph after deletion. Returns false when the graph key does not exist.
+     */
+    suspend fun deleteFlow(tabId: String): Boolean {
+        val store = storage ?: throw IllegalStateException("Flow storage is unavailable")
+        if (store.getJson(graphKey(tabId)) == null) return false
+
+        closeOpenFlowTabs(tabId)
+        withContext(NonCancellable) {
+            store.removeJsonValue(graphKey(tabId))
+            store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
+        }
+        return true
+    }
+
     // ---- async run jobs (F1) ------------------------------------------------
 
     /**
@@ -401,6 +419,16 @@ class FlowController(
         if (!startsWith("tool:")) return null
         val secondColon = indexOf(':', startIndex = "tool:".length)
         return if (secondColon >= 0) substring(0, secondColon + 1) else "tool:"
+    }
+
+    private suspend fun closeOpenFlowTabs(tabId: String) {
+        val activeTabs = context.activeTabsProvider ?: return
+        activeTabs.refreshTabs()
+        val openCount = activeTabs.activeTabs.value.count { it.tabId == tabId }
+        repeat(openCount) {
+            val closed = withContext(Dispatchers.Main.immediate) { activeTabs.closeTab(tabId) }
+            check(closed) { "Could not close open flow tab '$tabId'; deletion was cancelled" }
+        }
     }
 
     private fun graphKey(tabId: String) = "$GRAPH_PREFIX$tabId"

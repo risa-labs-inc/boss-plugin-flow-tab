@@ -97,7 +97,7 @@ class FlowMcpToolProviderTest {
         assertEquals(
             setOf(
                 "flow_create", "flow_add_node", "flow_connect", "flow_run",
-                "flow_status", "flow_result", "flow_list", "flow_get",
+                "flow_status", "flow_result", "flow_list", "flow_get", "flow_delete",
                 "prompt_upsert", "prompt_get", "prompt_list",
             ),
             names.toSet(),
@@ -152,6 +152,21 @@ class FlowMcpToolProviderTest {
             .map { it.jsonObject }
             .single { it.getValue("tabId").jsonPrimitive.content == "flow-corrupt" }
         assertEquals("false", corrupt.getValue("readable").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `flow_delete permanently removes readable and corrupt flows`() = runBlocking {
+        val storage = FakeStorage()
+        val p = provider(storage)
+        val tabId = obj(call(p, "flow_create", """{"name":"Disposable"}"""))
+            .getValue("tabId").jsonPrimitive.content
+
+        assertFalse(call(p, "flow_delete", """{"tabId":"$tabId"}""").isError)
+        assertTrue(call(p, "flow_get", """{"tabId":"$tabId"}""").isError)
+
+        storage.putJson("${FlowController.GRAPH_PREFIX}flow-corrupt", "{not-json")
+        assertFalse(call(p, "flow_delete", """{"tabId":"flow-corrupt"}""").isError)
+        assertTrue(call(p, "flow_delete", """{"tabId":"flow-missing"}""").isError)
     }
 
     @Test
