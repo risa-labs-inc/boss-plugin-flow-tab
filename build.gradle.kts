@@ -110,6 +110,7 @@ dependencies {
     // --- Tests ---
     testImplementation(kotlin("test-junit5"))
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")
     // The boss-plugin-api is compileOnly for main (host-provided); tests need it
     // on the classpath to build a fake PluginContext / BrowserService / BrowserHandle.
     if (useLocalDependencies) {

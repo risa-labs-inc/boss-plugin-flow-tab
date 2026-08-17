@@ -180,11 +180,12 @@ class FlowController(
     }
 
     /**
-     * Rename the currently open flow from its live canvas snapshot. Unlike [renameFlow],
-     * this does not require the debounced autosave to have created the storage entry yet,
-     * so a brand-new tab can be named immediately after it opens.
+     * Persist (and, when necessary, create) the currently open graph from its live
+     * canvas snapshot with a new name. This is deliberately internal to the tab UI;
+     * storage-seated callers must use [renameFlow] so a stale supplied snapshot cannot
+     * replace a saved graph.
      */
-    suspend fun renameOpenFlow(tabId: String, name: String, snapshot: GraphSnapshot): FlowSummary =
+    internal suspend fun renameOpenFlow(tabId: String, name: String, snapshot: GraphSnapshot): FlowSummary =
         persistRenamedFlow(tabId, name, snapshot)
 
     private suspend fun persistRenamedFlow(
@@ -198,18 +199,25 @@ class FlowController(
             "Flow name cannot exceed $MAX_FLOW_NAME_LENGTH characters"
         }
         val metadata = (snapshot.metadata ?: FlowMeta()).copy(name = normalizedName)
-        write(tabId, snapshot.copy(metadata = metadata))
+        FlowRenameCoordinator.withFlowLock(tabId) {
+            write(tabId, snapshot.copy(metadata = metadata))
+            // Publish only after the storage write succeeds. Open tabs replay this name
+            // into their live state, and their autosave consults it under the same lock.
+            FlowRenameCoordinator.publish(tabId, normalizedName)
+        }
 
         context.tabUpdateProviderFactory?.let { factory ->
-            runCatching {
+            try {
                 withContext(Dispatchers.Main.immediate) {
                     factory.createProvider(tabId, FlowTabType.typeId)?.updateTitle(normalizedName)
                 }
-            }.onFailure {
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
                 // The graph has already been renamed successfully. A host tab-title
                 // refresh failure must not report the whole rename as failed and make
                 // the live metadata diverge from the persisted snapshot.
-                println("[flow-tab] renamed '$tabId', but its tab title could not be refreshed: ${it.message}")
+                println("[flow-tab] renamed '$tabId', but its tab title could not be refreshed: ${failure.message}")
             }
         }
         return FlowSummary(
@@ -235,6 +243,7 @@ class FlowController(
             store.removeJsonValue(graphKey(tabId))
             store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
         }
+        FlowRenameCoordinator.forget(tabId)
         return true
     }
 

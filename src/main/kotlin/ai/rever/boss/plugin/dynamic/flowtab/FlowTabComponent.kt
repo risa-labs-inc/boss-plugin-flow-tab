@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.AlertDialog
@@ -151,7 +150,7 @@ class FlowTabComponent(
     private val templateCatalog = TemplateCatalog()
     private val runJobs = RunJobFence(coroutineScope)
     private val runStatePersistence = RunStatePersistenceGate()
-    private var initialized = false
+    private var initialized by mutableStateOf(false)
     // "Realistic" mode: pace the run with human-like delays between steps, so it's
     // watchable and mimics a person driving the page. Observed by the toolbar.
     private var realistic by mutableStateOf(false)
@@ -214,9 +213,26 @@ class FlowTabComponent(
                         state.runStates.putAll(json.decodeFromString(RunSnapshot.serializer(), rs).toRuns())
                     }
                 }
+                // A launcher/sidebar rename may have completed while this graph was
+                // loading. The replayed name wins over the older stored snapshot.
+                FlowRenameCoordinator.latestName(config.id)?.let { name ->
+                    state.metadata = (state.metadata ?: FlowMeta()).copy(name = name)
+                }
                 initialized = true
             }
             focusRequester.requestFocus()
+        }
+
+        // A flow can be renamed from the launcher while its canvas is already open.
+        // Keep the component state in sync so its close-time autosave cannot restore
+        // the previous name.
+        LaunchedEffect(config.id) {
+            FlowRenameCoordinator.names.collect { renamed ->
+                renamed[config.id]?.let { name ->
+                    val metadata = (state.metadata ?: FlowMeta()).copy(name = name)
+                    if (state.metadata != metadata) state.metadata = metadata
+                }
+            }
         }
 
         // Debounced autosave: waits for the one-time load, then writes after a quiet
@@ -227,7 +243,10 @@ class FlowTabComponent(
             snapshotFlow { state.toSnapshot() }.collectLatest { snapshot ->
                 delay(400)
                 runCatching {
-                    storage.putJson(storageKey, json.encodeToString(GraphSnapshot.serializer(), snapshot))
+                    FlowRenameCoordinator.withFlowLock(config.id) {
+                        val current = FlowRenameCoordinator.applyLatestName(config.id, snapshot)
+                        storage.putJson(storageKey, json.encodeToString(GraphSnapshot.serializer(), current))
+                    }
                 }
             }
         }
@@ -538,6 +557,7 @@ class FlowTabComponent(
         var showGallery by remember { mutableStateOf(false) }
         var showRename by remember { mutableStateOf(false) }
         var renameInProgress by remember { mutableStateOf(false) }
+        val renameEnabled = initialized && !renameInProgress
         val currentFlowName = state.metadata?.name?.ifBlank { null }
             ?: config.title.ifBlank { "Flow" }
 
@@ -558,7 +578,8 @@ class FlowTabComponent(
                         FlowTabData(id = "flow-${java.util.UUID.randomUUID()}", title = "Flow")
                     )
                 },
-                onRename = { if (!renameInProgress) showRename = true },
+                renameEnabled = renameEnabled,
+                onRename = { showRename = true },
                 onTemplates = { showGallery = true },
                 onZoomIn = { state.zoomBy(1.2f, viewCenterScreen()) },
                 onZoomOut = { state.zoomBy(1f / 1.2f, viewCenterScreen()) },
@@ -716,6 +737,7 @@ class FlowTabComponent(
 @Composable
 private fun Toolbar(
     flowName: String,
+    renameEnabled: Boolean,
     scale: Float,
     isRunning: Boolean,
     realistic: Boolean,
@@ -758,9 +780,9 @@ private fun Toolbar(
             fontWeight = FontWeight.SemiBold,
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.widthIn(max = 180.dp),
+            modifier = Modifier.weight(1f, fill = false),
         )
-        ToolbarButton(Icons.Filled.Edit, "Rename flow", onRename)
+        ToolbarButton(Icons.Filled.Edit, "Rename flow", onRename, enabled = renameEnabled)
 
         Spacer(Modifier.width(4.dp))
         // Run / Stop
@@ -886,7 +908,8 @@ private fun Toolbar(
 private fun ToolbarButton(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     description: String,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    enabled: Boolean = true,
 ) {
     TooltipArea(
         delayMillis = 350,
@@ -903,8 +926,13 @@ private fun ToolbarButton(
             }
         }
     ) {
-        IconButton(onClick = onClick, modifier = Modifier.size(34.dp)) {
-            Icon(icon, contentDescription = description, tint = IconTint, modifier = Modifier.size(18.dp))
+        IconButton(onClick = onClick, enabled = enabled, modifier = Modifier.size(34.dp)) {
+            Icon(
+                icon,
+                contentDescription = description,
+                tint = if (enabled) IconTint else IconTint.copy(alpha = 0.38f),
+                modifier = Modifier.size(18.dp),
+            )
         }
     }
 }

@@ -9,10 +9,14 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.PluginStorageFactory
 import ai.rever.boss.plugin.api.PluginStorageProvider
 import ai.rever.boss.plugin.api.TabRegistry
+import ai.rever.boss.plugin.api.TabTypeId
+import ai.rever.boss.plugin.api.TabUpdateProvider
+import ai.rever.boss.plugin.api.TabUpdateProviderFactory
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -20,6 +24,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
@@ -41,11 +48,15 @@ import kotlin.test.assertTrue
  * that the async run-job model reaches a terminal state and yields per-node outputs
  * — all against an in-memory fake store, no live boss server (F1 async, F5 storage).
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class FlowControllerTest {
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    private fun context(storage: PluginStorageProvider): PluginContext = object : PluginContext {
+    private fun context(
+        storage: PluginStorageProvider,
+        tabUpdates: TabUpdateProviderFactory? = null,
+    ): PluginContext = object : PluginContext {
         override val panelRegistry = PanelRegistry()
         override val tabRegistry = TabRegistry()
         override val pluginScope = scope
@@ -53,13 +64,15 @@ class FlowControllerTest {
         override val pluginStorageFactory = object : PluginStorageFactory {
             override fun createStorage(pluginId: String): PluginStorageProvider = storage
         }
+        override val tabUpdateProviderFactory: TabUpdateProviderFactory? = tabUpdates
     }
 
     private fun controller(
         storage: PluginStorageProvider = DesktopStorage(),
         registry: NodeRegistry = builtinNodeRegistry(),
         runTimeoutMs: Long = FlowController.DEFAULT_RUN_TIMEOUT_MS,
-    ) = FlowController(context(storage), { scope }, registry, runTimeoutMs)
+        tabUpdates: TabUpdateProviderFactory? = null,
+    ) = FlowController(context(storage, tabUpdates), { scope }, registry, runTimeoutMs)
 
     // ---- authoring ----------------------------------------------------------
 
@@ -249,6 +262,100 @@ class FlowControllerTest {
         assertEquals("Keep me", renamed.metadata?.description)
         assertEquals(listOf("claimId"), renamed.metadata?.inputs)
         assertEquals("n1", renamed.nodes.single().id)
+    }
+
+    @Test
+    fun `renameOpenFlow validates blank and overlong names`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = "flow-new-tab-validation"
+
+        assertFailsWith<IllegalArgumentException> {
+            fc.renameOpenFlow(tabId, "   ", GraphSnapshot())
+        }
+        assertFailsWith<IllegalArgumentException> {
+            fc.renameOpenFlow(
+                tabId,
+                "x".repeat(FlowController.MAX_FLOW_NAME_LENGTH + 1),
+                GraphSnapshot(),
+            )
+        }
+        assertNull(fc.getFlow(tabId))
+    }
+
+    @Test
+    fun `renameFlow keeps the graph renamed when the host title refresh fails`() = runBlocking {
+        val storage = DesktopStorage()
+        val tabId = controller(storage).createFlow(FlowMeta(name = "Old name"))
+        val titleFailure = object : TabUpdateProviderFactory {
+            override fun createProvider(tabId: String, typeId: TabTypeId): TabUpdateProvider {
+                val providerTabId = tabId
+                return object : TabUpdateProvider {
+                    override val tabId: String = providerTabId
+                    override fun updateTitle(title: String) = error("host title update failed")
+                    override fun updateFavicon(faviconUrl: String?) = Unit
+                    override fun updateUrl(url: String) = Unit
+                    override fun closeTab() = Unit
+                    override fun openNewTab(url: String): String? = null
+                }
+            }
+        }
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val fc = controller(storage, tabUpdates = titleFailure)
+            val summary = fc.renameFlow(tabId, "New name")
+
+            assertEquals("New name", summary.name)
+            assertEquals("New name", fc.getFlow(tabId)?.metadata?.name)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun `renameFlow does not swallow title refresh cancellation`() = runBlocking {
+        val storage = DesktopStorage()
+        val tabId = controller(storage).createFlow(FlowMeta(name = "Old name"))
+        val cancelledTitle = object : TabUpdateProviderFactory {
+            override fun createProvider(tabId: String, typeId: TabTypeId): TabUpdateProvider {
+                val providerTabId = tabId
+                return object : TabUpdateProvider {
+                    override val tabId: String = providerTabId
+                    override fun updateTitle(title: String): Unit = throw CancellationException("cancel")
+                    override fun updateFavicon(faviconUrl: String?) = Unit
+                    override fun updateUrl(url: String) = Unit
+                    override fun closeTab() = Unit
+                    override fun openNewTab(url: String): String? = null
+                }
+            }
+        }
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val fc = controller(storage, tabUpdates = cancelledTitle)
+            assertFailsWith<CancellationException> { fc.renameFlow(tabId, "New name") }
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun `stale open-tab autosave cannot revert a successful rename`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow(FlowMeta(name = "Old name"))
+        val staleOpenTabSnapshot = fc.getFlow(tabId)!!
+
+        fc.renameFlow(tabId, "New name")
+        FlowRenameCoordinator.withFlowLock(tabId) {
+            val safeAutosave = FlowRenameCoordinator.applyLatestName(tabId, staleOpenTabSnapshot)
+            storage.putJson(
+                "${FlowController.GRAPH_PREFIX}$tabId",
+                kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), safeAutosave),
+            )
+        }
+
+        assertEquals("New name", fc.getFlow(tabId)?.metadata?.name)
+        assertEquals("New name", FlowRenameCoordinator.latestName(tabId))
     }
 
     @Test
