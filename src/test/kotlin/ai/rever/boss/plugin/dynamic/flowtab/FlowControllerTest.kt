@@ -27,7 +27,9 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -94,6 +96,20 @@ class FlowControllerTest {
         fc.addNode(tabId, "SET", JsonObject(emptyMap()))
         val titles = fc.getFlow(tabId)!!.nodes.map { it.title }
         assertEquals(titles.toSet().size, titles.size) // all unique (D3)
+    }
+
+    @Test
+    fun `addNode rejects an unregistered kind without changing the flow`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+
+        val failure = assertFailsWith<IllegalArgumentException> {
+            fc.addNode(tabId, "__invalid_probe_kind__")
+        }
+
+        assertContains(failure.message.orEmpty(), "__invalid_probe_kind__")
+        assertContains(failure.message.orEmpty(), "SET")
+        assertTrue(fc.getFlow(tabId)!!.nodes.isEmpty())
     }
 
     @Test
@@ -217,10 +233,15 @@ class FlowControllerTest {
 
     @Test
     fun `a node error fails the run but reaches a terminal state`() = runBlocking {
-        val fc = controller()
+        val registry = builtinNodeRegistry().also {
+            // Model a kind that was registered when authored but is unavailable now;
+            // entirely unknown kinds are rejected by addNode.
+            it.register(NodeSpec.unavailable("tool:boss:gone"))
+        }
+        val fc = controller(registry = registry)
         val tabId = fc.createFlow()
         val trig = fc.addNode(tabId, "TRIGGER", JsonObject(emptyMap()))
-        val gone = fc.addNode(tabId, "tool:boss:gone", JsonObject(emptyMap())) // unavailable
+        val gone = fc.addNode(tabId, "tool:boss:gone", JsonObject(emptyMap()))
         fc.connect(tabId, trig, 0, gone, 0)
         val job = awaitTerminal(fc, fc.startRun(tabId))
         assertEquals(RunJobState.FAILED, job.state)

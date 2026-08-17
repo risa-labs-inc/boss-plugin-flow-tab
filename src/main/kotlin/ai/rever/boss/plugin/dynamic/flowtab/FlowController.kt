@@ -89,7 +89,12 @@ class FlowController(
      */
     suspend fun addNode(tabId: String, kind: String, config: JsonObject = JsonObject(emptyMap())): String {
         val snap = getFlow(tabId) ?: throw IllegalArgumentException("No flow '$tabId'")
-        val spec = registry.resolve(kind)
+        // Saved graphs still resolve missing kinds to placeholders so they round-trip,
+        // but new authoring requests must not create nodes that can never execute.
+        val spec = requireNotNull(registry[kind]) {
+            val validKinds = registry.all().map(NodeSpec::id).sorted().joinToString(", ")
+            "Unknown node kind '$kind'. Valid kinds: $validKinds"
+        }
         val nodeId = "n${snap.nextId}"
         val title = uniqueTitle(spec.label, snap.nodes.map { it.title }.toSet())
         val idx = snap.nodes.size
