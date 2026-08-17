@@ -242,8 +242,9 @@ data class EdgeModel(
 )
 
 /**
- * Optional metadata for a flow / lanager. Present on templates and agent-driven
- * workflows; null for a plain ad-hoc canvas.
+ * Optional descriptive metadata for a flow / lanager. Present on templates,
+ * agent-driven workflows, and named UI-created flows; null on legacy or unnamed
+ * ad-hoc canvases.
  *
  * @param inputs names of the values the flow expects to be supplied at run time
  *   (used by lanager templates + the MCP `flow_run` contract).

@@ -41,6 +41,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.arkivanov.decompose.ComponentContext
@@ -126,13 +127,17 @@ class FlowLauncherComponent(
             )
 
             NewFlowButton(enabled = splitView != null && controller != null && !creatingFlow) {
+                if (creatingFlow) return@NewFlowButton
+                creatingFlow = true
+                operationError = null
                 scope.launch {
-                    creatingFlow = true
-                    operationError = null
                     try {
                         val title = nextFlowName(savedFlows)
                         val tabId = withContext(Dispatchers.IO) {
-                            requireNotNull(controller).createFlow(FlowMeta(name = title))
+                            val activeController = requireNotNull(controller)
+                            activeController.createFlow(FlowMeta(name = title)).also { newId ->
+                                activeController.addNode(newId, "TRIGGER")
+                            }
                         }
                         splitView?.openTab(FlowTabData(id = tabId, title = title))
                         refreshGeneration++
@@ -266,12 +271,24 @@ private fun SavedFlowRow(flow: FlowSummary, enabled: Boolean, onClick: () -> Uni
             fontWeight = FontWeight.Medium,
         )
         if (flow.description.isNotBlank()) {
-            Text(flow.description, color = Color(0xFFB0B0B8), fontSize = 11.sp)
+            Text(
+                flow.description,
+                color = Color(0xFFB0B0B8),
+                fontSize = 11.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
         Text(
-            text = if (flow.readable) "${flow.nodeCount} node(s) · ${flow.tabId}" else flow.tabId,
+            text = if (flow.readable) {
+                "${flow.nodeCount} node(s) · ${flow.tabId.take(13)}…"
+            } else {
+                flow.tabId
+            },
             color = Color(0xFF7E7E88),
             fontSize = 10.sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -299,7 +316,7 @@ private fun NewFlowButton(enabled: Boolean, onClick: () -> Unit) {
     }
 }
 
-private fun nextFlowName(flows: List<FlowSummary>): String {
+internal fun nextFlowName(flows: List<FlowSummary>): String {
     val names = flows.mapTo(mutableSetOf()) { it.name }
     return generateSequence(1) { it + 1 }
         .map { "Flow $it" }
