@@ -56,6 +56,8 @@ class FlowExecutor(
     /** Kind-id → spec map used for dispatch. Defaults to the built-ins so tests and
      *  the ad-hoc executor path work without threading a registry through. */
     private val registry: NodeRegistry = builtinNodeRegistry(),
+    /** Injectable for tests; production resolves from the host secret manager. */
+    private val secrets: SecretResolver = SecretResolver.fromSecrets(context),
 ) {
 
     suspend fun run(
@@ -83,6 +85,7 @@ class FlowExecutor(
         val done = nodes.associate { it.id to CompletableDeferred<Unit>() }
         val ctx = RunContext(
             context,
+            secrets = secrets,
             onVisibleTab = onVisibleTab,
             depth = depth,
             ancestry = ancestry,

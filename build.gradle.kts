@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "ai.rever.boss.plugin.dynamic"
-version = "1.0.29"
+version = "1.0.30"
 
 java {
     toolchain {
@@ -125,6 +125,7 @@ tasks.test {
 
 // Task to build plugin JAR with compiled classes only
 tasks.register<Jar>("buildPluginJar") {
+    dependsOn(tasks.processResources)
     archiveFileName.set("boss-plugin-flow-tab-${version}.jar")
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 
@@ -138,9 +139,6 @@ tasks.register<Jar>("buildPluginJar") {
 
     // Include compiled classes
     from(sourceSets.main.get().output)
-
-    // Include plugin manifest
-    from("src/main/resources")
 
     // Fat-pack the P7 external-MCP runtime deps (MCP Kotlin SDK client + ktor + their
     // transitive closure) that the host classpath does NOT provide. Host-provided groups
@@ -171,9 +169,17 @@ tasks.register<Jar>("buildPluginJar") {
 
 // Sync version from build.gradle.kts into plugin.json (single source of truth)
 tasks.processResources {
+    // Project.version is not a file input, so declare it explicitly; otherwise Gradle can
+    // reuse a manifest generated for an older release after only this value changes.
+    inputs.property("pluginVersion", project.version.toString())
     filesMatching("**/plugin.json") {
         filter { line ->
-            line.replace(Regex(""""version"\s*:\s*"[^"]*""""), """"version": "\$version"""")
+            // Only the two-space-indented top-level plugin version. Dependency entries
+            // have deeper indentation and must retain their own version constraints.
+            line.replace(
+                Regex("^  \"version\"\\s*:\\s*\"[^\"]*\""),
+                "  \"version\": \"${project.version}\"",
+            )
         }
     }
 }

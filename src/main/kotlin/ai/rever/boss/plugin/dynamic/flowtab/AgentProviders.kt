@@ -43,7 +43,8 @@ fun interface SecretResolver {
         fun fromSecrets(context: ai.rever.boss.plugin.api.PluginContext): SecretResolver = SecretResolver { name ->
             val provider = context.secretDataProvider ?: return@SecretResolver null
             runCatching {
-                val page = provider.searchSecrets(name, 0, 20).getOrNull() ?: return@runCatching null
+                val page = provider.searchSecrets(name, limit = 20, offset = 0).getOrNull()
+                    ?: return@runCatching null
                 page.data.firstOrNull { it.website.equals(name, true) || it.username.equals(name, true) }?.password
             }.getOrNull()
         }

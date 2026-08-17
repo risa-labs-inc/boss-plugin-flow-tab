@@ -74,6 +74,9 @@ internal suspend fun BrowserIntegration.awaitElement(
  */
 class RunContext(
     val context: PluginContext,
+    /** Resolves logical secret names at execution time. Values are never copied into
+     * node config, graph snapshots, or logs. */
+    val secrets: SecretResolver = SecretResolver.fromSecrets(context),
     /** Reports the visible browser tab id this run opened, so the UI can close it
      *  before the next run (each run opens a fresh tab — see startRun). */
     onVisibleTab: (String?) -> Unit = {},
@@ -122,6 +125,43 @@ class RunContext(
      *  left open for inspection and torn down by the host). */
     suspend fun close() {
         sessions.closeAll()
+    }
+}
+
+/**
+ * Resolves `{{ $secret.name }}` references without passing them through
+ * [ExpressionEval], whose deliberately small expression language treats unknown
+ * roots as empty strings. A resolver instance lives for one HTTP execution, so a
+ * repeated name is fetched once and discarded with that request.
+ */
+internal class SecretTemplateResolver(private val secrets: SecretResolver) {
+    private val values = mutableMapOf<String, String>()
+
+    suspend fun resolve(template: String, interpolate: (String) -> String): String {
+        val malformed = SECRET_EXPRESSION.findAll(template)
+            .firstOrNull { SECRET_REFERENCE.matchEntire(it.value) == null }
+        if (malformed != null) {
+            throw ExecError("HTTP secret reference is invalid — use {{ \$secret.name }}")
+        }
+
+        val out = StringBuilder(template.length)
+        var cursor = 0
+        for (match in SECRET_REFERENCE.findAll(template)) {
+            out.append(interpolate(template.substring(cursor, match.range.first)))
+            val name = match.groupValues[1]
+            val value = values[name] ?: runCatching { secrets.get(name) }.getOrNull()
+                ?: throw ExecError("HTTP secret '$name' was not found")
+            values[name] = value
+            out.append(value)
+            cursor = match.range.last + 1
+        }
+        out.append(interpolate(template.substring(cursor)))
+        return out.toString()
+    }
+
+    private companion object {
+        val SECRET_REFERENCE = Regex("""\{\{\s*\${'$'}secret\.([A-Za-z0-9][A-Za-z0-9_.-]*)\s*}}""")
+        val SECRET_EXPRESSION = Regex("""\{\{\s*\${'$'}secret\b.*?}}""")
     }
 }
 
@@ -284,26 +324,34 @@ object NodeCatalog {
             NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
         }
 
-        NodeType.HTTP -> NodeExecutor { _, cfg, _, log ->
-            val url = cfg.str("url")
+        NodeType.HTTP -> NodeExecutor { ctx, cfg, _, log ->
+            val secretTemplates = SecretTemplateResolver(ctx.secrets)
+            val url = secretTemplates.resolve(cfg.raw("url"), cfg::interpolate)
             if (url.isBlank()) throw ExecError("HTTP needs a URL")
             val method = cfg.str("method", "GET").ifEmpty { "GET" }.uppercase()
-            val body = cfg.str("body")
-            val headers = parseHeaders(cfg.str("headers"))
-            log("$method $url")
-            val resp = withContext(Dispatchers.IO) {
-                // Bounded so a hung endpoint can't stall the node (and, under MCP flow_run,
-                // the whole run) indefinitely — red-team S3.
-                val builder = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(60))
-                headers.forEach { (k, v) -> builder.header(k, v) }
-                val pub = if (method == "GET" || method == "DELETE") {
-                    HttpRequest.BodyPublishers.noBody()
-                } else {
-                    HttpRequest.BodyPublishers.ofString(body)
+            val body = secretTemplates.resolve(cfg.raw("body"), cfg::interpolate)
+            val headers = parseHeaders(secretTemplates.resolve(cfg.raw("headers"), cfg::interpolate))
+            log("$method HTTP request")
+            val resp = try {
+                withContext(Dispatchers.IO) {
+                    // Bounded so a hung endpoint can't stall the node (and, under MCP flow_run,
+                    // the whole run) indefinitely — red-team S3.
+                    val builder = HttpRequest.newBuilder(URI.create(url)).timeout(Duration.ofSeconds(60))
+                    headers.forEach { (k, v) -> builder.header(k, v) }
+                    val pub = if (method == "GET" || method == "DELETE") {
+                        HttpRequest.BodyPublishers.noBody()
+                    } else {
+                        HttpRequest.BodyPublishers.ofString(body)
+                    }
+                    builder.method(method, pub)
+                    val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
+                    client.send(builder.build(), HttpResponse.BodyHandlers.ofString())
                 }
-                builder.method(method, pub)
-                val client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
-                client.send(builder.build(), HttpResponse.BodyHandlers.ofString())
+            } catch (e: ExecError) {
+                throw e
+            } catch (_: Exception) {
+                // URI/header/client exceptions may embed request values in their messages.
+                throw ExecError("HTTP request failed before a response was received")
             }
             val parsedBody = runCatching { EXEC_JSON.parseToJsonElement(resp.body()) }
                 .getOrElse { JsonPrimitive(resp.body()) }
@@ -356,11 +404,14 @@ object NodeCatalog {
 
     private fun parseHeaders(raw: String): Map<String, String> {
         if (raw.isBlank()) return emptyMap()
-        return runCatching {
+        return try {
             EXEC_JSON.parseToJsonElement(raw).jsonObject.mapValues { (_, v) ->
                 (v as? JsonPrimitive)?.content ?: v.toString()
             }
-        }.getOrDefault(emptyMap())
+        } catch (_: Exception) {
+            // Do not echo raw JSON: it can already contain resolved credentials.
+            throw ExecError("HTTP headers must be a valid JSON object")
+        }
     }
 
     /**

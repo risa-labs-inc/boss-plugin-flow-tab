@@ -139,6 +139,13 @@ readability. `flow_delete` permanently removes a graph and its UI run-state snap
 matching open tab first. The launcher uses the same controller and storage namespace as these MCP
 contracts, lets users rename readable flows, and asks for confirmation before deletion.
 
+### HTTP secrets
+
+HTTP node URL, headers, and body fields accept `{{ $secret.name }}` references. `name` is matched
+against the website or username in the host secret manager, using the same resolver as external
+MCP configuration. Flow stores only the reference in graph JSON; the password is substituted at
+execution time and is never written back or included in HTTP-node logs and error messages.
+
 ## Version Management
 
 **`build.gradle.kts` is the single source of truth for version.**
