@@ -139,6 +139,12 @@ class FlowMcpToolProviderTest {
         assertEquals("Router", detail.getValue("name").jsonPrimitive.content)
         assertEquals(2, detail.getValue("nodeCount").jsonPrimitive.content.toInt())
         assertEquals("true", detail.getValue("readable").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `detailed flow list exposes corrupt flows as unreadable`() = runBlocking {
+        val storage = FakeStorage()
+        val p = provider(storage)
 
         storage.putJson("${FlowController.GRAPH_PREFIX}flow-corrupt", "{not-json")
         val corrupt = obj(call(p, "flow_list", """{"detail":true}"""))

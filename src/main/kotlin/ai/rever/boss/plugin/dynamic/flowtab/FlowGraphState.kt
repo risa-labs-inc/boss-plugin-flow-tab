@@ -86,7 +86,7 @@ class FlowGraphState(
     val edges = mutableStateListOf<EdgeModel>()
 
     /** Descriptive data loaded with the graph and preserved by every autosave. */
-    var metadata: FlowMeta? = null
+    var metadata by mutableStateOf<FlowMeta?>(null)
 
     var scale by mutableStateOf(1f)
     var panOffset by mutableStateOf(Offset.Zero)

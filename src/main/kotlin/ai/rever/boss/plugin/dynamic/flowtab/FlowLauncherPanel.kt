@@ -46,10 +46,8 @@ import androidx.compose.ui.unit.sp
 import com.arkivanov.decompose.ComponentContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.util.UUID
 
 /** Sidebar panel info for the Flow launcher. */
 object FlowLauncherInfo : PanelInfo {
@@ -82,6 +80,8 @@ class FlowLauncherComponent(
         var savedFlows by remember { mutableStateOf<List<FlowSummary>>(emptyList()) }
         var loading by remember { mutableStateOf(true) }
         var loadError by remember { mutableStateOf<String?>(null) }
+        var operationError by remember { mutableStateOf<String?>(null) }
+        var creatingFlow by remember { mutableStateOf(false) }
         var refreshGeneration by remember { mutableIntStateOf(0) }
         var openingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
         val scope = rememberCoroutineScope()
@@ -125,21 +125,37 @@ class FlowLauncherComponent(
                 fontSize = 12.sp
             )
 
-            NewFlowButton(enabled = splitView != null) {
-                splitView?.openTab(
-                    FlowTabData(id = "flow-${UUID.randomUUID()}", title = "Flow")
-                )
+            NewFlowButton(enabled = splitView != null && controller != null && !creatingFlow) {
                 scope.launch {
-                    delay(700)
-                    refreshGeneration++
+                    creatingFlow = true
+                    operationError = null
+                    try {
+                        val title = nextFlowName(savedFlows)
+                        val tabId = withContext(Dispatchers.IO) {
+                            requireNotNull(controller).createFlow(FlowMeta(name = title))
+                        }
+                        splitView?.openTab(FlowTabData(id = tabId, title = title))
+                        refreshGeneration++
+                    } catch (failure: Exception) {
+                        operationError = failure.message ?: failure.toString()
+                    } finally {
+                        creatingFlow = false
+                    }
                 }
             }
 
-            if (splitView == null) {
+            if (splitView == null || controller == null) {
                 Text(
-                    text = "Tab operations are unavailable in this context.",
+                    text = "Flow creation is unavailable in this context.",
                     color = Color(0xFFE5935B),
                     fontSize = 11.sp
+                )
+            }
+            if (context.activeTabsProvider == null) {
+                Text(
+                    text = "Opening saved flows is unavailable in this context.",
+                    color = Color(0xFFE5935B),
+                    fontSize = 11.sp,
                 )
             }
 
@@ -163,37 +179,46 @@ class FlowLauncherComponent(
                     .fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                when {
-                    loading -> item { LauncherMessage("Loading saved flows…") }
-                    loadError != null -> item {
-                        LauncherMessage(
-                            "Could not load saved flows: $loadError",
-                            Color(0xFFE5935B),
-                        )
-                    }
-                    savedFlows.isEmpty() -> item { LauncherMessage("No saved flows yet.") }
-                    else -> items(savedFlows, key = { it.tabId }) { flow ->
-                        SavedFlowRow(
-                            flow = flow,
-                            enabled = flow.readable && splitView != null && flow.tabId !in openingFlowIds,
-                        ) {
-                            if (flow.tabId in openingFlowIds) return@SavedFlowRow
-                            openingFlowIds += flow.tabId
-                            scope.launch {
-                                try {
-                                    val activeTabs = context.activeTabsProvider
-                                    activeTabs?.refreshTabs()
-                                    val alreadyOpen = activeTabs?.activeTabs?.value
-                                        ?.firstOrNull { it.tabId == flow.tabId }
-                                    if (alreadyOpen != null) {
-                                        activeTabs.selectTab(alreadyOpen.tabId, alreadyOpen.panelId)
-                                    } else {
-                                        val title = flow.name.ifBlank { "Untitled Flow" }
-                                        splitView?.openTab(FlowTabData(id = flow.tabId, title = title))
-                                    }
-                                } finally {
-                                    openingFlowIds -= flow.tabId
+                if (loading) {
+                    item { LauncherMessage(if (savedFlows.isEmpty()) "Loading saved flows…" else "Refreshing…") }
+                }
+                loadError?.let { error ->
+                    item { LauncherMessage("Could not refresh saved flows: $error", Color(0xFFE5935B)) }
+                }
+                operationError?.let { error ->
+                    item { LauncherMessage(error, Color(0xFFE5935B)) }
+                }
+                if (!loading && loadError == null && savedFlows.isEmpty()) {
+                    item { LauncherMessage("No saved flows yet.") }
+                }
+                items(savedFlows, key = { it.tabId }) { flow ->
+                    SavedFlowRow(
+                        flow = flow,
+                        enabled = flow.readable && splitView != null &&
+                            context.activeTabsProvider != null && flow.tabId !in openingFlowIds,
+                    ) {
+                        if (flow.tabId in openingFlowIds) return@SavedFlowRow
+                        openingFlowIds += flow.tabId
+                        operationError = null
+                        scope.launch {
+                            try {
+                                val activeTabs = requireNotNull(context.activeTabsProvider) {
+                                    "Saved-flow opening is unavailable because active-tab discovery is unavailable."
                                 }
+                                // refreshTabs is a suspend contract: when it returns, value contains
+                                // the host's latest snapshot and is safe to sample synchronously.
+                                activeTabs.refreshTabs()
+                                val alreadyOpen = activeTabs.activeTabs.value.firstOrNull { it.tabId == flow.tabId }
+                                if (alreadyOpen != null) {
+                                    activeTabs.selectTab(alreadyOpen.tabId, alreadyOpen.panelId)
+                                } else {
+                                    val title = flow.name.ifBlank { "Untitled Flow" }
+                                    splitView?.openTab(FlowTabData(id = flow.tabId, title = title))
+                                }
+                            } catch (failure: Exception) {
+                                operationError = failure.message ?: failure.toString()
+                            } finally {
+                                openingFlowIds -= flow.tabId
                             }
                         }
                     }
@@ -272,4 +297,11 @@ private fun NewFlowButton(enabled: Boolean, onClick: () -> Unit) {
         Spacer(Modifier.width(8.dp))
         Text("New Flow Canvas", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium)
     }
+}
+
+private fun nextFlowName(flows: List<FlowSummary>): String {
+    val names = flows.mapTo(mutableSetOf()) { it.name }
+    return generateSequence(1) { it + 1 }
+        .map { "Flow $it" }
+        .first { it !in names }
 }
