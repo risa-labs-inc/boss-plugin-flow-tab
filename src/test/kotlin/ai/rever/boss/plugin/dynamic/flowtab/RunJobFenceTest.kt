@@ -133,6 +133,32 @@ class RunJobFenceTest {
         }
     }
 
+    @Test
+    fun `later attempts fail fast after predecessor timeout`() = runTimedTest {
+        val fence = RunJobFence(this, predecessorTimeoutMs = 20)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CompletableDeferred<Unit>()
+        fence.launch {
+            firstStarted.complete(Unit)
+            withContext(NonCancellable) { releaseFirst.await() }
+        }
+        firstStarted.await()
+        val timedOut = fence.launch { }
+        timedOut.join()
+
+        var retryStarted = false
+        var retryCause: Throwable? = null
+        val retry = fence.launch { retryStarted = true }
+        retry.invokeOnCompletion { retryCause = it }
+        try {
+            retry.join()
+            assertFalse(retryStarted)
+            assertIs<PredecessorRunTimeoutException>(retryCause)
+        } finally {
+            releaseFirst.complete(Unit)
+        }
+    }
+
     private fun runTimedTest(block: suspend CoroutineScope.() -> Unit) = runBlocking {
         withTimeout(5_000) { block() }
     }

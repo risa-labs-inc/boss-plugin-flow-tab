@@ -17,7 +17,6 @@ internal class RunInvalidation internal constructor(
 internal enum class RunStateClearResult {
     CLEARED,
     PRESERVED_NEWER,
-    TIMED_OUT,
 }
 
 /** Switch to blocking-I/O capacity without letting run cancellation skip the final save. */
@@ -39,7 +38,6 @@ internal suspend fun persistRunStateOnIo(
  */
 internal class RunStatePersistenceGate(
     private val persistTimeoutMs: Long = DEFAULT_OPERATION_TIMEOUT_MS,
-    private val clearTimeoutMs: Long = DEFAULT_OPERATION_TIMEOUT_MS,
 ) {
     private val generation = AtomicLong(0)
     private val persistenceMutex = Mutex()
@@ -78,18 +76,17 @@ internal class RunStatePersistenceGate(
     ): RunStateClearResult {
         check(invalidation.owner === this) { "Run was invalidated by a different gate" }
         return withContext(NonCancellable) {
-            // As above, this bounds contention and cooperative/suspending host calls.
-            withTimeoutOrNull(clearTimeoutMs) {
-                persistenceMutex.withLock {
-                    // If a newer run already saved while this async clear was queued,
-                    // its snapshot owns the shared key and must not be removed.
-                    if (lastPersistedGeneration > invalidation.generation) {
-                        return@withLock RunStateClearResult.PRESERVED_NEWER
-                    }
-                    clearPersisted()
-                    RunStateClearResult.CLEARED
+            persistenceMutex.withLock {
+                // If a newer run already saved while this async clear was queued,
+                // its snapshot owns the shared key and must not be removed.
+                if (lastPersistedGeneration > invalidation.generation) {
+                    return@withLock RunStateClearResult.PRESERVED_NEWER
                 }
-            } ?: RunStateClearResult.TIMED_OUT
+                // Destructive clear is intentionally unbounded: giving up after a
+                // final save passed its generation check recreates issue #25.
+                clearPersisted()
+                RunStateClearResult.CLEARED
+            }
         }
     }
 

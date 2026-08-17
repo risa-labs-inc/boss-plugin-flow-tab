@@ -114,7 +114,7 @@ class RunStatePersistenceGateTest {
 
     @Test
     fun `persist times out while clear owns the mutex`() = runTimedTest {
-        val gate = RunStatePersistenceGate(persistTimeoutMs = 20, clearTimeoutMs = 1_000)
+        val gate = RunStatePersistenceGate(persistTimeoutMs = 20)
         gate.beginRun()
         val invalidation = gate.invalidateRun()
         val clearEntered = CompletableDeferred<Unit>()

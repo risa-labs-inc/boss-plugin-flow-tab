@@ -424,10 +424,6 @@ class FlowTabComponent(
                         clearPersistedRunState(storage, config.id)
                     }
                     when (result) {
-                        RunStateClearResult.TIMED_OUT -> {
-                            state.notice = "Flow cleared, but saved run-state cleanup timed out"
-                            Snapshot.sendApplyNotifications()
-                        }
                         RunStateClearResult.CLEARED,
                         RunStateClearResult.PRESERVED_NEWER -> Unit
                     }

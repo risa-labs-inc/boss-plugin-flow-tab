@@ -8,6 +8,7 @@ import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.CoroutineContext
 import kotlin.coroutines.EmptyCoroutineContext
 
@@ -22,6 +23,7 @@ internal class RunJobFence(
     private val predecessorTimeoutMs: Long = DEFAULT_PREDECESSOR_TIMEOUT_MS,
 ) {
     private val active = ConcurrentHashMap.newKeySet<Job>()
+    private val predecessorWedged = AtomicBoolean(false)
 
     fun launch(
         context: CoroutineContext = EmptyCoroutineContext,
@@ -29,18 +31,27 @@ internal class RunJobFence(
     ): Job {
         val predecessors = active.filterNot(Job::isCompleted)
         val job = scope.launch(context) {
+            if (predecessors.isNotEmpty() && predecessorWedged.get()) {
+                throw PredecessorRunTimeoutException()
+            }
             // Every incomplete predecessor is snapshotted, so cancelling this queued
             // job is immediate without letting a later run skip an older active one.
             val predecessorsFinished = withTimeoutOrNull(predecessorTimeoutMs) {
                 predecessors.joinAll()
                 true
             } ?: false
-            if (!predecessorsFinished) throw PredecessorRunTimeoutException()
+            if (!predecessorsFinished) {
+                predecessorWedged.set(true)
+                throw PredecessorRunTimeoutException()
+            }
             coroutineContext.ensureActive()
             block()
         }
         active += job
-        job.invokeOnCompletion { active -= job }
+        job.invokeOnCompletion {
+            active -= job
+            if (active.none { !it.isCompleted }) predecessorWedged.set(false)
+        }
         return job
     }
 
