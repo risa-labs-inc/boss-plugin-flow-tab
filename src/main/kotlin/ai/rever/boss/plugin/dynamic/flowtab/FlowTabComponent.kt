@@ -715,9 +715,8 @@ class FlowTabComponent(
                                         controller.renameOpenFlow(config.id, newName, renamedSnapshot)
                                         state.notice = "Renamed flow to '$newName'"
                                     } catch (cancelled: CancellationException) {
-                                        // The controller's durable write is non-cancellable; a
-                                        // surviving/recreated composition replays its published name.
-                                        state.metadata = previousMetadata
+                                        // The durable write finishes before cancellation can
+                                        // propagate, so reverting here would make the live UI stale.
                                         throw cancelled
                                     } catch (failure: Exception) {
                                         state.metadata = previousMetadata

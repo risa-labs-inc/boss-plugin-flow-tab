@@ -140,6 +140,10 @@ matching open tab first. The launcher uses the same controller and storage names
 contracts, lets users rename readable flows, and asks for confirmation before deletion. An open
 flow shows its current name in the canvas toolbar with an edit action; that path persists the live
 snapshot immediately, so even a brand-new tab can be named before its debounced autosave runs.
+The launcher/controller and an open tab are independent full-snapshot writers for the same graph
+key. Sidebar renames therefore read and write storage under `FlowRenameCoordinator`; an in-canvas
+rename instead writes its captured live snapshot under that lock. Open-tab autosave uses the same
+lock and a temporary name guard that clears after convergence.
 
 ### HTTP secrets
 
