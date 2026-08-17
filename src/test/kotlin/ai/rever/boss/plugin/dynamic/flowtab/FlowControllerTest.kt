@@ -108,7 +108,26 @@ class FlowControllerTest {
         }
 
         assertContains(failure.message.orEmpty(), "__invalid_probe_kind__")
-        assertContains(failure.message.orEmpty(), "SET")
+        assertContains(failure.message.orEmpty(), "Valid kinds:")
+        val validKinds = failure.message.orEmpty()
+            .substringAfter("Valid kinds: ")
+            .removeSuffix(".")
+            .split(", ")
+        assertEquals(validKinds.sorted(), validKinds)
+        assertTrue(fc.getFlow(tabId)!!.nodes.isEmpty())
+    }
+
+    @Test
+    fun `addNode is case-sensitive and gives dynamic kinds a synchronization hint`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+
+        assertFailsWith<IllegalArgumentException> { fc.addNode(tabId, "set") }
+        val dynamicFailure = assertFailsWith<IllegalArgumentException> {
+            fc.addNode(tabId, "tool:ext:server/missing")
+        }
+
+        assertContains(dynamicFailure.message.orEmpty(), "may still be synchronizing")
         assertTrue(fc.getFlow(tabId)!!.nodes.isEmpty())
     }
 

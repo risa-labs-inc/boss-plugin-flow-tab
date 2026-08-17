@@ -85,15 +85,25 @@ class FlowController(
      * Append a node of [kind] to flow [tabId] and return its id. The kind's
      * [NodeSpec.defaultConfig] is seeded first (so tool nodes keep their cached
      * ref/schema — F4) and [config] merged over it. Title is de-duplicated so
-     * title-based `{{ }}` refs stay unambiguous (D3). Throws if the flow is absent.
+     * title-based `{{ }}` refs stay unambiguous (D3). Throws if the flow is absent
+     * or [kind] is not currently registered. Dynamic `tool:*` kinds synchronize
+     * asynchronously, so their rejection message tells callers that retrying may help.
      */
     suspend fun addNode(tabId: String, kind: String, config: JsonObject = JsonObject(emptyMap())): String {
         val snap = getFlow(tabId) ?: throw IllegalArgumentException("No flow '$tabId'")
         // Saved graphs still resolve missing kinds to placeholders so they round-trip,
         // but new authoring requests must not create nodes that can never execute.
         val spec = requireNotNull(registry[kind]) {
-            val validKinds = registry.all().map(NodeSpec::id).sorted().joinToString(", ")
-            "Unknown node kind '$kind'. Valid kinds: $validKinds"
+            val registered = registry.all().map(NodeSpec::id).sorted()
+            val shown = registered.take(MAX_KINDS_IN_ERROR)
+            val remainder = registered.size - shown.size
+            val suffix = if (remainder > 0) ", … and $remainder more" else ""
+            val syncHint = if (kind.startsWith("tool:")) {
+                " Dynamic tool kinds may still be synchronizing; retry shortly."
+            } else {
+                ""
+            }
+            "Unknown node kind '$kind'. Valid kinds: ${shown.joinToString(", ")}$suffix.$syncHint"
         }
         val nodeId = "n${snap.nextId}"
         val title = uniqueTitle(spec.label, snap.nodes.map { it.title }.toSet())
@@ -354,6 +364,7 @@ class FlowController(
     private fun runKey(runId: String) = "$RUN_PREFIX$runId"
 
     companion object {
+        private const val MAX_KINDS_IN_ERROR = 30
         const val STORAGE_NAMESPACE = "ai.rever.boss.plugin.dynamic.flowtab"
         const val GRAPH_PREFIX = "graph:"
         const val RUN_PREFIX = "run:"

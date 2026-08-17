@@ -229,7 +229,7 @@ class FlowMcpToolProviderTest {
 
         assertTrue(result.isError)
         assertContains(result.text, "__invalid_probe_kind__")
-        assertContains(result.text, "SET")
+        assertContains(result.text, "Valid kinds:")
         assertTrue(obj(call(p, "flow_get", """{"tabId":"$tabId"}""")).getValue("nodes").jsonArray.isEmpty())
     }
 
