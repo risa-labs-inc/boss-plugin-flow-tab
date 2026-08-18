@@ -225,6 +225,12 @@ and/or merges config keys, and `flow_delete_node` removes the node plus incident
 autosave, so an agent can repair a graph without rebuilding it or having a live canvas overwrite
 the repair. `flow_stop` cancels an in-memory `flow_run`; for compatibility its terminal state is
 `FAILED` with an explicit `Flow run stopped by caller` error, and repeated stops are idempotent.
+A lanager sub-run's lifetime is bound to its node: Canvas Stop, `flow_stop`, or a parent watchdog
+timeout explicitly stops the sub-run, and nested lanagers cascade that stop through their own
+children. The stop publishes `FAILED` and requests cancellation without joining, so child execution
+and session cleanup may briefly overlap a subsequent run; the stop's storage persistence has no
+separate deadline. If stop races with terminal publication, stop may win and leave a `FAILED` child
+record whose already-published node snapshot contains only successful nodes.
 Browser-session cleanup is ownership-aware. Interactive canvas runs leave their last visible tab
 open for inspection and close it when the UI admits the next run. Controller/MCP `flow_run` calls
 have no UI owner, so `FlowExecutor` marks their `SessionRegistry` as owning visible tabs and closes
