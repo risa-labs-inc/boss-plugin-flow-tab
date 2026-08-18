@@ -233,8 +233,10 @@ rank to columns, orders each column from its parents' vertical barycenter and ou
 and spaces variable-height cards without overlap. Cyclic residuals remain drawable in one final
 column even though execution will reject the cycle. Tidy is always explicit—controller/MCP edits
 must not discard hand-tuned positions automatically—and the canvas retains one pre-tidy position
-snapshot for Undo. Controller-created nodes use the same geometry to choose the first
-collision-free authoring slot, so deleting a node cannot make its replacement stack on a survivor.
+snapshot for Undo. Any later drag or topology edit retires that snapshot so Undo cannot discard
+newer manual work. Controller-created nodes use the same geometry and widened standard-slot search
+to choose the first collision-free authoring position, so deleting or moving a node cannot make its
+replacement stack on a survivor or jump prematurely to the far-right fallback.
 
 ### Browser waits and human sign-in
 

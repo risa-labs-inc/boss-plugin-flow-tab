@@ -259,9 +259,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode, displayNumber: Int) {
                         val change = event.changes.firstOrNull { it.id == down.id } ?: break
                         if (!change.pressed) break
                         val delta = change.positionChange()
-                        if (delta != Offset.Zero) {
-                            node.x += delta.x
-                            node.y += delta.y
+                        if (state.moveNodeBy(node.id, delta)) {
                             change.consume()
                         }
                     }
