@@ -1,6 +1,8 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -47,7 +49,13 @@ class LanagerNodeExecutor(
 
         log("lanager → sub-flow '$subId' (depth ${ctx.depth + 1})")
         val runId = controller.startRun(subId, depth = ctx.depth + 1, ancestry = ctx.ancestry)
-        val job = awaitTerminal(runId)
+        val job = try {
+            awaitTerminal(runId)
+        } finally {
+            // startRun launches on the controller scope, not as a child of this node.
+            // Explicitly stop an active sub-run when the parent is cancelled or times out.
+            withContext(NonCancellable) { controller.stopRun(runId) }
+        }
 
         if (job.state == RunJobState.FAILED) {
             throw ExecError("lanager sub-flow '$subId' failed: ${job.error ?: "unknown error"}")

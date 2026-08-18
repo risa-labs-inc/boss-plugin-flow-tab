@@ -6,9 +6,11 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.PluginStorageFactory
 import ai.rever.boss.plugin.api.PluginStorageProvider
 import ai.rever.boss.plugin.api.TabRegistry
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -41,8 +43,12 @@ class LanagerNodeTest {
     }
 
     /** A controller whose registry also knows the `lanager` kind (executor holds it). */
-    private fun controllerWithLanager(maxDepth: Int = 3): FlowController {
-        val fc = FlowController(context(TestStorage()), { scope })
+    private fun controllerWithLanager(
+        maxDepth: Int = 3,
+        storage: PluginStorageProvider = TestStorage(),
+        registry: NodeRegistry = builtinNodeRegistry(),
+    ): FlowController {
+        val fc = FlowController(context(storage), { scope }, registry)
         fc.registry.register(lanagerNodeSpec(fc, maxDepth = maxDepth))
         return fc
     }
@@ -75,6 +81,58 @@ class LanagerNodeTest {
         assertEquals(RunStatus.SUCCESS, lanagerOut.status)
         // The lanager node reports the sub-run it launched.
         assertEquals(child, lanagerOut.output.single()["subFlow"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `stopping a parent run also stops its active sub-flow`() = runBlocking {
+        val storage = TestStorage()
+        val childEntered = CompletableDeferred<Unit>()
+        val childCancelled = CompletableDeferred<Unit>()
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "BLOCK",
+                    label = "Block",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, _, _ ->
+                        childEntered.complete(Unit)
+                        try {
+                            awaitCancellation()
+                        } finally {
+                            childCancelled.complete(Unit)
+                        }
+                    },
+                ),
+            )
+        }
+        val fc = controllerWithLanager(storage = storage, registry = registry)
+
+        val child = fc.createFlow(FlowMeta(name = "child"))
+        fc.addNode(child, "BLOCK", JsonObject(emptyMap()))
+
+        val parent = fc.createFlow(FlowMeta(name = "parent"))
+        val pt = fc.addNode(parent, "TRIGGER", JsonObject(emptyMap()))
+        val pl = fc.addNode(parent, "lanager", buildJsonObject { put(LanagerNode.FLOW_ID_KEY, child) })
+        fc.connect(parent, pt, 0, pl, 0)
+
+        val parentRunId = fc.startRun(parent)
+        withTimeout(5_000) { childEntered.await() }
+        val childRunId = storage.map.keys
+            .single { it.startsWith(FlowController.RUN_PREFIX) && it != "${FlowController.RUN_PREFIX}$parentRunId" }
+            .removePrefix(FlowController.RUN_PREFIX)
+
+        fc.stopRun(parentRunId)
+
+        withTimeout(5_000) { childCancelled.await() }
+        val parentJob = awaitTerminal(fc, parentRunId)
+        val childJob = awaitTerminal(fc, childRunId)
+        assertEquals(RunJobState.FAILED, parentJob.state)
+        assertEquals(RunJobState.FAILED, childJob.state)
+        assertTrue(childJob.error!!.contains("stopped by caller", ignoreCase = true))
     }
 
     @Test
