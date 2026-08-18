@@ -10,13 +10,10 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.RegisteredMcpTool
 import ai.rever.boss.plugin.api.TabRegistry
 import androidx.compose.ui.geometry.Offset
-import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -31,8 +28,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -199,7 +196,7 @@ class ToolNodeTest {
         val fake = FakeRegistry(listOf(tool("a", "{}"), tool("b", "{}"))) { _, _ -> McpToolResult("", false) }
         val src = BossRegistryToolSource(fake)
         val reg = builtinNodeRegistry()
-        val sync = ToolNodeSync(src, reg)
+        val sync = ToolNodeSync(src, reg, sourceLabel = "host")
         runBlocking {
             sync.apply(src.list())
             assertNotNull(reg["tool:boss:a"])
@@ -214,61 +211,52 @@ class ToolNodeTest {
     }
 
     @Test
-    fun `sync prepares every spec before mutating registry state`() {
+    fun `sync preserves a failed descriptor while applying healthy peers`() {
         val fake = FakeRegistry(emptyList()) { _, _ -> McpToolResult("", false) }
         val source = BossRegistryToolSource(fake)
         val registry = builtinNodeRegistry()
-        var rejectBad = false
-        val sync = ToolNodeSync(source, registry) { descriptor ->
-            if (rejectBad && descriptor.name == "bad") error("bad spec")
-            toolNodeSpec(descriptor, source)
-        }
-        fun descriptor(name: String) = ToolDescriptor(ToolRef(ToolScope.BOSS, name), name, "", "{}")
+        val diagnostics = mutableListOf<String>()
+        val sync = ToolNodeSync(source, registry, "host", diagnostics::add)
+        fun descriptor(ref: String, label: String = ref) =
+            ToolDescriptor(ToolRef(ToolScope.BOSS, ref), label, "", "{}")
 
-        sync.apply(listOf(descriptor("before")))
-        rejectBad = true
-        assertFailsWith<IllegalStateException> {
-            sync.apply(listOf(descriptor("partially-built"), descriptor("bad")))
-        }
+        sync.apply(listOf(descriptor("flaky"), descriptor("removed")))
+        sync.apply(listOf(descriptor("flaky", label = ""), descriptor("healthy")))
 
-        assertNotNull(registry["tool:boss:before"], "failed preparation must preserve the previous registry")
-        assertNull(registry["tool:boss:partially-built"], "prepared specs must not register before all succeed")
-        assertNull(registry["tool:boss:bad"])
+        assertEquals("flaky", registry["tool:boss:flaky"]?.label, "failed updates keep the last good spec")
+        assertNotNull(registry["tool:boss:healthy"], "healthy peers in the same update must still register")
+        assertNull(registry["tool:boss:removed"], "absent healthy descriptors must still unregister")
+        assertEquals(1, diagnostics.size)
+        assertContains(diagnostics.single(), "tool:boss:flaky")
 
-        rejectBad = false
-        sync.apply(listOf(descriptor("after")))
-        assertNull(registry["tool:boss:before"], "the next successful diff must use the previous current set")
-        assertNotNull(registry["tool:boss:after"])
+        sync.apply(listOf(descriptor("flaky", label = ""), descriptor("healthy")))
+        assertEquals(1, diagnostics.size, "an unchanged malformed descriptor must not spam every emission")
+
+        sync.apply(listOf(descriptor("flaky"), descriptor("healthy")))
+        sync.apply(listOf(descriptor("flaky", label = ""), descriptor("healthy")))
+        assertEquals(2, diagnostics.size, "a failure recurring after recovery must be reported again")
     }
 
     @Test
-    fun `sync tracks desired ids before a registration failure`() {
+    fun `sync retains the complete registry when every spec is malformed`() {
         val fake = FakeRegistry(emptyList()) { _, _ -> McpToolResult("", false) }
         val source = BossRegistryToolSource(fake)
         val registry = builtinNodeRegistry()
-        var rejectBad = false
-        val sync = ToolNodeSync(
-            source = source,
-            registry = registry,
-            registerSpec = { spec ->
-                if (rejectBad && spec.id == "tool:boss:bad") error("registry rejected spec")
-                registry.register(spec)
-            },
-        )
-        fun descriptor(name: String) = ToolDescriptor(ToolRef(ToolScope.BOSS, name), name, "", "{}")
+        val diagnostics = mutableListOf<String>()
+        val sync = ToolNodeSync(source, registry, "external MCP", diagnostics::add)
+        fun descriptor(ref: String, label: String = ref) =
+            ToolDescriptor(ToolRef(ToolScope.EXT, ref), label, "", "{}")
 
-        sync.apply(listOf(descriptor("before")))
-        rejectBad = true
-        assertFailsWith<IllegalStateException> {
-            sync.apply(listOf(descriptor("partial"), descriptor("bad")))
-        }
-        assertNotNull(registry["tool:boss:partial"], "the failure must occur after a partial registration")
+        sync.apply(listOf(descriptor("last-good")))
+        sync.apply(listOf(descriptor("bad\nid", label = "")))
 
-        rejectBad = false
-        sync.apply(listOf(descriptor("after")))
-        assertNull(registry["tool:boss:partial"], "the next diff must remove a partially registered id")
-        assertNull(registry["tool:boss:bad"])
-        assertNotNull(registry["tool:boss:after"])
+        assertNotNull(registry["tool:ext:last-good"], "an all-failed transient update keeps all last-good specs")
+        assertEquals(1, diagnostics.size)
+        assertContains(diagnostics.single(), "external MCP tool 'tool:ext:bad id'")
+        assertFalse('\n' in diagnostics.single())
+
+        sync.apply(emptyList())
+        assertNull(registry["tool:ext:last-good"], "a valid empty update still removes vanished tools")
     }
 
     @Test
@@ -278,94 +266,38 @@ class ToolNodeTest {
     }
 
     @Test
-    fun `boss tool collector skips one malformed descriptor and applies healthy peers`() = runBlocking {
+    fun `boss tool collector applies live host updates`() = runBlocking {
         val updates = MutableSharedFlow<List<RegisteredMcpTool>>()
-        val failures = mutableListOf<Exception>()
-        val applied = CompletableDeferred<List<ToolDescriptor>>()
+        val fake = FakeRegistry(emptyList()) { _, _ -> McpToolResult("", false) }
+        val registry = builtinNodeRegistry()
+        val sync = ToolNodeSync(BossRegistryToolSource(fake), registry, sourceLabel = "host")
         val job = launch(start = CoroutineStart.UNDISPATCHED) {
-            collectBossToolUpdates(
-                updates = updates,
-                apply = { applied.complete(it) },
-                convert = { registered ->
-                    if (registered.definition.name == "broken") error("bad descriptor")
-                    registered.toDescriptor()
-                },
-                reportFailure = failures::add,
-            )
+            collectBossToolUpdates(updates, sync)
         }
 
         try {
-            updates.emit(listOf(tool("broken", "{}"), tool("healthy", "{}")))
+            updates.emit(listOf(tool("healthy", "{}")))
 
-            assertEquals("healthy", withTimeout(2_000) { applied.await() }.single().name)
-            assertEquals(listOf("bad descriptor"), failures.map { it.message })
-            assertTrue(job.isActive, "one rejected update must not terminate the collector")
+            withTimeout(2_000) {
+                while (registry["tool:boss:healthy"] == null) kotlinx.coroutines.yield()
+            }
+            assertTrue(job.isActive)
         } finally {
             job.cancelAndJoin()
         }
-    }
-
-    @Test
-    fun `boss tool collector reports a stable malformed descriptor once until recovery`() = runBlocking {
-        val updates = MutableSharedFlow<List<RegisteredMcpTool>>()
-        val failures = mutableListOf<Exception>()
-        val applied = Channel<Unit>(Channel.UNLIMITED)
-        val job = launch(start = CoroutineStart.UNDISPATCHED) {
-            collectBossToolUpdates(
-                updates = updates,
-                apply = { applied.trySend(Unit).getOrThrow() },
-                convert = { error("stable malformed descriptor") },
-                reportFailure = failures::add,
-            )
-        }
-
-        try {
-            updates.emit(listOf(tool("broken", "{}")))
-            withTimeout(2_000) { applied.receive() }
-            updates.emit(listOf(tool("broken", "{}")))
-            withTimeout(2_000) { applied.receive() }
-            assertEquals(1, failures.size, "an unchanged malformed descriptor must not spam every emission")
-
-            updates.emit(emptyList())
-            withTimeout(2_000) { applied.receive() }
-            updates.emit(listOf(tool("broken", "{}")))
-            withTimeout(2_000) { applied.receive() }
-            assertEquals(2, failures.size, "the diagnostic must return if the failure recurs after recovery")
-        } finally {
-            job.cancelAndJoin()
-        }
-    }
-
-    @Test
-    fun `boss tool descriptor conversion preserves cancellation`() = runBlocking {
-        val updates = MutableSharedFlow<List<RegisteredMcpTool>>()
-        val failures = mutableListOf<Exception>()
-        var applied = false
-        val job = launch(start = CoroutineStart.UNDISPATCHED) {
-            collectBossToolUpdates(
-                updates = updates,
-                apply = { applied = true },
-                convert = { throw CancellationException("cancel conversion") },
-                reportFailure = failures::add,
-            )
-        }
-
-        updates.emit(listOf(tool("cancelled", "{}")))
-        withTimeout(2_000) { job.join() }
-
-        assertTrue(job.isCancelled, "conversion cancellation must terminate the collector")
-        assertFalse(applied, "a cancelled batch must not reach registry application")
-        assertTrue(failures.isEmpty(), "cancellation must not be logged as a malformed tool")
     }
 
     @Test
     fun `tool sync failure messages are single line and bounded`() {
         val bounded = toolSyncFailureMessage(IllegalStateException("x".repeat(250) + "\nsecret"))
         val sanitized = toolSyncFailureMessage(IllegalStateException("a\nb\rc\u0000d\u0085e\u2028f\u2029g"))
+        val identifier = toolSyncIdentifier("tool:boss:a\nb" + "x".repeat(200))
 
         assertEquals(MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH, bounded.length)
         assertFalse("secret" in bounded)
         assertEquals("a b c d e f g", sanitized)
         assertTrue(sanitized.none(Char::isISOControl))
+        assertEquals(MAX_TOOL_SYNC_IDENTIFIER_LENGTH, identifier.length)
+        assertFalse('\n' in identifier)
     }
 }

@@ -790,6 +790,7 @@ class FlowControllerTest {
         val storage = DesktopStorage()
         val dispatchEntered = CountDownLatch(1)
         val releaseDispatch = CountDownLatch(1)
+        val disposeStarted = CountDownLatch(1)
         val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
         val registry = builtinNodeRegistry().also {
             it.register(
@@ -825,10 +826,11 @@ class FlowControllerTest {
         }
 
         assertTrue(dispatchEntered.await(5, TimeUnit.SECONDS), "start must reach the locked dispatch seam")
-        val disposeThread = thread(name = "flow-dispose-race") { fc.dispose() }
-        withTimeout(5_000) {
-            while (disposeThread.state != Thread.State.BLOCKED) yield()
+        val disposeThread = thread(name = "flow-dispose-race") {
+            disposeStarted.countDown()
+            fc.dispose()
         }
+        assertTrue(disposeStarted.await(5, TimeUnit.SECONDS), "dispose must start before dispatch is released")
         releaseDispatch.countDown()
         startThread.join(5_000)
         disposeThread.join(5_000)

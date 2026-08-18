@@ -65,7 +65,8 @@ data class FlowSummary(
 class FlowController(
     private val context: PluginContext,
     /** Resolve the scope at dispatch time. A sandbox watchdog restart replaces
-     * [PluginContext.pluginScope], while the UI supplies its stable tab scope. */
+     * [PluginContext.pluginScope], while the UI supplies its stable tab scope. This
+     * callback runs under the lifecycle lock and must remain cheap and non-blocking. */
     private val scopeProvider: () -> CoroutineScope = { context.pluginScope },
     /** Kind-id → spec map used to lay out new nodes and dispatch runs. Threading the
      *  same instance the tab uses keeps tool/agent kinds resolvable. */
@@ -418,9 +419,9 @@ class FlowController(
                 launchRun(runId, tabId, depth, ancestry)
             }
         }
-        // A rejected start has no live controller scope left to persist it. Write the
-        // terminal result before returning so flow_status remains durable after reload.
-        rejected?.let { runBlocking { persistRun(it) } }
+        // A rejected start has no live controller scope left to persist it. Attempt a
+        // bounded terminal write before returning so flow_status remains durable normally.
+        rejected?.let { persistRunsBlocking(listOf(it)) }
         return runId
     }
 
@@ -547,7 +548,7 @@ class FlowController(
         }
         // Cancellation can prevent an execution body or watchdog from ever starting.
         // Persist the terminal transitions directly instead of relying on either child.
-        runBlocking { failedRuns.forEach { persistRun(it) } }
+        persistRunsBlocking(failedRuns)
     }
 
     private fun publishTerminalIfRunning(runId: String, candidate: RunJob): RunJob =
@@ -575,11 +576,40 @@ class FlowController(
     private suspend fun persistRun(job: RunJob) {
         withContext(NonCancellable) {
             persistMutex.withLock {
-                runCatching {
-                    // Always serialize the newest in-memory snapshot. Coroutine
-                    // scheduling may otherwise let an older live write run last.
-                    val safeJob = jobs[job.runId] ?: job
-                    storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), safeJob))
+                // Normal run persistence preserves the historical best-effort contract:
+                // a provider-origin exception, including CancellationException, must not
+                // abort execution while this write is intentionally NonCancellable.
+                runCatching { writeRun(job) }
+            }
+        }
+    }
+
+    private suspend fun persistRunCancellable(job: RunJob) {
+        persistMutex.withLock {
+            try {
+                writeRun(job)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Run status remains available in memory when best-effort storage fails.
+            }
+        }
+    }
+
+    private suspend fun writeRun(job: RunJob) {
+        // Always serialize the newest in-memory snapshot. Coroutine scheduling may
+        // otherwise let an older live write run last.
+        val safeJob = jobs[job.runId] ?: job
+        storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), safeJob))
+    }
+
+    /** Best-effort durability for synchronous disposal paths; never block teardown forever. */
+    private fun persistRunsBlocking(runs: List<RunJob>) {
+        if (runs.isEmpty()) return
+        runCatching {
+            runBlocking {
+                withTimeoutOrNull(DISPOSE_PERSIST_TIMEOUT_MS) {
+                    runs.forEach { persistRunCancellable(it) }
                 }
             }
         }
@@ -718,6 +748,7 @@ class FlowController(
         const val RUN_PREFIX = "run:"
         const val DEFAULT_RUN_TIMEOUT_MS = 15 * 60 * 1000L
         const val CONTROLLER_DISPOSED_ERROR = "Flow controller disposed"
+        const val DISPOSE_PERSIST_TIMEOUT_MS = 5_000L
     }
 }
 

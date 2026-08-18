@@ -120,45 +120,123 @@ class ToolNodeExecutor(
  * into [NodeSpec.defaultConfig] so a spawned node keeps them for the absent-tool
  * case (F4).
  */
-fun toolNodeSpec(desc: ToolDescriptor, source: ToolSource): NodeSpec = NodeSpec(
-    id = desc.ref.kindId,
-    label = desc.name,
-    inputs = 1,
-    outputs = 1,
-    accent = ToolNode.ACCENT,
-    description = desc.description.ifBlank { "Tool: ${desc.name}" },
-    runMode = RunMode.PER_ITEM,
-    configFields = JsonSchemaToConfig.convert(desc.inputSchema),
-    executor = ToolNodeExecutor(source, desc.ref, desc.inputSchema),
-    defaultConfig = buildJsonObject {
-        put(ToolNode.REF_KEY, desc.ref.kindId)
-        put(ToolNode.SCHEMA_KEY, desc.inputSchema)
-    },
-)
+fun toolNodeSpec(desc: ToolDescriptor, source: ToolSource): NodeSpec {
+    require(desc.ref.name.isNotBlank()) { "Tool reference name must not be blank" }
+    require(desc.name.isNotBlank()) { "Tool display name must not be blank" }
+    return NodeSpec(
+        id = desc.ref.kindId,
+        label = desc.name,
+        inputs = 1,
+        outputs = 1,
+        accent = ToolNode.ACCENT,
+        description = desc.description.ifBlank { "Tool: ${desc.name}" },
+        runMode = RunMode.PER_ITEM,
+        configFields = JsonSchemaToConfig.convert(desc.inputSchema),
+        executor = ToolNodeExecutor(source, desc.ref, desc.inputSchema),
+        defaultConfig = buildJsonObject {
+            put(ToolNode.REF_KEY, desc.ref.kindId)
+            put(ToolNode.SCHEMA_KEY, desc.inputSchema)
+        },
+    )
+}
 
 /**
  * Keeps a [NodeRegistry]'s tool specs in sync with a [ToolSource]: registers a spec
  * per descriptor and unregisters ones that have disappeared, leaving built-ins and
  * other kinds untouched. Not thread-safe by itself; drive it from one scope.
  */
-class ToolNodeSync(
+internal class ToolNodeSync(
     private val source: ToolSource,
     private val registry: NodeRegistry,
-    private val registerSpec: (NodeSpec) -> Unit = registry::register,
-    private val buildSpec: (ToolDescriptor) -> NodeSpec = { toolNodeSpec(it, source) },
+    private val sourceLabel: String,
+    private val reportFailure: (String) -> Unit = ::println,
 ) {
+    private data class Failure(val toolId: String, val exception: Exception)
+
     private var current: Set<String> = emptySet()
+    private var previousFailureKeys: Set<String> = emptySet()
 
     fun apply(descriptors: List<ToolDescriptor>) {
-        // Prepare every spec before mutating the registry. If one descriptor is bad,
-        // current and the registry stay aligned for the next update.
-        val specs = descriptors.map(buildSpec)
-        val next = specs.map { it.id }.toSet()
-        (current - next).forEach { registry.unregister(it) }
-        // Record the desired set before registration. If a custom/host registry throws
-        // part-way through, the next emission can still remove every partially added id.
+        apply(descriptors, emptyList())
+    }
+
+    fun applyRegistered(tools: List<RegisteredMcpTool>) {
+        val failures = mutableListOf<Failure>()
+        val descriptors = tools.mapIndexedNotNull { index, tool ->
+            val toolId = try {
+                ToolRef(ToolScope.BOSS, tool.definition.name).kindId
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                failures += Failure("tool:boss:<unreadable-$index>", failure)
+                return@mapIndexedNotNull null
+            }
+            try {
+                tool.toDescriptor()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                failures += Failure(toolId, failure)
+                null
+            }
+        }
+        apply(descriptors, failures)
+    }
+
+    private fun apply(descriptors: List<ToolDescriptor>, upstreamFailures: List<Failure>) {
+        val failures = upstreamFailures.toMutableList()
+        val built = descriptors.mapNotNull { descriptor ->
+            try {
+                descriptor to toolNodeSpec(descriptor, source)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                failures += Failure(descriptor.ref.kindId, failure)
+                null
+            }
+        }
+        val specs = built.mapNotNull { (descriptor, spec) ->
+            try {
+                registry.register(spec)
+                spec
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                // NodeRegistry is a non-throwing synchronized map today. Keep the state
+                // transition correct if registration later gains validation or delegation.
+                failures += Failure(descriptor.ref.kindId, failure)
+                null
+            }
+        }
+        reportNewFailures(failures)
+
+        // If the entire non-empty update is malformed, treat it as transient and retain
+        // the complete last-known-good registry. With partial success, preserve only the
+        // previous entries whose incoming descriptors failed while applying healthy peers.
+        if (specs.isEmpty() && failures.isNotEmpty()) return
+        val failedIds = failures.mapTo(mutableSetOf()) { it.toolId }
+        val next = specs.mapTo(mutableSetOf()) { it.id }.apply {
+            addAll(current.intersect(failedIds))
+        }
+        (current - next).forEach(registry::unregister)
         current = next
-        specs.forEach(registerSpec)
+    }
+
+    private fun reportNewFailures(failures: List<Failure>) {
+        val keyed = failures.associateBy { failure ->
+            val id = toolSyncIdentifier(failure.toolId)
+            "$id:${failure.exception.javaClass.name}:${toolSyncFailureMessage(failure.exception)}"
+        }
+        keyed
+            .filterKeys { it !in previousFailureKeys }
+            .values
+            .forEach { failure ->
+                reportFailure(
+                    "[flow-tab] failed to synchronize $sourceLabel tool " +
+                        "'${toolSyncIdentifier(failure.toolId)}': ${toolSyncFailureMessage(failure.exception)}",
+                )
+            }
+        previousFailureKeys = keyed.keys.toSet()
     }
 }
 
@@ -171,56 +249,33 @@ class ToolNodeSync(
 fun syncBossTools(context: PluginContext, registry: NodeRegistry, scope: CoroutineScope): Job? {
     val reg = context.mcpToolRegistry ?: return null
     val source = BossRegistryToolSource(reg)
-    val sync = ToolNodeSync(source, registry)
+    val sync = ToolNodeSync(source, registry, sourceLabel = "host")
     return scope.launch {
-        collectBossToolUpdates(reg.tools, sync::apply)
+        collectBossToolUpdates(reg.tools, sync)
     }
 }
 
 /** Keep a bad host-tool update from permanently terminating the live registry collector. */
 internal suspend fun collectBossToolUpdates(
     updates: Flow<List<RegisteredMcpTool>>,
-    apply: (List<ToolDescriptor>) -> Unit,
-    convert: (RegisteredMcpTool) -> ToolDescriptor = { it.toDescriptor() },
-    reportFailure: (Exception) -> Unit = { failure ->
-        println("[flow-tab] failed to synchronize host tools: ${toolSyncFailureMessage(failure)}")
-    },
+    sync: ToolNodeSync,
 ) {
-    var previousDescriptorFailures: Set<String> = emptySet()
-    updates.collect { tools ->
-        val descriptorFailures = linkedMapOf<String, Exception>()
-        val descriptors = tools.mapNotNull { tool ->
-            try {
-                convert(tool)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (failure: Exception) {
-                val key = "${failure::class.qualifiedName}:${toolSyncFailureMessage(failure)}"
-                descriptorFailures.putIfAbsent(key, failure)
-                null
-            }
-        }
-        descriptorFailures
-            .filterKeys { it !in previousDescriptorFailures }
-            .values
-            .forEach(reportFailure)
-        previousDescriptorFailures = descriptorFailures.keys
-        try {
-            apply(descriptors)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Exception) {
-            reportFailure(failure)
-        }
-    }
+    updates.collect(sync::applyRegistered)
 }
 
 internal const val MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH = 200
+internal const val MAX_TOOL_SYNC_IDENTIFIER_LENGTH = 100
 
-internal fun toolSyncFailureMessage(failure: Exception): String =
-    (failure.message ?: "unknown error")
+internal fun toolSyncIdentifier(identifier: String): String =
+    sanitizeToolSyncText(identifier, MAX_TOOL_SYNC_IDENTIFIER_LENGTH)
+
+internal fun toolSyncFailureMessage(failure: Throwable): String =
+    sanitizeToolSyncText(failure.message ?: "unknown error", MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH)
+
+private fun sanitizeToolSyncText(value: String, maxLength: Int): String =
+    value
+        .take(maxLength)
         .map { char ->
             if (char.isISOControl() || char == '\u2028' || char == '\u2029') ' ' else char
         }
         .joinToString("")
-        .take(MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH)

@@ -41,7 +41,9 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         // dispose(). Reap the old controller-owned collector before losing its reference.
         // This does not claim full re-registration teardown: the previous external MCP
         // manager and already-open tabs have a separate shared lifetime handled elsewhere.
-        headlessController?.dispose()
+        runCatching { headlessController?.dispose() }.onFailure {
+            println("[flow-tab] failed to dispose replaced controller: ${toolSyncFailureMessage(it)}")
+        }
         headlessController = null
         pluginContext = context
 
@@ -96,7 +98,9 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         pluginContext?.tabRegistry?.unregisterTabType(FlowTabType.typeId)
         pluginContext?.panelRegistry?.unregisterPanel(FlowLauncherInfo.id)
         runCatching { pluginContext?.unregisterMcpToolProvider(FlowMcpToolProvider.PROVIDER_ID) }
-        headlessController?.dispose()
+        runCatching { headlessController?.dispose() }.onFailure {
+            println("[flow-tab] failed to dispose headless controller: ${toolSyncFailureMessage(it)}")
+        }
         headlessController = null
         // Reap any external MCP child processes / sockets (red-team F9), bounded so a
         // hung server can't block plugin teardown.
