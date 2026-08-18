@@ -331,6 +331,80 @@ class FlowExecutorTest {
     }
 
     @Test
+    fun `inject waits for its optional target before running`() {
+        var polls = 0
+        val handle = FakeHandle(responder = { script ->
+            when {
+                script.contains("return !!") -> ++polls >= 2
+                script == "window.didRun=true" -> null
+                else -> true
+            }
+        })
+        val states = runGraph(
+            listOf(
+                n("open", NodeType.OPEN_BROWSER),
+                n(
+                    "inject",
+                    NodeType.INJECT,
+                    "waitForType" to "css",
+                    "waitFor" to ".ready",
+                    "waitMs" to "1000",
+                    "script" to "window.didRun=true",
+                ),
+            ),
+            listOf(e("open", "inject")),
+            FakeService(handle),
+        )
+
+        assertEquals(RunStatus.SUCCESS, states["inject"]?.status)
+        assertEquals(2, polls)
+        assertTrue(states["inject"]!!.logs.any { "Waited for '.ready'" in it })
+        assertEquals("window.didRun=true", handle.jsCalls.last())
+    }
+
+    @Test
+    fun `inject fails itself when its wait target never appears`() {
+        val handle = FakeHandle(responder = { false })
+        val states = runGraph(
+            listOf(
+                n("open", NodeType.OPEN_BROWSER),
+                n(
+                    "inject",
+                    NodeType.INJECT,
+                    "waitFor" to "#missing",
+                    "waitMs" to "0",
+                    "script" to "window.didRun=true",
+                ),
+            ),
+            listOf(e("open", "inject")),
+            FakeService(handle),
+        )
+
+        assertEquals(RunStatus.ERROR, states["inject"]?.status)
+        assertEquals("Inject: no element matched '#missing' within 0ms", states["inject"]?.error)
+        assertFalse(handle.jsCalls.contains("window.didRun=true"))
+    }
+
+    @Test
+    fun `inject treats exact false as failure but keeps null backward compatible`() {
+        val failed = runGraph(
+            listOf(n("open", NodeType.OPEN_BROWSER), n("inject", NodeType.INJECT, "script" to "false")),
+            listOf(e("open", "inject")),
+            FakeService(FakeHandle(responder = { false })),
+        )
+        val succeeded = runGraph(
+            listOf(n("open", NodeType.OPEN_BROWSER), n("inject", NodeType.INJECT, "script" to "void 0")),
+            listOf(e("open", "inject")),
+            FakeService(FakeHandle(responder = { null })),
+        )
+
+        assertEquals(RunStatus.ERROR, failed["inject"]?.status)
+        assertEquals("Inject script returned false", failed["inject"]?.error)
+        assertEquals(RunStatus.SUCCESS, succeeded["inject"]?.status)
+        assertEquals(listOf("Ran injected script"), succeeded["inject"]?.logs)
+    }
+
+    @Test
     fun `session fence serializes parallel browser nodes`() {
         // Two Clicks both depend only on Open Browser, so they are ready together;
         // the session mutex must keep them from overlapping (max concurrency 1).

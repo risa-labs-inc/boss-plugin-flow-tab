@@ -172,6 +172,14 @@ credentials, request bodies, or assignment payloads. Metadata chips may identify
 fixed, dynamic, or secret without rendering the value itself. Card dimensions remain centralized
 in `FlowModel.kt` so rendering, edges, hit-testing, imports, and fit-to-content stay aligned.
 
+### Inject execution contract
+
+Inject optionally waits for `waitFor` using `waitForType` and `waitMs` before executing its raw
+JavaScript. A missing wait target fails Inject directly. An exact JavaScript boolean `false` also
+fails the node; `null`/undefined and all other return values remain successful for backward
+compatibility. Recorder-imported Select actions seed the known selector as their wait target and
+return an explicit boolean from their generated script.
+
 ## Version Management
 
 **`build.gradle.kts` is the single source of truth for version.**

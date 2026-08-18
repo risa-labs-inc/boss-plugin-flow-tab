@@ -100,7 +100,11 @@ object RpaRecorderImport {
                 buildJsonObject { put("selectorType", selType); put("selector", selVal); put("text", v) })
             "select" -> ImportStep(
                 NodeType.INJECT.name, a.name.ifBlank { "Select option" },
-                buildJsonObject { put("script", selectJs(selType, selVal, v)) })
+                buildJsonObject {
+                    put("waitForType", selType)
+                    put("waitFor", selVal)
+                    put("script", selectJs(selType, selVal, v))
+                })
             "scroll" -> ImportStep(
                 NodeType.INJECT.name, a.name.ifBlank { "Scroll" },
                 buildJsonObject { put("script", scrollJs(v)) })
@@ -124,11 +128,12 @@ object RpaRecorderImport {
         }
     }
 
-    private fun jsStr(s: String): String = "'" + s.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    private fun jsStr(s: String): String = "'${BrowserScripts.escapeSingleQuotedContent(s)}'"
 
     private fun selectJs(selType: String, selVal: String, value: String): String =
         "(function(){var el=${BrowserScripts.elementExpr(selType, selVal)}; " +
-            "if(el){el.value=${jsStr(value)}; el.dispatchEvent(new Event('change',{bubbles:true}));}})()"
+            "if(!el)return false; el.value=${jsStr(value)}; " +
+            "el.dispatchEvent(new Event('change',{bubbles:true})); return true;})()"
 
     private fun scrollJs(value: String): String {
         val parts = value.split(",").mapNotNull { it.trim().toIntOrNull() }
