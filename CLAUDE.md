@@ -58,11 +58,14 @@ default that used to live on `AnthropicProvider`.
 `maxTokens` is still overridden per request (4096, not the provider's chat-completion default of
 2000) because a bounded tool-use loop needs the headroom. A run is bounded by `AgentBudget`.
 `timeoutMs` is a hard node deadline, not merely a check between agent steps. `AgentRuntime` owns
-its loop on an independent scope so a non-cooperative provider or tool boundary cannot prevent the
-caller from publishing TIMEOUT. The scope is cancelled best-effort and stops accepting log writes
-at the deadline, so late completion cannot mutate the already-published node state. An agent
-TIMEOUT is converted to `ExecError` by `AgentNodeExecutor`; it must be a red node failure rather
-than a successful output carrying `stopReason: TIMEOUT`.
+its loop on an independent, concurrency-limited IO lane so a non-cooperative provider or tool
+boundary cannot prevent the caller from publishing TIMEOUT or exhaust the host's shared IO pool.
+The scope is cancelled best-effort, no new host work starts after the deadline, progress counters
+are snapshotted for the timeout diagnostic, and a serialized log gate closes before return so late
+completion cannot mutate the already-published node state. An agent TIMEOUT is converted to
+`ExecError` by `AgentNodeExecutor`; it must be a red node failure rather than a successful output
+carrying `stopReason: TIMEOUT`. `MAX_STEPS` and `TOKEN_BUDGET` remain successful bounded results
+because they may carry a usable partial answer.
 
 `plugin.json` declares `ai.rever.boss.plugin.dynamic.aigateway` as an **optional** dependency.
 Declaring it makes the host's one existing check work - `DynamicPluginManager.checkCanUnload`

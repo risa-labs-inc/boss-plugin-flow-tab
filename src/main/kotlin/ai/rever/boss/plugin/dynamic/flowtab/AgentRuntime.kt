@@ -8,7 +8,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * One tool the model asked to run this turn. [id] correlates the call with its result
@@ -98,39 +98,83 @@ class AgentRuntime(
     private val source: ToolSource,
     private val budget: AgentBudget = AgentBudget(),
 ) {
+    private data class Progress(
+        val lastText: String = "",
+        val steps: Int = 0,
+        val toolCalls: Int = 0,
+        val usage: TokenUsage = TokenUsage(),
+    )
+
+    /** Serializes the worker's writes with closing the gate at the timeout boundary. */
+    private class LogGate(private val sink: (String) -> Unit) {
+        private val lock = Any()
+        private var accepting = true
+
+        fun write(message: String) = synchronized(lock) {
+            if (accepting) sink(message)
+        }
+
+        fun close() = synchronized(lock) {
+            accepting = false
+        }
+    }
+
+    /**
+     * [log] is invoked from the bounded agent execution lane. Calls are serialized, and
+     * the gate is closed before [run] returns so a late host response cannot write afterward.
+     */
     suspend fun run(
         system: String,
         input: String,
         allowlist: Set<String>,
         log: (String) -> Unit = {},
     ): AgentResult {
+        val timeoutMs = budget.timeoutMs.coerceAtLeast(0)
+        if (timeoutMs == 0L) {
+            return done("", StopReason.TIMEOUT, steps = 0, toolCalls = 0, usage = TokenUsage())
+        }
+
         // Provider and tool integrations are host/plugin boundaries and may block without
         // cooperating with coroutine cancellation. Keep their loop in an independently
         // owned scope so the caller can publish TIMEOUT at the configured wall-clock
         // deadline instead of waiting for a late host call to return. Cancellation remains
         // best-effort; a late result has no path back to the already-returned AgentResult.
-        val executionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        val acceptingLogs = AtomicBoolean(true)
+        val executionScope = CoroutineScope(SupervisorJob() + agentExecutionDispatcher)
+        val progress = AtomicReference(Progress())
+        val failure = AtomicReference<Throwable?>(null)
+        val logGate = LogGate(log)
         val execution = executionScope.async {
-            runLoop(system, input, allowlist) { message ->
-                if (acceptingLogs.get()) log(message)
-            }
+            runLoop(system, input, allowlist, progress, logGate::write)
         }
-        execution.invokeOnCompletion { executionScope.cancel() }
-        return try {
-            withTimeoutOrNull(budget.timeoutMs.coerceAtLeast(0)) { execution.await() }
-                ?: done("", StopReason.TIMEOUT, steps = 0, toolCalls = 0, usage = TokenUsage())
+        execution.invokeOnCompletion { cause ->
+            if (cause != null && cause !is CancellationException) failure.compareAndSet(null, cause)
+        }
+        val result = try {
+            withTimeoutOrNull(timeoutMs) { execution.await() }
         } finally {
-            acceptingLogs.set(false)
-            execution.cancel(CancellationException("Agent execution ended"))
-            executionScope.cancel()
+            logGate.close()
+            executionScope.cancel(CancellationException("Agent execution ended"))
         }
+        if (result != null) return result
+
+        // Preserve a provider failure that completed at the deadline instead of replacing
+        // it with a misleading timeout. A still-running non-cooperative call has no failure.
+        failure.get()?.let { throw it }
+        val snapshot = progress.get()
+        return done(
+            snapshot.lastText,
+            StopReason.TIMEOUT,
+            snapshot.steps,
+            snapshot.toolCalls,
+            snapshot.usage,
+        )
     }
 
     private suspend fun runLoop(
         system: String,
         input: String,
         allowlist: Set<String>,
+        progress: AtomicReference<Progress>,
         log: (String) -> Unit,
     ): AgentResult {
         val started = System.currentTimeMillis()
@@ -157,6 +201,7 @@ class AgentRuntime(
             steps++
             turn.usage?.let { usage += it }
             turn.text?.let { lastText = it }
+            progress.set(Progress(lastText, steps, toolCalls, usage))
             messages.add(AssistantMsg(turn.text, turn.toolCalls))
 
             if (turn.toolCalls.isEmpty()) {
@@ -165,6 +210,7 @@ class AgentRuntime(
 
             val outcomes = turn.toolCalls.map { c ->
                 toolCalls++
+                progress.set(Progress(lastText, steps, toolCalls, usage))
                 if (c.name !in allowedNames) {
                     log("blocked tool '${c.name}' (not in allowlist)")
                     ToolOutcome(c.id, c.name, "tool '${c.name}' is not in this agent's allowlist", isError = true)
@@ -189,4 +235,10 @@ class AgentRuntime(
 
     private fun done(text: String, reason: StopReason, steps: Int, toolCalls: Int, usage: TokenUsage) =
         AgentResult(text, reason, steps, toolCalls, usage)
+
+    private companion object {
+        // A permanently wedged provider can occupy at most this many shared IO workers.
+        // Later Agent runs queue on this lane and still time out at their own deadlines.
+        val agentExecutionDispatcher = Dispatchers.IO.limitedParallelism(4)
+    }
 }

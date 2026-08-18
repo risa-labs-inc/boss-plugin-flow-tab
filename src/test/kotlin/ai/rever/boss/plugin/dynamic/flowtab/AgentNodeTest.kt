@@ -14,6 +14,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -117,6 +118,32 @@ class AgentNodeTest {
         assertEquals("Agent timed out after 100ms", states["a"]?.error)
         assertTrue(states["a"]?.logs.orEmpty().any { it.startsWith("agent stopped: TIMEOUT") })
         assertTrue(states["a"]?.output.orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `negative timeout is clamped before provider work starts`() {
+        val providerCalls = AtomicInteger()
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = {
+                FakeProvider { _, _, _, _ ->
+                    providerCalls.incrementAndGet()
+                    AssistantTurn(text = "should not run")
+                }
+            },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.TIMEOUT_KEY, "-5")
+        }
+
+        val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
+
+        assertEquals(RunStatus.ERROR, states["a"]?.status)
+        assertEquals("Agent timed out after 0ms", states["a"]?.error)
+        assertEquals(0, providerCalls.get())
     }
 
     @Test

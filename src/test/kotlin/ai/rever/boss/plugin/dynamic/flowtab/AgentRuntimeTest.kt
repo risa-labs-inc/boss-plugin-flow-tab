@@ -1,8 +1,14 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -124,24 +130,85 @@ class AgentRuntimeTest {
 
     @Test
     fun `a non-cooperative provider cannot hold the caller past the wall-clock budget`() = runBlocking {
-        val source = RecordingSource(listOf(desc("late")))
+        val source = RecordingSource(listOf(desc("first"), desc("late")))
         val logs = mutableListOf<String>()
-        val provider = FakeProvider { _, _, _, _ ->
-            Thread.sleep(1_500)
-            AssistantTurn(toolCalls = listOf(call("late")))
+        val providerBlocked = CompletableDeferred<Unit>()
+        val releaseProvider = CountDownLatch(1)
+        val providerFinished = CompletableDeferred<Unit>()
+        val provider = FakeProvider { step, _, _, _ ->
+            if (step == 0) {
+                AssistantTurn(
+                    text = "partial answer",
+                    toolCalls = listOf(call("first")),
+                    usage = TokenUsage(input = 4, output = 3),
+                )
+            } else {
+                providerBlocked.complete(Unit)
+                try {
+                    releaseProvider.await() // deliberately ignores coroutine cancellation
+                    AssistantTurn(toolCalls = listOf(call("late")))
+                } finally {
+                    providerFinished.complete(Unit)
+                }
+            }
         }
         val started = System.currentTimeMillis()
+        val running = async {
+            AgentRuntime(provider, source, AgentBudget(timeoutMs = 500))
+                .run(system = "s", input = "go", allowlist = setOf("first", "late"), log = logs::add)
+        }
+        var logsAtTimeout = emptyList<String>()
 
-        val result = AgentRuntime(provider, source, AgentBudget(timeoutMs = 100))
-            .run(system = "s", input = "go", allowlist = setOf("late"), log = logs::add)
+        val result = try {
+            withTimeout(5_000) { providerBlocked.await() }
+            running.await().also { logsAtTimeout = logs.toList() }
+        } finally {
+            releaseProvider.countDown()
+            withTimeout(5_000) { providerFinished.await() }
+        }
         val elapsed = System.currentTimeMillis() - started
 
         assertEquals(StopReason.TIMEOUT, result.stopReason)
-        assertTrue(elapsed < 1_000, "non-cooperative step held the caller for ${elapsed}ms")
-        val logsAtTimeout = logs.toList()
-        delay(1_600)
+        assertEquals("partial answer", result.finalText)
+        assertEquals(1, result.steps)
+        assertEquals(1, result.toolCalls)
+        assertEquals(TokenUsage(input = 4, output = 3), result.usage)
+        assertTrue(elapsed < 2_000, "non-cooperative step held the caller for ${elapsed}ms")
         assertEquals(logsAtTimeout, logs, "late completion must not mutate published timeout logs")
-        assertTrue(source.invoked.isEmpty(), "late provider completion must not invoke a tool after timeout")
+        assertEquals(setOf("first"), source.invoked)
+    }
+
+    @Test
+    fun `a zero timeout returns before provider work starts`() = runBlocking {
+        var providerCalls = 0
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls++
+            AssistantTurn(text = "should not run")
+        }
+
+        val result = AgentRuntime(provider, RecordingSource(emptyList()), AgentBudget(timeoutMs = 0))
+            .run(system = "s", input = "go", allowlist = emptySet())
+
+        assertEquals(StopReason.TIMEOUT, result.stopReason)
+        assertEquals(0, providerCalls)
+    }
+
+    @Test
+    fun `caller cancellation is not converted to a timeout`() = runBlocking {
+        val providerStarted = CompletableDeferred<Unit>()
+        val provider = FakeProvider { _, _, _, _ ->
+            providerStarted.complete(Unit)
+            awaitCancellation()
+        }
+        val running = async {
+            AgentRuntime(provider, RecordingSource(emptyList()), AgentBudget(timeoutMs = 10_000))
+                .run(system = "s", input = "go", allowlist = emptySet())
+        }
+        withTimeout(5_000) { providerStarted.await() }
+
+        running.cancel()
+
+        assertTrue(runCatching { running.await() }.exceptionOrNull() is CancellationException)
     }
 
     // ---- tool output is data, not instructions ------------------------------
