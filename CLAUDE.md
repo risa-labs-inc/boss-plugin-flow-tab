@@ -226,6 +226,16 @@ credentials, request bodies, or assignment payloads. Metadata chips may identify
 fixed, dynamic, or secret without rendering the value itself. Card dimensions remain centralized
 in `FlowModel.kt` so rendering, edges, hit-testing, imports, and fit-to-content stay aligned.
 
+### Canvas layout
+
+`FlowLayout.kt` owns deterministic graph placement. Tidy layout assigns longest-path dependency
+rank to columns, orders each column from its parents' vertical barycenter and output-port order,
+and spaces variable-height cards without overlap. Cyclic residuals remain drawable in one final
+column even though execution will reject the cycle. Tidy is always explicit—controller/MCP edits
+must not discard hand-tuned positions automatically—and the canvas retains one pre-tidy position
+snapshot for Undo. Controller-created nodes use the same geometry to choose the first
+collision-free authoring slot, so deleting a node cannot make its replacement stack on a survivor.
+
 ### Inject execution contract
 
 Inject optionally waits for `waitFor` using `waitForType` and `waitMs` before executing its raw

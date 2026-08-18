@@ -12,6 +12,7 @@ import ai.rever.boss.plugin.api.TabRegistry
 import ai.rever.boss.plugin.api.TabTypeId
 import ai.rever.boss.plugin.api.TabUpdateProvider
 import ai.rever.boss.plugin.api.TabUpdateProviderFactory
+import androidx.compose.ui.geometry.Offset
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -114,6 +115,26 @@ class FlowControllerTest {
         fc.addNode(tabId, "SET", JsonObject(emptyMap()))
         val titles = fc.getFlow(tabId)!!.nodes.map { it.title }
         assertEquals(titles.toSet().size, titles.size) // all unique (D3)
+    }
+
+    @Test
+    fun `addNode reuses a deleted layout slot instead of colliding by node count`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+        val first = fc.addNode(tabId, "TRIGGER")
+        val deleted = fc.addNode(tabId, "SET")
+        val third = fc.addNode(tabId, "SET")
+        val beforeDelete = fc.getFlow(tabId)!!
+        val deletedPosition = beforeDelete.nodes.single { it.id == deleted }.let { Offset(it.x, it.y) }
+
+        fc.deleteNode(tabId, deleted)
+        val replacement = fc.addNode(tabId, "CODE")
+        val final = fc.getFlow(tabId)!!
+
+        assertEquals(deletedPosition, final.nodes.single { it.id == replacement }.let { Offset(it.x, it.y) })
+        assertEquals(3, final.nodes.size)
+        assertEquals(setOf(first, third, replacement), final.nodes.map { it.id }.toSet())
+        assertEquals(final.nodes.size, final.nodes.map { it.x to it.y }.toSet().size)
     }
 
     @Test
