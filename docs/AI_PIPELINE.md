@@ -59,6 +59,11 @@ Getting data **out** requires `RpaBrowserSession.executeJavaScript(): Any?` (it 
 ### Phase-2 node executors
 - **HTTP Request**(method, url, headers, body) → JVM `HttpClient` → item `{ status, headers, body }`. perItem.
 - **AI / LLM**(model, prompt, key from `secretDataProvider`) → HTTP to the LLM (Anthropic default) → item `{ text, raw }`. perItem.
+- **Agent structured output:** an optional, fixed per-node `outputSchema` exposes a reserved
+  `flow_submit_output` tool. Flow validates the submitted object locally before emitting it as
+  the item; invalid or missing submissions receive at most two correction turns. With no schema,
+  the Agent keeps its legacy text-result shape. The supported schema subset is provider-portable,
+  and unsupported validation keywords fail before any model call.
 - **If / Merge / Set** → control flow over items.
 
 ### Expressions

@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.test.Test
@@ -123,5 +125,47 @@ class FlowNodeViewTest {
             nodeSummary(login),
         )
         assertEquals(listOf("xpath", "300000ms wait"), nodeMetaChips(login))
+    }
+
+    @Test
+    fun `agent summary identifies structured mode for string and object schema config`() {
+        fun agent(config: JsonObject) = FlowNode(
+            id = "agent",
+            spec = agentNodeSpec(
+                prompts = null,
+                providerFor = { FakeProvider.scripted(AssistantTurn(text = "unused")) },
+                toolSourceFor = { object : ToolSource {
+                    override suspend fun list() = emptyList<ToolDescriptor>()
+                    override suspend fun invoke(name: String, argsJson: String) = ToolResult("unused", true)
+                } },
+            ),
+            title = "Agent",
+            x = 0f,
+            y = 0f,
+            config = config,
+        )
+
+        assertEquals(
+            "Runs an AI agent with approved tools",
+            nodeSummary(agent(buildJsonObject {})),
+        )
+        assertEquals(
+            "Runs an AI agent and returns structured data",
+            nodeSummary(agent(buildJsonObject { put(AgentNode.OUTPUT_SCHEMA_KEY, """{"type":"object"}""") })),
+        )
+        assertEquals(
+            "Runs an AI agent and returns structured data",
+            nodeSummary(
+                agent(
+                    buildJsonObject {
+                        put(AgentNode.OUTPUT_SCHEMA_KEY, buildJsonObject { put("type", "object") })
+                    },
+                ),
+            ),
+        )
+        assertEquals(
+            "Runs an AI agent and returns structured data",
+            nodeSummary(agent(buildJsonObject { put(AgentNode.OUTPUT_SCHEMA_KEY, buildJsonArray {}) })),
+        )
     }
 }

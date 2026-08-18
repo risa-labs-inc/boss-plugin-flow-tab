@@ -11,6 +11,10 @@ together with edges, n8n style.
   JavaScript because the host does not currently provide a plugin-safe JS runtime. A
   value containing only `{{ expression }}` preserves its JSON type; add surrounding
   text when a string result is required.
+- **Agent structured output** optionally takes an object JSON Schema. In that mode the
+  model submits its result through a schema-shaped tool, Flow validates it locally, and
+  downstream nodes receive the parsed object instead of model prose. Invalid submissions
+  get at most two correction rounds and never enter the item stream.
 - **Empty output stops a branch**: downstream nodes are marked Skipped rather than
   being seeded with a synthetic item and executed.
 - **If conditions** support whitespace-delimited `==`, `!=`, `>`, `>=`, `<`, and `<=`.

@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -189,6 +190,53 @@ class GatewayAgentProviderTest {
                 rounds.map { it.outcomes.single().content },
                 "round one's observation must still be visible on step three",
             )
+        }
+
+    @Test
+    fun `tool round remains intact when prose is corrected on the next step`() =
+        runBlocking {
+            val asked = AiTurn(toolCalls = listOf(AiToolCall("c1", "ls", "{}")))
+            val prose = AiTurn(text = "I found it")
+            val gateway = RecordingGateway(listOf(asked, prose, AiTurn(text = "corrected")))
+            val provider = GatewayAgentProvider({ gateway })
+            val calls = asked.toolCalls.map { ToolCall(it.id, it.name, it.argumentsJson) }
+
+            provider.step("s", listOf(UserMsg("q")), listOf(tool))
+            provider.step(
+                "s",
+                listOf(
+                    UserMsg("q"),
+                    AssistantMsg(null, calls),
+                    ToolResultsMsg(listOf(ToolOutcome("c1", "ls", "evidence", false))),
+                ),
+                listOf(tool),
+            )
+            provider.step(
+                "s",
+                listOf(
+                    UserMsg("q"),
+                    AssistantMsg(null, calls),
+                    ToolResultsMsg(listOf(ToolOutcome("c1", "ls", "evidence", false))),
+                    AssistantMsg("I found it", emptyList()),
+                    UserMsg(AgentStructuredOutput.MISSING_SUBMISSION_MESSAGE),
+                ),
+                listOf(
+                    tool,
+                    ToolDescriptor(
+                        ToolRef(ToolScope.FLOW, AgentStructuredOutput.TOOL_NAME),
+                        AgentStructuredOutput.TOOL_NAME,
+                        "submit",
+                        """{"type":"object","properties":{"answer":{"type":"string"}}}""",
+                    ),
+                ),
+            )
+
+            val (request, rounds) = gateway.steps[2]
+            assertEquals(listOf("q", "I found it", AgentStructuredOutput.MISSING_SUBMISSION_MESSAGE), request.messages.map { it.text })
+            assertEquals("c1", rounds.single().turn.toolCalls.single().id)
+            assertEquals("evidence", rounds.single().outcomes.single().content)
+            val outputSpec = gateway.toolsSeen[2].single { it.name == AgentStructuredOutput.TOOL_NAME }
+            assertContains(outputSpec.inputSchema, "answer")
         }
 
     @Test
