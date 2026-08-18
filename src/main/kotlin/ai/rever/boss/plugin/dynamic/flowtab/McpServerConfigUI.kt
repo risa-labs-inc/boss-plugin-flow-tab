@@ -44,11 +44,12 @@ import kotlinx.coroutines.launch
  * feature flag (OFF by default) and the per-server [McpServerConfig] list held by
  * [manager]; every mutation persists through the manager (config JSON at
  * [ExternalMcpManager.CONFIG_KEY], flag in [SettingsStore]) and then calls
- * [ExternalMcpManager.refresh] to reconcile live connections.
+ * [ExternalMcpManager.refresh] to reconcile live connections. [onChanged] lets the
+ * owning Flow tab immediately mirror the manager's current tools into its palette.
  *
  * Secrets are never entered/stored here as values — a server references a secret by its
  * logical *name* ([McpServerConfig.secretRef]), resolved from the host vault at connect
- * time. Deliberately compact and consistent with [FlowTheme]; not unit-tested (UI).
+ * time. Deliberately compact and consistent with [FlowTheme].
  */
 @Composable
 fun McpServerConfigPanel(
@@ -136,19 +137,11 @@ fun McpServerConfigPanel(
             Field("URL", url) { url = it }
         }
         Field("Secret name (optional)", secretRef) { secretRef = it }
-        Pill("Add server", enabledLook = name.isNotBlank()) {
-            if (name.isBlank()) return@Pill
-            val cfg = McpServerConfig(
-                name = name.trim(),
-                kind = kind,
-                command = command.trim(),
-                args = args.trim().split(Regex("\\s+")).filter { it.isNotEmpty() },
-                url = url.trim(),
-                enabled = false,
-                secretRef = secretRef.trim().ifBlank { null },
-            )
+        val draft = McpServerDraft(name, kind, command, args, url, secretRef)
+        Pill("Add server", enabledLook = draft.toConfigOrNull() != null) {
+            val cfg = draft.toConfigOrNull() ?: return@Pill
             scope.launch {
-                manager.upsertConfig(cfg); reload(); onChanged()
+                manager.upsertConfig(cfg); manager.refresh(); reload(); onChanged()
                 name = ""; command = ""; args = ""; url = ""; secretRef = ""
             }
         }
@@ -235,9 +228,39 @@ private fun Pill(text: String, enabledLook: Boolean, onClick: () -> Unit) {
             .background(if (enabledLook) FlowTheme.Primary.copy(alpha = 0.25f) else FlowTheme.Canvas)
             .border(1.dp, if (enabledLook) FlowTheme.Primary else FlowTheme.Border, RoundedCornerShape(FlowTheme.rSm))
             .pointerHoverIcon(PointerIcon.Hand)
-            .clickable { onClick() }
+            .clickable(enabled = enabledLook, onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 8.dp),
     )
+}
+
+/** Pure form-to-config conversion kept outside Compose so required transport fields
+ * and secret-free persistence can be covered without a desktop UI harness. */
+internal data class McpServerDraft(
+    val name: String,
+    val kind: McpTransportKind,
+    val command: String,
+    val args: String,
+    val url: String,
+    val secretRef: String,
+) {
+    fun toConfigOrNull(): McpServerConfig? {
+        if (name.isBlank()) return null
+        if (kind == McpTransportKind.STDIO && command.isBlank()) return null
+        if (kind == McpTransportKind.HTTP_SSE && url.isBlank()) return null
+        return McpServerConfig(
+            name = name.trim(),
+            kind = kind,
+            command = if (kind == McpTransportKind.STDIO) command.trim() else "",
+            args = if (kind == McpTransportKind.STDIO) {
+                args.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            } else {
+                emptyList()
+            },
+            url = if (kind == McpTransportKind.HTTP_SSE) url.trim() else "",
+            enabled = false,
+            secretRef = secretRef.trim().ifBlank { null },
+        )
+    }
 }
 
 @Composable
