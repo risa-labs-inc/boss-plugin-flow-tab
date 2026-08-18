@@ -60,14 +60,11 @@ class FlowBrowserToolSource(
     private suspend fun browserOpen(args: JsonObject): ToolResult {
         val requested = args.str("session_id")
         val boundDefault = defaultSessionId
-        val reused = boundDefault != null &&
-            (requested.isBlank() || requested == boundDefault) &&
-            sessions.get(boundDefault) != null
-        val id = when {
-            requested.isNotBlank() && requested != boundDefault -> sessions.open(args.bool("headless"), requested)
-            boundDefault == null -> sessions.open(args.bool("headless"))
-            reused -> boundDefault
-            else -> sessions.open(args.bool("headless"), boundDefault)
+        val (id, reused) = when {
+            requested.isNotBlank() && requested != boundDefault ->
+                sessions.open(args.bool("headless"), requested) to false
+            boundDefault == null -> sessions.open(args.bool("headless")) to false
+            else -> boundDefault to sessions.openIfAbsent(args.bool("headless"), boundDefault)
         }
         val url = args.str("url")
         if (url.isNotBlank()) sessions.withSession(id) { it.navigate(url) }
@@ -135,6 +132,9 @@ class FlowBrowserToolSource(
 
     private suspend fun browserClose(args: JsonObject): ToolResult {
         val id = args.sessionId("browser_close", allowDefault = false)
+        if (id == defaultSessionId) {
+            return err("browser_close cannot close the flow run's shared browser session")
+        }
         sessions.close(id)
         return ok(buildJsonObject { put("closed", id) })
     }
@@ -157,8 +157,13 @@ class FlowBrowserToolSource(
 
     private fun JsonObject.sessionId(tool: String, allowDefault: Boolean = true): String {
         val requested = str("session_id")
-        if (requested.isNotBlank()) return requested
         val boundDefault = defaultSessionId
+        if (requested.isNotBlank()) {
+            if (allowDefault && requested == boundDefault && sessions.get(requested) == null) {
+                throw ExecError("No browser session is open for this flow run — call browser_open first")
+            }
+            return requested
+        }
         if (!allowDefault || boundDefault == null) throw ExecError("$tool needs a 'session_id'")
         if (sessions.get(boundDefault) == null) {
             throw ExecError("No browser session is open for this flow run — call browser_open first")
@@ -192,11 +197,16 @@ class FlowBrowserToolSource(
                 " Omit session_id to use this flow run's browser session."
             }
             val session = if (sessionRequired) listOf("session_id") else emptyList()
+            val openDescription = if (sessionRequired) {
+                "Open a browser session (headless or visible) and optionally navigate; returns its session_id."
+            } else {
+                "Open or reuse a browser session (headless or visible) and optionally navigate; " +
+                    "returns its session_id and whether it was reused. Reuse keeps the existing visibility."
+            }
             return listOf(
                 desc(
                     "browser_open",
-                    "Open or reuse a browser session (headless or visible) and optionally navigate; " +
-                        "returns its session_id.$sessionHint",
+                    "$openDescription$sessionHint",
                     schema(
                         """"headless":{"type":"boolean"},"url":{"type":"string"},$SESSION_PROP""",
                         emptyList(),
@@ -236,7 +246,7 @@ class FlowBrowserToolSource(
             )
         }
 
-        /** Browser tools for callers that must name every session explicitly. */
+        /** Explicit-session contract for a default-constructed source and direct/future callers. */
         val TOOLS: List<ToolDescriptor> = tools(sessionRequired = true)
 
         /** Browser tools presented to an agent bound to its run's default session. */

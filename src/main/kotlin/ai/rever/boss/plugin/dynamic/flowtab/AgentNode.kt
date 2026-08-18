@@ -233,15 +233,22 @@ fun defaultAgentNodeSpec(
                 },
             )
         },
-        toolSourceFor = { ctx ->
-            val lanes = buildList {
-                context.mcpToolRegistry?.let { add(BossRegistryToolSource(it)) }
-                add(FlowBrowserToolSource(ctx.sessions, ctx.defaultSessionId))
-                external?.let { add(it) }
-            }
-            MergedToolSource(lanes)
-        },
+        toolSourceFor = { ctx -> defaultAgentToolSource(context, external, ctx) },
     )
+}
+
+/** Production Agent tool wiring, kept as a testable seam so default-session binding cannot regress. */
+internal fun defaultAgentToolSource(
+    context: PluginContext,
+    external: ExternalMcpManager?,
+    ctx: RunContext,
+): ToolSource {
+    val lanes = buildList {
+        context.mcpToolRegistry?.let { add(BossRegistryToolSource(it)) }
+        add(FlowBrowserToolSource(ctx.sessions, ctx.defaultSessionId))
+        external?.let { add(it) }
+    }
+    return MergedToolSource(lanes)
 }
 
 /**

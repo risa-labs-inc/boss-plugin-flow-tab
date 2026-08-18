@@ -25,6 +25,7 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -282,6 +283,7 @@ class SessionRegistryTest {
         val tools = FlowBrowserToolSource(reg).list().associateBy { it.name }
 
         assertTrue("session_id" in tools.getValue("browser_navigate").requiredProperties())
+        assertFalse(tools.getValue("browser_open").description.contains("reuse", ignoreCase = true))
 
         val close = FlowBrowserToolSource(reg).invoke("browser_close", "{}")
         assertTrue(close.isError)
@@ -308,18 +310,19 @@ class SessionRegistryTest {
         assertEquals(listOf("selector", "text"), tools.getValue("browser_type").requiredProperties())
         assertEquals(listOf("selector"), tools.getValue("browser_extract").requiredProperties())
         assertEquals(listOf("session_id"), tools.getValue("browser_close").requiredProperties())
+        assertFalse(tools.getValue("browser_close").description.contains("Omit session_id"))
 
         val opened = src.invoke("browser_open", """{"headless":true}""")
         assertFalse(opened.isError)
         val openedJson = JSON.parseToJsonElement(opened.text).jsonObject
         assertEquals(defaultId, openedJson["session_id"]!!.jsonPrimitive.content)
-        assertEquals("false", openedJson["reused"]!!.jsonPrimitive.content)
+        assertEquals(false, openedJson["reused"]!!.jsonPrimitive.booleanOrNull)
         assertNotNull(reg.get(defaultId))
 
         // Opening again without an id reuses the page established for the run.
         val reopened = src.invoke("browser_open", """{"headless":true,"url":"https://open.example"}""")
         assertFalse(reopened.isError)
-        assertEquals("true", JSON.parseToJsonElement(reopened.text).jsonObject["reused"]!!.jsonPrimitive.content)
+        assertEquals(true, JSON.parseToJsonElement(reopened.text).jsonObject["reused"]!!.jsonPrimitive.booleanOrNull)
         assertEquals(1, svc.pages.size)
 
         // Old prompts that explicitly name the default id must reuse it too.
@@ -328,7 +331,7 @@ class SessionRegistryTest {
             """{"session_id":"$defaultId","headless":true,"url":"https://explicit-default.example"}""",
         )
         assertFalse(explicitDefault.isError)
-        assertEquals("true", JSON.parseToJsonElement(explicitDefault.text).jsonObject["reused"]!!.jsonPrimitive.content)
+        assertEquals(true, JSON.parseToJsonElement(explicitDefault.text).jsonObject["reused"]!!.jsonPrimitive.booleanOrNull)
         assertEquals(1, svc.pages.size)
 
         assertFalse(src.invoke("browser_navigate", """{"url":"https://navigate.example"}""").isError)
@@ -346,33 +349,91 @@ class SessionRegistryTest {
         assertTrue(page.jsCalls.any { it.contains("#go") })
         assertTrue(page.jsCalls.any { it.contains("#name") })
 
+        val extra = src.invoke(
+            "browser_open",
+            """{"session_id":"agent-extra","headless":true,"url":"https://extra.example"}""",
+        )
+        assertFalse(extra.isError)
+        assertEquals(false, JSON.parseToJsonElement(extra.text).jsonObject["reused"]!!.jsonPrimitive.booleanOrNull)
+        assertEquals(2, svc.pages.size)
+        assertEquals(
+            listOf("https://open.example", "https://explicit-default.example", "https://navigate.example"),
+            page.navigated,
+        )
+        assertEquals(listOf("https://extra.example"), svc.pages[1].navigated)
+        assertFalse(src.invoke("browser_close", """{"session_id":"agent-extra"}""").isError)
+        assertTrue(svc.pages[1].disposed)
+
         val omittedClose = src.invoke("browser_close", "{}")
         assertTrue(omittedClose.isError)
         assertTrue(omittedClose.text.contains("session_id"))
         assertNotNull(reg.get(defaultId))
         assertFalse(page.disposed)
 
-        assertFalse(src.invoke("browser_close", """{"session_id":"$defaultId"}""").isError)
-        assertNull(reg.get(defaultId))
-        assertTrue(page.disposed)
+        val defaultClose = src.invoke("browser_close", """{"session_id":"$defaultId"}""")
+        assertTrue(defaultClose.isError)
+        assertTrue(defaultClose.text.contains("shared browser session"))
+        assertNotNull(reg.get(defaultId))
+        assertFalse(page.disposed)
+
+        reg.close(defaultId)
     }
 
     @Test
     fun `run-bound tool error does not leak an unopened default session id`() = runBlocking {
         val (reg, _) = registry()
         val defaultId = reg.newSessionId()
-        val result = FlowBrowserToolSource(reg, defaultId)
-            .invoke("browser_navigate", """{"url":"https://example.com"}""")
+        val src = FlowBrowserToolSource(reg, defaultId)
+        val omitted = src.invoke("browser_navigate", """{"url":"https://example.com"}""")
+        val explicit = src.invoke(
+            "browser_navigate",
+            """{"session_id":"$defaultId","url":"https://example.com"}""",
+        )
 
-        assertTrue(result.isError)
-        assertTrue(result.text.contains("call browser_open first"))
-        assertFalse(result.text.contains(defaultId))
+        listOf(omitted, explicit).forEach { result ->
+            assertTrue(result.isError)
+            assertTrue(result.text.contains("call browser_open first"))
+            assertFalse(result.text.contains(defaultId))
+        }
     }
 
     @Test
     fun `run-bound source rejects a blank default session id`() {
         val (reg, _) = registry()
         assertFailsWith<IllegalArgumentException> { FlowBrowserToolSource(reg, "") }
+    }
+
+    @Test
+    fun `production agent tool wiring drives the RunContext default session`() = runBlocking {
+        val svc = MultiFakeService { FakePage() }
+        val context = Ctx(svc)
+        val run = RunContext(context)
+        val opened = run.openSession(headless = true)
+        val source = defaultAgentToolSource(context, external = null, ctx = run)
+        source.list()
+
+        val result = source.invoke("browser_navigate", """{"url":"https://wired.example"}""")
+
+        assertFalse(result.isError)
+        assertEquals(listOf("https://wired.example"), svc.pages.single().navigated)
+        assertTrue(run.session === opened)
+        assertTrue(run.requireSession() === opened)
+    }
+
+    @Test
+    fun `agent-opened default session is inherited by native nodes`() = runBlocking {
+        val svc = MultiFakeService { FakePage() }
+        val context = Ctx(svc)
+        val run = RunContext(context)
+        val source = defaultAgentToolSource(context, external = null, ctx = run)
+        source.list()
+
+        val result = source.invoke("browser_open", """{"headless":true}""")
+
+        assertFalse(result.isError)
+        assertNotNull(run.session)
+        assertTrue(run.requireSession() === run.session)
+        assertEquals(1, svc.pages.size)
     }
 
     @Test
