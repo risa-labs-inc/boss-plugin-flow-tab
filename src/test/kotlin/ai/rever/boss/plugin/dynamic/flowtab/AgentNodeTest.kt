@@ -376,7 +376,8 @@ class AgentNodeTest {
 
         assertEquals(RunStatus.SUCCESS, state.status)
         assertEquals(AgentNode.MAX_TIMEOUT_MS, settings.budget.timeoutMs)
-        assertTrue(settings.budget.timeoutMs < FlowController.DEFAULT_RUN_TIMEOUT_MS)
+        val hardStopMs = settings.budget.timeoutMs + maxOf(500L, settings.budget.timeoutMs / 20)
+        assertTrue(hardStopMs <= FlowController.DEFAULT_RUN_TIMEOUT_MS - 60_000L)
     }
 
     @Test

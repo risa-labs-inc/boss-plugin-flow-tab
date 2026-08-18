@@ -55,9 +55,10 @@ than the old editable `claude-sonnet-5` value that never affected execution. The
 remains untouched in raw saved JSON for compatibility but is not parsed or sent. Optional Agent
 temperature is a real request parameter: blank defers to whatever the active provider sends (AI
 Gateway v1.1.2+ omits it when the provider setting is also absent), while an explicit value from 0 to
-2 is forwarded. The node timeout is capped at 14 minutes
-so it remains below the flow controller watchdog, then forwarded to relax the gateway's shorter
-per-turn default; `AgentRuntime` still enforces the decreasing whole-run time remaining and fires first.
+2 is forwarded. The node timeout is capped at 12 minutes so its 5% hard-stop grace remains
+comfortably below the 15-minute flow controller watchdog, then forwarded to relax the gateway's
+shorter per-turn default; `AgentRuntime` still enforces the decreasing whole-run time remaining and
+fires first.
 
 `maxTokens` is still overridden per request (4096, not the provider's chat-completion default of
 2000) because a bounded tool-use loop needs the headroom. A run is bounded by `AgentBudget`.

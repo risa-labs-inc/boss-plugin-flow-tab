@@ -28,8 +28,11 @@ object AgentNode {
 
     const val ACCENT = 0xFF6D4AFF
 
-    /** Ensures no single Agent node can consume the whole flow-run watchdog. */
-    val MAX_TIMEOUT_MS: Long = MAX_ELEMENT_WAIT_MS.toLong()
+    /**
+     * Keeps one Agent node, including its 5% hard-stop grace, comfortably below
+     * the whole-flow watchdog so timeout state still has time to be published.
+     */
+    const val MAX_TIMEOUT_MS = FlowController.DEFAULT_RUN_TIMEOUT_MS - 3 * 60 * 1_000L
 
     val CONFIG_FIELDS: List<ConfigField> = listOf(
         ConfigField(PROMPT_ID_KEY, "Prompt id (optional)", FieldType.TEXT, placeholder = "a saved prompt's id"),
@@ -47,12 +50,12 @@ object AgentNode {
             TEMPERATURE_KEY,
             "Temperature (optional; blank = provider setting)",
             FieldType.NUMBER,
-            placeholder = "0–2; for example 0.2 or {{ \$json.temp }}",
+            placeholder = "0–2 (range varies by provider); e.g. 0.2 or {{ \$json.temp }}",
         ),
         ConfigField(MAX_STEPS_KEY, "Max steps", FieldType.NUMBER, default = "8"),
         ConfigField(
             TIMEOUT_KEY,
-            "Timeout (ms, max 840000)",
+            "Timeout (ms, max 720000)",
             FieldType.NUMBER,
             default = "120000",
             placeholder = "blank = 120000",
@@ -250,8 +253,8 @@ fun defaultAgentNodeSpec(
                 },
                 temperature = settings.temperature,
                 // AgentRuntime applies the decreasing remaining whole-run budget to each
-                // turn. Forwarding the capped budget relaxes the gateway's shorter default;
-                // the runtime remains the authoritative timeout and fires first.
+                // turn. Forwarding the watchdog-derived cap relaxes the gateway's shorter
+                // default; the runtime remains the authoritative timeout and fires first.
                 requestTimeoutMs = settings.budget.timeoutMs,
             )
         },
