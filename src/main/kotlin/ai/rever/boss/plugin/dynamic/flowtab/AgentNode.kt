@@ -93,8 +93,10 @@ object AgentNode {
             MAX_TOKENS_INFO_KEY,
             "Token budget notes",
             FieldType.INFO,
-            note = "Cumulative provider-reported input + output usage across every model turn in the run, " +
-                "including tool-call argument traffic. Separate from the gateway's fixed 4096-token output cap " +
+            note = "Cumulative provider-reported input + output usage across every model turn in the run. " +
+                "Replayed transcript and tool results count again as input; tool-call arguments count as output " +
+                "when generated and as input when replayed. Enforced only when the provider reports usage. " +
+                "Separate from the gateway's fixed ${GatewayAgentProvider.DEFAULT_MAX_TOKENS}-token output cap " +
                 "on each individual model request.",
         ),
     )
@@ -149,16 +151,29 @@ class AgentNodeExecutor(
                 outputSchema = settings.outputSchema,
                 log = log,
             )
-        if (result.stopReason == StopReason.TIMEOUT) {
-            if (result.finalText.isNotBlank()) {
-                log("agent partial text withheld (${result.finalText.length} chars)")
-            }
-            throw ExecError(
-                "Agent stopped: TIMEOUT after ${result.steps} completed step(s), " +
-                    "${result.toolCalls} attempted tool call(s); timeout was ${settings.budget.timeoutMs}ms" +
-                    if (settings.outputSchema == null) "" else "; no valid structured output was produced",
+        return when (result.stopReason) {
+            StopReason.COMPLETED -> completedOutput(settings, result, log)
+            StopReason.MAX_STEPS -> failForRunLimit(
+                settings,
+                result,
+                "configured maxSteps was ${settings.budget.maxSteps}",
+                log,
             )
+            StopReason.TOKEN_BUDGET -> failForRunLimit(
+                settings,
+                result,
+                "configured maxTokens was ${settings.budget.maxTokens}",
+                log,
+            )
+            StopReason.TIMEOUT -> failForTimeout(settings, result, log)
         }
+    }
+
+    private fun completedOutput(
+        settings: AgentSettings,
+        result: AgentResult,
+        log: (String) -> Unit,
+    ): NodeOutput {
         if (settings.outputSchema != null) {
             val structured = result.structuredOutput
             if (structured == null) {
@@ -166,20 +181,11 @@ class AgentNodeExecutor(
                     log("agent non-structured final text withheld (${result.finalText.length} chars)")
                 }
                 throw ExecError(
-                    "Agent stopped: ${result.stopReason} after ${result.steps} completed step(s), " +
+                    "Agent stopped: COMPLETED after ${result.steps} completed step(s), " +
                         "${result.toolCalls} attempted tool call(s); no valid structured output was produced",
                 )
             }
             return NodeOutput.single(listOf(Item(structured)))
-        }
-        if (result.stopReason == StopReason.TOKEN_BUDGET || result.stopReason == StopReason.MAX_STEPS) {
-            if (result.finalText.isNotBlank()) {
-                log("agent partial text withheld (${result.finalText.length} chars)")
-            }
-            throw ExecError(
-                "Agent stopped: ${result.stopReason} after ${result.steps} completed step(s), " +
-                    "${result.toolCalls} attempted tool call(s); no final response was completed",
-            )
         }
         return NodeOutput.single(listOf(
             Item(buildJsonObject {
@@ -189,6 +195,52 @@ class AgentNodeExecutor(
                 put("toolCalls", result.toolCalls)
             })
         ))
+    }
+
+    private fun failForTimeout(
+        settings: AgentSettings,
+        result: AgentResult,
+        log: (String) -> Unit,
+    ): Nothing {
+        if (result.finalText.isNotBlank()) {
+            log("agent partial text withheld (${result.finalText.length} chars)")
+        }
+        throw ExecError(
+            "Agent stopped: TIMEOUT after ${result.steps} completed step(s), " +
+                "${result.toolCalls} attempted tool call(s); timeout was ${settings.budget.timeoutMs}ms" +
+                if (settings.outputSchema == null) "" else "; no valid structured output was produced",
+        )
+    }
+
+    private fun failForRunLimit(
+        settings: AgentSettings,
+        result: AgentResult,
+        configuredLimit: String,
+        log: (String) -> Unit,
+    ): Nothing {
+        if (result.finalText.isNotBlank()) {
+            val message = if (settings.outputSchema == null) {
+                "agent partial text withheld"
+            } else {
+                "agent non-structured final text withheld"
+            }
+            log("$message (${result.finalText.length} chars)")
+        }
+        val usage = if (result.usageReported) {
+            "provider-reported usage was ${result.usage.total} token(s) " +
+                "(input ${result.usage.input} + output ${result.usage.output})"
+        } else {
+            "provider-reported usage was unavailable"
+        }
+        val missingOutput = if (settings.outputSchema == null) {
+            "no final response was completed"
+        } else {
+            "no valid structured output was produced"
+        }
+        throw ExecError(
+            "Agent stopped: ${result.stopReason} after ${result.steps} completed step(s), " +
+                "${result.toolCalls} attempted tool call(s); $configuredLimit; $usage; $missingOutput",
+        )
     }
 
     private suspend fun resolveSystem(settings: AgentSettings): String {

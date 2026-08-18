@@ -212,6 +212,23 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `an answer on the final permitted step completes`() = runBlocking {
+        val source = RecordingSource(listOf(desc("lookup")))
+        val provider = FakeProvider.scripted(
+            AssistantTurn(toolCalls = listOf(call("lookup"))),
+            AssistantTurn(text = "final answer"),
+        )
+
+        val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 2))
+            .run(system = "s", input = "go", allowlist = setOf("lookup"))
+
+        assertEquals(StopReason.COMPLETED, result.stopReason)
+        assertEquals("final answer", result.finalText)
+        assertEquals(2, result.steps)
+        assertEquals(1, result.toolCalls)
+    }
+
+    @Test
     fun `a token budget stops the loop`() = runBlocking {
         val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("spin")))
@@ -256,6 +273,29 @@ class AgentRuntimeTest {
         assertEquals(120, result.usage.total)
         assertEquals(2, result.steps)
         assertEquals(2, providerCalls.get(), "the cumulative limit must prevent a third model request")
+    }
+
+    @Test
+    fun `an answering turn that reaches or exceeds the token budget completes`() = runBlocking {
+        for (reportedTotal in listOf(100, 101)) {
+            val provider = FakeProvider.scripted(
+                AssistantTurn(
+                    text = "answer at $reportedTotal",
+                    usage = TokenUsage(input = 40, output = reportedTotal - 40),
+                ),
+            )
+
+            val result = AgentRuntime(
+                provider,
+                RecordingSource(emptyList()),
+                AgentBudget(maxTokens = 100),
+            ).run(system = "s", input = "go", allowlist = emptySet())
+
+            assertEquals(StopReason.COMPLETED, result.stopReason)
+            assertEquals("answer at $reportedTotal", result.finalText)
+            assertEquals(reportedTotal, result.usage.total)
+            assertTrue(result.usageReported)
+        }
     }
 
     @Test

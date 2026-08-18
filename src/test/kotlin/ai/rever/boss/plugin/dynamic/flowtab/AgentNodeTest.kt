@@ -480,6 +480,7 @@ class AgentNodeTest {
         assertEquals(RunStatus.ERROR, state.status)
         assertEquals(
             "Agent stopped: MAX_STEPS after 2 completed step(s), 0 attempted tool call(s); " +
+                "configured maxSteps was 2; provider-reported usage was unavailable; " +
                 "no valid structured output was produced",
             state.error,
         )
@@ -615,7 +616,12 @@ class AgentNodeTest {
         ).getValue("token")
 
         assertEquals(RunStatus.ERROR, tokenState.status)
-        assertContains(tokenState.error.orEmpty(), "Agent stopped: TOKEN_BUDGET")
+        assertEquals(
+            "Agent stopped: TOKEN_BUDGET after 1 completed step(s), 0 attempted tool call(s); " +
+                "configured maxTokens was 1; provider-reported usage was 2 token(s) (input 1 + output 1); " +
+                "no valid structured output was produced",
+            tokenState.error,
+        )
         assertTrue(tokenState.output.isEmpty())
         assertFalse(tokenState.logs.joinToString("\n").contains("token-limited prose"))
 
@@ -725,8 +731,10 @@ class AgentNodeTest {
         val helpField = AgentNode.CONFIG_FIELDS.single { it.key == AgentNode.MAX_TOKENS_INFO_KEY }
         assertEquals(FieldType.INFO, helpField.type)
         assertTrue(helpField.note.contains("every model turn"))
-        assertTrue(helpField.note.contains("tool-call argument traffic"))
-        assertTrue(helpField.note.contains("4096-token output cap"))
+        assertTrue(helpField.note.contains("tool-call arguments count as output"))
+        assertTrue(helpField.note.contains("as input when replayed"))
+        assertTrue(helpField.note.contains("only when the provider reports usage"))
+        assertTrue(helpField.note.contains("${GatewayAgentProvider.DEFAULT_MAX_TOKENS}-token output cap"))
         assertTrue(helpField.note.contains("each individual model request"))
     }
 
@@ -974,7 +982,11 @@ class AgentNodeTest {
         val source = RecordingSource(listOf("spin"))
         val partial = "still working through tools"
         val provider = FakeProvider { _, _, _, _ ->
-            AssistantTurn(text = partial, toolCalls = listOf(ToolCall("1", "spin", "{}")))
+            AssistantTurn(
+                text = partial,
+                toolCalls = listOf(ToolCall("1", "spin", "{}")),
+                usage = TokenUsage(input = 3, output = 4),
+            )
         }
         val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
         val reg = builtinNodeRegistry().also { it.register(spec) }
@@ -992,6 +1004,7 @@ class AgentNodeTest {
         assertEquals(RunStatus.ERROR, state.status)
         assertEquals(
             "Agent stopped: MAX_STEPS after 1 completed step(s), 1 attempted tool call(s); " +
+                "configured maxSteps was 1; provider-reported usage was 7 token(s) (input 3 + output 4); " +
                 "no final response was completed",
             state.error,
         )
@@ -1027,6 +1040,7 @@ class AgentNodeTest {
         assertEquals(RunStatus.ERROR, state.status)
         assertEquals(
             "Agent stopped: TOKEN_BUDGET after 1 completed step(s), 1 attempted tool call(s); " +
+                "configured maxTokens was 1; provider-reported usage was 10 token(s) (input 5 + output 5); " +
                 "no final response was completed",
             state.error,
         )

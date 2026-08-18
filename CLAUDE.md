@@ -62,11 +62,15 @@ fires first.
 
 There are two intentionally separate token controls. The Agent node's optional `maxTokens` setting
 is the cumulative whole-run budget: it sums provider-reported input plus output usage across every
-model turn, including provider-counted tool-call argument traffic. Blank remains unbounded. In
-contrast, `GatewayAgentProvider` always asks the gateway for at most 4096 output tokens on each
-individual model request (rather than the provider's chat-completion default of 2000) because a
-tool-use turn needs the headroom. This documents the existing semantics; it does not change either
-default or split the `AgentBudget` API.
+model turn. Because each request replays the conversation and completed tool rounds, earlier
+transcript, tool calls, and tool results count again as input on later turns. Tool-call arguments
+count as output when the model generates them and as input when that round is replayed. Enforcement
+is best-effort: a provider that omits usage contributes nothing to the counter, so `maxTokens` cannot
+be a hard bound for that provider. Blank remains unbounded. In contrast, `GatewayAgentProvider`
+always asks the gateway for at most `GatewayAgentProvider.DEFAULT_MAX_TOKENS` (currently 4096) output
+tokens on each individual model request (rather than the provider's chat-completion default of 2000)
+because a tool-use turn needs the headroom. This documents the existing semantics; it does not change
+either default or split the `AgentBudget` API.
 
 `timeoutMs` is a hard node deadline, not merely a check between agent steps. `AgentRuntime` owns
 its loop on a 64-call, concurrency-limited elastic IO view so a non-cooperative provider or tool
