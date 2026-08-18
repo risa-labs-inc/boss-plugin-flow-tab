@@ -273,15 +273,25 @@ class AgentRuntime(
     ): AgentResult {
         val started = System.currentTimeMillis()
         val available = source.list()
-        if (outputSchema != null && AgentStructuredOutput.TOOL_NAME in allowlist &&
-            available.any { it.ref.name == AgentStructuredOutput.TOOL_NAME }
-        ) {
+        val resolved = available.filter { descriptor ->
+            allowlist.any { entry -> descriptor.matchesAllowlist(entry) }
+        }
+        val unmatched = allowlist.filterNot { entry ->
+            available.any { descriptor -> descriptor.matchesAllowlist(entry) }
+        }
+        log(resolvedToolsLog(resolved, outputSchema != null))
+        if (unmatched.isNotEmpty()) {
+            throw ExecError(
+                "Agent tool allowlist contains unavailable tool(s): ${formatToolNames(unmatched.sorted())}",
+            )
+        }
+        if (outputSchema != null && resolved.any { it.ref.name == AgentStructuredOutput.TOOL_NAME }) {
             throw ExecError(
                 "Agent output tool '${AgentStructuredOutput.TOOL_NAME}' conflicts with an allowlisted tool of the same name",
             )
         }
         val allowed = buildList {
-            addAll(available.filter { it.ref.name in allowlist })
+            addAll(resolved)
             outputSchema?.let { add(AgentStructuredOutput.descriptor(it)) }
         }
         val allowedNames = allowed.map { it.ref.name }.toSet()
@@ -445,6 +455,20 @@ class AgentRuntime(
         "agent stopped: FAILED " +
             "(${failure.steps} completed step(s), ${failure.toolCalls} attempted tool call(s))"
 
+    private fun ToolDescriptor.matchesAllowlist(entry: String): Boolean =
+        entry == ref.name || entry == ref.kindId
+
+    private fun resolvedToolsLog(resolved: List<ToolDescriptor>, structuredOutput: Boolean): String {
+        val tools = if (resolved.isEmpty()) "" else " (${formatToolNames(resolved.map { it.ref.name })})"
+        val structured = if (structuredOutput) "; structured output enabled" else ""
+        return "agent tools resolved: ${resolved.size}$tools$structured"
+    }
+
+    private fun formatToolNames(names: Collection<String>): String {
+        val shown = names.take(MAX_LOG_TOOL_LIST_ENTRIES).joinToString(", ") { safeToolName(it) }
+        return shown + if (names.size > MAX_LOG_TOOL_LIST_ENTRIES) ", …" else ""
+    }
+
     /** Model-supplied names must remain one bounded, trustworthy log-line token. */
     private fun safeToolName(name: String): String =
         name.take(MAX_LOG_TOOL_NAME_CHARS)
@@ -462,6 +486,7 @@ class AgentRuntime(
         const val ADMISSION_TIMEOUT_MS = 1_000L
         const val MIN_HARD_TIMEOUT_GRACE_MS = 500L
         const val MAX_LOG_TOOL_NAME_CHARS = 80
+        const val MAX_LOG_TOOL_LIST_ENTRIES = 12
         const val MAX_LOG_VALIDATION_REASON_CHARS = 240
         const val MAX_STRUCTURED_OUTPUT_FAILURES = 3
         val STRUCTURED_OUTPUT_FAILURE_MESSAGE =

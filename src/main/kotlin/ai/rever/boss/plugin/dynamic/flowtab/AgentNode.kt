@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.PluginContext
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -233,13 +234,54 @@ class AgentNodeExecutor(
         return value
     }
 
-    /** Allowlist as a JSON array of names, or a comma/newline-separated string. */
-    private fun parseAllowlist(cfg: ConfigReader): Set<String> =
-        when (val el = cfg.element(AgentNode.ALLOWLIST_KEY)) {
-            is JsonArray -> el.mapNotNull { (it as? JsonPrimitive)?.content?.trim() }.filter { it.isNotEmpty() }.toSet()
-            is JsonPrimitive -> el.content.split(',', '\n').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
-            else -> emptySet()
+    /**
+     * Allowlist as a JSON array of names/tool kind-ids, or a comma/newline-separated
+     * string. The inspector stores JSON editor content in a JsonPrimitive, while raw
+     * flow JSON may contain a real JsonArray, so both representations are intentional.
+     */
+    private fun parseAllowlist(cfg: ConfigReader): Set<String> {
+        val entries = when (val configured = cfg.element(AgentNode.ALLOWLIST_KEY)) {
+            null, JsonNull -> emptyList()
+            is JsonArray -> allowlistEntries(configured)
+            is JsonPrimitive -> {
+                val raw = configured.content.trim()
+                when {
+                    raw.isEmpty() -> emptyList()
+                    raw.startsWith("[") -> {
+                        val parsed = runCatching { Json.parseToJsonElement(raw) }.getOrElse { error ->
+                            throw ExecError(
+                                "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) must be a valid JSON array: " +
+                                    (error.message ?: "invalid JSON"),
+                            )
+                        }
+                        val array = parsed as? JsonArray
+                            ?: throw ExecError(
+                                "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) must be a JSON array of strings",
+                            )
+                        allowlistEntries(array)
+                    }
+                    else -> raw.split(',', '\n').map(String::trim).filter(String::isNotEmpty)
+                }
+            }
+            else -> throw ExecError(
+                "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) must be a JSON array or comma-separated names",
+            )
         }
+        return entries.toCollection(LinkedHashSet())
+    }
+
+    private fun allowlistEntries(array: JsonArray): List<String> = array.mapIndexed { index, element ->
+        val primitive = element as? JsonPrimitive
+        if (primitive == null || !primitive.isString) {
+            throw ExecError(
+                "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) entry ${index + 1} must be a string",
+            )
+        }
+        primitive.content.trim().takeIf(String::isNotEmpty)
+            ?: throw ExecError(
+                "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) entry ${index + 1} must not be blank",
+            )
+    }
 }
 
 /**

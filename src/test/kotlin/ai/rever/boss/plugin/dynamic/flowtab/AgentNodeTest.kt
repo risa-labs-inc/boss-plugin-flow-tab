@@ -55,7 +55,7 @@ class AgentNodeTest {
     }
 
     @Test
-    fun `agent node runs the loop and emits its final text`() {
+    fun `agent node accepts the inspector's text encoded JSON allowlist`() {
         val source = RecordingSource(listOf("lookup"))
         val provider = FakeProvider.scripted(
             AssistantTurn(toolCalls = listOf(ToolCall("1", "lookup", "{}"))),
@@ -68,7 +68,7 @@ class AgentNodeTest {
         val cfg = buildJsonObject {
             put("system", "be helpful")
             put("input", "do the thing")
-            put(AgentNode.ALLOWLIST_KEY, buildJsonArray { add(kotlinx.serialization.json.JsonPrimitive("lookup")) })
+            put(AgentNode.ALLOWLIST_KEY, """["lookup"]""")
         }
         val states = runFlow(
             reg,
@@ -78,6 +78,32 @@ class AgentNodeTest {
         assertEquals(RunStatus.SUCCESS, states["a"]!!.status)
         assertEquals("final answer", states["a"]!!.output.single().json["text"]!!.jsonPrimitive.content)
         assertTrue(source.invoked.contains("lookup"))
+        assertTrue(states["a"]!!.logs.contains("agent tools resolved: 1 (lookup)"))
+    }
+
+    @Test
+    fun `agent node rejects malformed JSON allowlist before requesting the model`() {
+        val providerCalls = AtomicInteger()
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls.incrementAndGet()
+            AssistantTurn(text = "must not run")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(listOf("lookup")) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.ALLOWLIST_KEY, "[\"lookup\"")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertContains(state.error.orEmpty(), "toolAllowlist) must be a valid JSON array")
+        assertEquals(0, providerCalls.get())
     }
 
     @Test
@@ -696,6 +722,7 @@ class AgentNodeTest {
         )
         assertEquals(
             listOf(
+                "agent tools resolved: 0",
                 "agent step 1: requesting model",
                 "agent stopped: FAILED (0 completed step(s), 0 attempted tool call(s))",
             ),
