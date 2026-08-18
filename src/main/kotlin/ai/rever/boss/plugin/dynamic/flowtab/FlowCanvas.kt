@@ -176,8 +176,8 @@ fun FlowCanvas(
         // visible browser pane is otherwise idle. No-op when not running.
         @Suppress("UNUSED_EXPRESSION") state.repaintTick
 
-        state.nodes.forEach { node ->
-            key(node.id) { FlowNodeView(state, node) }
+        state.nodes.forEachIndexed { index, node ->
+            key(node.id) { FlowNodeView(state, node, displayNumber = index + 1) }
         }
 
         EdgeActions(state)

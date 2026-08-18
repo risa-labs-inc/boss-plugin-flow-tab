@@ -164,6 +164,14 @@ single-quoted JavaScript literals. `BrowserScripts` escapes quotes, backslashes,
 line terminator, and ASCII control characters before interpolation; keep all new browser-script
 string inputs on that shared escaping path.
 
+### Canvas node cards
+
+Nodes render a one-based creation-order badge, their registry type, custom title, and a concise
+action sentence. Summaries should describe intent and useful targets, never raw typed values,
+credentials, request bodies, or assignment payloads. Metadata chips may identify a value as
+fixed, dynamic, or secret without rendering the value itself. Card dimensions remain centralized
+in `FlowModel.kt` so rendering, edges, hit-testing, imports, and fit-to-content stay aligned.
+
 ## Version Management
 
 **`build.gradle.kts` is the single source of truth for version.**

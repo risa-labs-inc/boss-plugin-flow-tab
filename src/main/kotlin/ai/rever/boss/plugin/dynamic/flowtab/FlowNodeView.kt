@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -109,30 +111,61 @@ fun runStatusColor(status: RunStatus?): Color? = when (status) {
     else -> null
 }
 
-/** One-line summary of a node's key config, shown under its title. */
+/** Human-facing, one-based canvas position used by the node number badge. */
+fun nodeNumberLabel(displayNumber: Int): String = "#${displayNumber.coerceAtLeast(1)}"
+
+/**
+ * One-line action sentence shown under a node's title. It describes intent rather
+ * than dumping raw config, so cards remain understandable without exposing typed
+ * values, credentials, request bodies, or assignment payloads on the canvas.
+ */
 fun nodeSummary(node: FlowNode): String {
     fun c(k: String) = (node.config[k] as? JsonPrimitive)?.content ?: ""
-    val raw = when (node.kind) {
-        "OPEN_BROWSER" -> c("url").ifBlank { "ephemeral session" }
-        "NAVIGATE" -> c("url")
-        // selector kind / method / mode move to the meta chip row below.
-        "CLICK", "TYPE", "EXTRACT" -> c("selector")
-        "HTTP" -> c("url")
-        "SET" -> c("assignments")
-        "INJECT" -> c("script")
-        else -> ""
-    }.trim()
-    // Let the Text's maxLines=1 + ellipsis own truncation (no manual double-cut).
-    return raw
+    fun withTarget(action: String, target: String, fallback: String): String =
+        if (target.isBlank()) fallback else "$action ${target.trim()}"
+
+    return when (node.kind) {
+        "TRIGGER" -> "Starts this flow"
+        "OPEN_BROWSER" -> withTarget("Opens", c("url"), "Opens a browser session")
+        "NAVIGATE" -> withTarget("Navigates to", c("url"), "Navigates to a URL")
+        "CLICK" -> withTarget("Clicks", c("selector"), "Clicks a page element")
+        "TYPE" -> withTarget("Types into", c("selector"), "Types text into a page field")
+        "EXTRACT" -> {
+            val mode = c("mode").ifBlank { "text" }
+            withTarget("Extracts $mode from", c("selector"), "Extracts $mode from the page")
+        }
+        "INJECT" -> "Runs custom JavaScript in the page"
+        "HTTP" -> {
+            val method = c("method").ifBlank { "GET" }.uppercase()
+            withTarget("$method request to", c("url"), "Sends a $method request")
+        }
+        "SET" -> "Sets or updates item fields"
+        "CODE" -> "Transforms each input item"
+        "IF" -> withTarget("Branches when", c("condition"), "Routes items by a condition")
+        "MERGE" -> "Combines both input branches"
+        AgentNode.KIND -> "Runs an AI agent with approved tools"
+        LanagerNode.KIND -> withTarget("Runs sub-flow", c(LanagerNode.FLOW_ID_KEY), "Runs another flow")
+        else -> node.spec.description.ifBlank { "Runs ${node.spec.label}" }
+    }
 }
 
 /** Small at-a-glance metadata chips for a node (selector kind, method, …). */
 fun nodeMetaChips(node: FlowNode): List<String> {
     fun c(k: String) = (node.config[k] as? JsonPrimitive)?.content ?: ""
+    fun valueSource(value: String): String = when {
+        value.isBlank() -> "no value"
+        "\$secret." in value -> "secret value"
+        "{{" in value -> "dynamic value"
+        else -> "fixed value"
+    }
     return when (node.kind) {
         "OPEN_BROWSER" -> listOf(if (c("headless").equals("true", true)) "headless" else "visible")
-        "HTTP" -> listOf(c("method").ifBlank { "GET" })
-        "CLICK", "TYPE" -> listOf(c("selectorType").ifBlank { "css" })
+        "HTTP" -> buildList {
+            add(c("method").ifBlank { "GET" }.uppercase())
+            if ("\$secret." in c("headers") || "\$secret." in c("body") || "\$secret." in c("url")) add("uses secret")
+        }
+        "CLICK" -> listOf(c("selectorType").ifBlank { "css" })
+        "TYPE" -> listOf(c("selectorType").ifBlank { "css" }, valueSource(c("text")))
         "EXTRACT" -> buildList {
             add(c("selectorType").ifBlank { "css" })
             add(c("mode").ifBlank { "text" })
@@ -152,7 +185,7 @@ fun nodeMetaChips(node: FlowNode): List<String> {
  * handlers, drag deltas arrive in world units regardless of zoom.
  */
 @Composable
-fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
+fun FlowNodeView(state: FlowGraphState, node: FlowNode, displayNumber: Int) {
     val selected = state.selection == Selection.Node(node.id)
     val accent = Color(node.spec.accent)
     val h = nodeHeight(node.spec)
@@ -232,28 +265,47 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
                 // Colored icon tile.
                 Box(
                     modifier = Modifier
-                        .size(40f.wdp())
+                        .size(44f.wdp())
                         .clip(RoundedCornerShape(10f.wdp()))
                         .background(accent),
                     contentAlignment = Alignment.Center
                 ) {
-                    Icon(node.spec.icon(), null, tint = Color.White, modifier = Modifier.size(21f.wdp()))
+                    Icon(node.spec.icon(), null, tint = Color.White, modifier = Modifier.size(22f.wdp()))
                 }
-                Spacer(Modifier.width(11f.wdp()))
+                Spacer(Modifier.width(12f.wdp()))
                 Column(Modifier.weight(1f)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        NodeNumberBadge(displayNumber, accent)
+                        Spacer(Modifier.width(6f.wdp()))
+                        Text(
+                            text = node.spec.label.uppercase(),
+                            color = FlowTheme.TextFaint,
+                            fontSize = 9.sp,
+                            fontWeight = FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (status != null) {
+                            Spacer(Modifier.width(6f.wdp()))
+                            StatusPill(status, run)
+                        }
+                    }
+                    Spacer(Modifier.height(2f.wdp()))
                     Text(
                         text = node.title,
                         color = FlowTheme.TextPrimary,
-                        fontSize = 13.sp,
+                        fontSize = 14.sp,
                         fontWeight = FontWeight.SemiBold,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    // Config preview, falling back to the type's description so the
-                    // second line is never empty (no lonely-title look).
-                    val subtitle = nodeSummary(node).ifBlank { node.spec.description }
+                    // Human-readable action sentence; never dumps sensitive value payloads.
                     Text(
-                        text = subtitle,
+                        text = nodeSummary(node),
                         color = FlowTheme.TextMuted,
                         fontSize = 11.sp,
                         maxLines = 1,
@@ -269,10 +321,6 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
                             for (chip in nodeMetaChips(node)) MetaChip(chip)
                         }
                     }
-                }
-                if (status != null) {
-                    Spacer(Modifier.width(8f.wdp()))
-                    StatusPill(status, run)
                 }
             }
 
@@ -359,6 +407,26 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode) {
                     }
             )
         }
+    }
+}
+
+/** Creation-order badge shown before the node type. */
+@Composable
+private fun NodeNumberBadge(number: Int, accent: Color) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(5f.wdp()))
+            .background(accent.copy(alpha = 0.18f))
+            .padding(horizontal = 5f.wdp(), vertical = 1f.wdp()),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = nodeNumberLabel(number),
+            color = accent,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Bold,
+            maxLines = 1,
+        )
     }
 }
 
