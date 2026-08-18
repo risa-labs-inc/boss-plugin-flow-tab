@@ -132,6 +132,7 @@ class AgentNodeTest {
             states["a"]?.error,
         )
         assertTrue(states["a"]?.logs.orEmpty().any { it.startsWith("agent stopped: TIMEOUT") })
+        assertTrue(states["a"]?.logs.orEmpty().contains("agent partial text withheld (14 chars)"))
         assertFalse(states["a"]?.logs.orEmpty().any { "working answer" in it })
         assertTrue(states["a"]?.output.orEmpty().isEmpty())
     }

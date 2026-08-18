@@ -108,6 +108,9 @@ class AgentNodeExecutor(
         val result = AgentRuntime(provider, source, settings.budget)
             .run(system = system, input = settings.input, allowlist = settings.allowlist, log = log)
         if (result.stopReason == StopReason.TIMEOUT) {
+            if (result.finalText.isNotBlank()) {
+                log("agent partial text withheld (${result.finalText.length} chars)")
+            }
             throw ExecError(
                 "Agent stopped: TIMEOUT after ${result.steps} completed step(s), " +
                     "${result.toolCalls} attempted tool call(s); timeout was ${settings.budget.timeoutMs}ms",

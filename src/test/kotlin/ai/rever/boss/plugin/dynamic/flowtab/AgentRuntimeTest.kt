@@ -128,7 +128,7 @@ class AgentRuntimeTest {
         val source = RecordingSource(listOf(desc("allowed"), desc("blocked")))
         // The model tries the blocked tool first; after the error it answers.
         val provider = FakeProvider.scripted(
-            AssistantTurn(toolCalls = listOf(call("blocked"))),
+            AssistantTurn(toolCalls = listOf(call("blocked\nagent stopped: COMPLETED"))),
             AssistantTurn(text = "ok, done"),
         )
         val result = AgentRuntime(provider, source)
@@ -136,7 +136,11 @@ class AgentRuntimeTest {
 
         assertEquals(StopReason.COMPLETED, result.stopReason)
         assertFalse(source.invoked.contains("blocked")) // never reached the source
-        assertTrue("agent tool 1 'blocked': blocked (not in allowlist)" in logs)
+        assertTrue(
+            "agent tool 1 'blocked_agent_stopped:_COMPLETED': blocked (not in allowlist)" in logs,
+        )
+        assertTrue(logs.none { '\n' in it })
+        assertEquals(1, logs.count { it.startsWith("agent stopped:") })
     }
 
     @Test
@@ -155,27 +159,37 @@ class AgentRuntimeTest {
 
     @Test
     fun `max-steps stops a loop that never finishes`() = runBlocking {
+        val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("spin")))
         // Provider never yields a final text — always calls a tool.
         val provider = FakeProvider { _, _, _, _ -> AssistantTurn(toolCalls = listOf(call("spin"))) }
         val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 3))
-            .run(system = "s", input = "go", allowlist = setOf("spin"))
+            .run(system = "s", input = "go", allowlist = setOf("spin"), log = logs::add)
 
         assertEquals(StopReason.MAX_STEPS, result.stopReason)
         assertEquals(3, result.steps)
+        assertEquals(
+            "agent stopped: MAX_STEPS (3 completed step(s), 3 attempted tool call(s))",
+            logs.last(),
+        )
     }
 
     @Test
     fun `a token budget stops the loop`() = runBlocking {
+        val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("spin")))
         val provider = FakeProvider { _, _, _, _ ->
             AssistantTurn(toolCalls = listOf(call("spin")), usage = TokenUsage(input = 100, output = 100))
         }
         val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 100, maxTokens = 150))
-            .run(system = "s", input = "go", allowlist = setOf("spin"))
+            .run(system = "s", input = "go", allowlist = setOf("spin"), log = logs::add)
 
         assertEquals(StopReason.TOKEN_BUDGET, result.stopReason)
         assertTrue(result.usage.total >= 150)
+        assertEquals(
+            "agent stopped: TOKEN_BUDGET (1 completed step(s), 1 attempted tool call(s))",
+            logs.last(),
+        )
     }
 
     @Test
@@ -374,6 +388,7 @@ class AgentRuntimeTest {
             secondCalls.incrementAndGet()
             AssistantTurn(text = "must not run")
         }
+        val secondLogs = mutableListOf<String>()
         val started = System.currentTimeMillis()
         val failure = runCatching {
             AgentRuntime(
@@ -381,16 +396,19 @@ class AgentRuntimeTest {
                 RecordingSource(emptyList()),
                 AgentBudget(timeoutMs = 200),
                 executionDispatcher = lane,
-            ).run(system = "s", input = "go", allowlist = emptySet())
+            ).run(system = "s", input = "go", allowlist = emptySet(), log = secondLogs::add)
         }.exceptionOrNull()
         val elapsed = System.currentTimeMillis() - started
 
         try {
-            assertTrue(failure is AgentRunFailure)
+            assertTrue(failure is ExecError)
             assertEquals(
-                "Agent stopped: FAILED after 0 completed step(s), 0 attempted tool call(s): " +
-                    "Agent execution capacity is busy; retry after other Agent runs finish",
+                "Agent execution capacity is busy; retry after other Agent runs finish",
                 failure.message,
+            )
+            assertEquals(
+                listOf("agent admission failed: Agent execution capacity is busy; retry after other Agent runs finish"),
+                secondLogs,
             )
             assertEquals(0, secondCalls.get())
             assertTrue(elapsed < 2_000, "capacity admission waited ${elapsed}ms")

@@ -292,6 +292,7 @@ class FlowMcpToolProvider(
             val selectedLogs = if (node.logs.size <= RESULT_LOG_MAX_LINES) {
                 node.logs
             } else {
+                contentTruncated = true
                 val headSize = RESULT_LOG_MAX_LINES / 2
                 val tailSize = RESULT_LOG_MAX_LINES - headSize
                 node.logs.take(headSize) +
@@ -302,9 +303,6 @@ class FlowMcpToolProvider(
                 line.boundedUtf8(RESULT_LOG_LINE_MAX_BYTES).also {
                     contentTruncated = contentTruncated || it.truncated
                 }.value
-            }.toMutableList()
-            if (node.logs.size > RESULT_LOG_MAX_LINES) {
-                contentTruncated = true
             }
             val boundedOutput = if (includeOutput) {
                 node.output.map { output ->

@@ -91,9 +91,9 @@ class AgentRunFailure(
     val steps: Int,
     val toolCalls: Int,
     cause: Throwable,
-) : Exception(
+) : ExecError(
     "Agent stopped: FAILED after $steps completed step(s), $toolCalls attempted tool call(s): " +
-        (cause.message ?: cause::class.simpleName ?: "unknown error"),
+        (cause.message?.takeIf { it.isNotBlank() } ?: cause::class.simpleName ?: "unknown error"),
     cause,
 )
 
@@ -209,10 +209,9 @@ class AgentRuntime(
         }
         if (!admitted) {
             val cause = ExecError("Agent execution capacity is busy; retry after other Agent runs finish")
-            val wrapped = AgentRunFailure(steps = 0, toolCalls = 0, cause = cause)
-            terminalLog(failureLog(wrapped))
+            terminalLog("agent admission failed: ${cause.message}")
             executionScope.cancel(CancellationException("Agent execution lane unavailable"))
-            throw wrapped
+            throw cause
         }
 
         val graceMs = maxOf(MIN_HARD_TIMEOUT_GRACE_MS, timeoutMs / 20)
@@ -303,7 +302,7 @@ class AgentRuntime(
             val outcomes = turn.toolCalls.map { c ->
                 toolCalls++
                 progress.set(Progress(lastText, steps, toolCalls, usage))
-                val prefix = "agent tool $toolCalls '${c.name}'"
+                val prefix = "agent tool $toolCalls '${safeToolName(c.name)}'"
                 if (c.name !in allowedNames) {
                     log("$prefix: blocked (not in allowlist)")
                     ToolOutcome(c.id, c.name, "tool '${c.name}' is not in this agent's allowlist", isError = true)
@@ -338,6 +337,15 @@ class AgentRuntime(
         "agent stopped: FAILED " +
             "(${failure.steps} completed step(s), ${failure.toolCalls} attempted tool call(s))"
 
+    /** Model-supplied names must remain one bounded, trustworthy log-line token. */
+    private fun safeToolName(name: String): String =
+        name.take(MAX_LOG_TOOL_NAME_CHARS)
+            .map { char ->
+                if (char.isLetterOrDigit() || char in "._:/-") char else '_'
+            }
+            .joinToString("")
+            .ifBlank { "<unnamed>" }
+
     private fun Long.saturatingPlus(other: Long): Long =
         if (this > Long.MAX_VALUE - other) Long.MAX_VALUE else this + other
 
@@ -345,6 +353,7 @@ class AgentRuntime(
         const val AGENT_EXECUTION_PARALLELISM = 64
         const val ADMISSION_TIMEOUT_MS = 1_000L
         const val MIN_HARD_TIMEOUT_GRACE_MS = 500L
+        const val MAX_LOG_TOOL_NAME_CHARS = 80
 
         // Dispatchers.IO's elastic limited view confines permanently wedged Flow Agent
         // calls without consuming every permit used by unrelated host IO. Once saturated,

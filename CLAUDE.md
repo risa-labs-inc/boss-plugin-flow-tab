@@ -80,9 +80,12 @@ Agent diagnostics are incremental and sanitized. The runtime logs each model ste
 provider call, each tool's name plus started/succeeded/failed status, and a terminal stop line.
 Provider failures therefore retain the number of completed steps and attempted tool calls even
 when the loop throws. Raw prompts, model text, tool arguments, and tool-result content are never
-written to these progress logs; the node error keeps the provider's error message with the same
-`FAILED` counters. Runtime-owned terminal logging is intentional—the executor cannot reliably log
-after a thrown provider boundary.
+written to these progress logs; model-controlled tool names are single-line, length-bounded tokens,
+and a timeout reports only the withheld partial text's character count. The node error keeps the
+provider's existing error message with the same `FAILED` counters, so provider-controlled boundary
+details remain visible there even though they are not copied into progress logs. Admission failure
+remains its own plain capacity error because no Agent run started. Runtime-owned terminal logging is
+intentional—the executor cannot reliably log after a thrown provider boundary.
 
 The agent's browser tool lane is bound to the run's `defaultSessionId`. In that lane,
 `session_id` is optional and omission means the same browser session native Open/Navigate/Click/
