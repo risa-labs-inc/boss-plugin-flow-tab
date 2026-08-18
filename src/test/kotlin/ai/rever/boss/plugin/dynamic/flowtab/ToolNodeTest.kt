@@ -10,11 +10,17 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.RegisteredMcpTool
 import ai.rever.boss.plugin.api.TabRegistry
 import androidx.compose.ui.geometry.Offset
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -207,5 +213,35 @@ class ToolNodeTest {
     fun `syncBossTools degrades to null when the host has no registry`() {
         val job = syncBossTools(minimalContext(null), builtinNodeRegistry(), CoroutineScope(Dispatchers.Default))
         assertNull(job)
+    }
+
+    @Test
+    fun `boss tool collector continues after one update fails`() = runBlocking {
+        val updates = MutableSharedFlow<List<RegisteredMcpTool>>()
+        val failures = mutableListOf<Exception>()
+        val applied = CompletableDeferred<List<ToolDescriptor>>()
+        var attempts = 0
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            collectBossToolUpdates(
+                updates = updates,
+                apply = { descriptors ->
+                    attempts++
+                    if (attempts == 1) error("bad tool update")
+                    applied.complete(descriptors)
+                },
+                reportFailure = failures::add,
+            )
+        }
+
+        try {
+            updates.emit(listOf(tool("broken", "{}")))
+            updates.emit(listOf(tool("healthy", "{}")))
+
+            assertEquals("healthy", withTimeout(2_000) { applied.await() }.single().name)
+            assertEquals(listOf("bad tool update"), failures.map { it.message })
+            assertTrue(job.isActive, "one rejected update must not terminate the collector")
+        } finally {
+            job.cancelAndJoin()
+        }
     }
 }

@@ -84,15 +84,29 @@ class FlowController(
     /** Independent from pluginScope so controller-owned work survives a sandbox watchdog
      * replacing that scope. Everything launched here is cancelled from [dispose]. */
     private val lifecycleScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val toolSyncLock = Any()
+    private var toolSyncJobs: List<Job>? = null
 
     /**
      * Keep the headless registry synchronized for this controller's whole lifetime.
      * These collectors deliberately do not belong to [scopeProvider]: that scope may be
-     * replaced by the host while the controller and its registry remain registered.
+     * replaced by the host while the controller and its registry remain registered. The
+     * first call fixes the external manager for this controller; later calls return the
+     * same jobs without installing duplicate collectors.
      */
-    internal fun startToolRegistrySync(external: ExternalMcpManager?) {
-        syncBossTools(context, registry, lifecycleScope)
-        external?.let { syncExternalMcpTools(it, registry, lifecycleScope) }
+    internal fun startToolRegistrySync(external: ExternalMcpManager?): List<Job> {
+        return synchronized(toolSyncLock) {
+            toolSyncJobs?.let { return@synchronized it }
+            val started = mutableListOf<Job>()
+            try {
+                syncBossTools(context, registry, lifecycleScope)?.let(started::add)
+                external?.let { started += syncExternalMcpTools(it, registry, lifecycleScope) }
+                started.toList().also { toolSyncJobs = it }
+            } catch (failure: Throwable) {
+                started.forEach { it.cancel() }
+                throw failure
+            }
+        }
     }
 
     // ---- authoring (storage-seated) -----------------------------------------
@@ -668,6 +682,10 @@ class FlowController(
  * [syncBossTools], so `flow_run` on a `tool:boss:*` node authored over MCP failed with
  * "Unknown node kind" while the identical UI-authored flow ran fine. Keep every kind the
  * UI can resolve resolvable here too.
+ *
+ * The optional [scope] controls run dispatch only. Registry synchronization belongs to
+ * the returned controller's independent lifecycle, so every caller owns and must invoke
+ * [FlowController.dispose] when that controller is no longer needed.
  */
 fun buildHeadlessController(
     context: PluginContext,
@@ -680,12 +698,12 @@ fun buildHeadlessController(
         context = context,
         scopeProvider = scopeProvider,
     )
-    // Host and external tools are synchronized on the controller-owned lifecycle. The
-    // host can replace pluginScope after a watchdog restart without freezing this registry.
-    controller.startToolRegistrySync(external)
     // Make agent + lanager kinds runnable in headless (MCP-driven) runs too, sharing
     // the controller's registry so a lanager's sub-run resolves the same kinds.
     controller.registry.register(defaultAgentNodeSpec(context, prompts, external))
     controller.registry.register(lanagerNodeSpec(controller))
+    // Start controller-owned background work only after construction can no longer fail.
+    // Host sync remains live across pluginScope replacement; external sync is one-shot.
+    controller.startToolRegistrySync(external)
     return controller
 }

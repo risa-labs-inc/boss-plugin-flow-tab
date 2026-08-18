@@ -1,8 +1,11 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.boss.plugin.api.RegisteredMcpTool
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -163,6 +166,25 @@ fun syncBossTools(context: PluginContext, registry: NodeRegistry, scope: Corouti
     val source = BossRegistryToolSource(reg)
     val sync = ToolNodeSync(source, registry)
     return scope.launch {
-        reg.tools.collect { tools -> sync.apply(tools.map { it.toDescriptor() }) }
+        collectBossToolUpdates(reg.tools, sync::apply)
+    }
+}
+
+/** Keep a bad host-tool update from permanently terminating the live registry collector. */
+internal suspend fun collectBossToolUpdates(
+    updates: Flow<List<RegisteredMcpTool>>,
+    apply: (List<ToolDescriptor>) -> Unit,
+    reportFailure: (Exception) -> Unit = { failure ->
+        println("[flow-tab] failed to synchronize host tools: ${failure.message}")
+    },
+) {
+    updates.collect { tools ->
+        try {
+            apply(tools.map { it.toDescriptor() })
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            reportFailure(failure)
+        }
     }
 }

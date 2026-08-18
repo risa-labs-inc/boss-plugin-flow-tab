@@ -45,6 +45,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -1014,11 +1015,15 @@ class FlowControllerTest {
         }
     }
 
-    private fun contextWithBossTool(storage: PluginStorageProvider, tool: String): PluginContext = object : PluginContext {
+    private fun contextWithBossTool(
+        storage: PluginStorageProvider,
+        bossRegistry: McpToolRegistry,
+        scopeProvider: () -> CoroutineScope = { scope },
+    ): PluginContext = object : PluginContext {
         override val panelRegistry = PanelRegistry()
         override val tabRegistry = TabRegistry()
-        override val pluginScope = scope
-        override val mcpToolRegistry: McpToolRegistry? = FakeBossRegistry(tool)
+        override val pluginScope: CoroutineScope get() = scopeProvider()
+        override val mcpToolRegistry: McpToolRegistry = bossRegistry
         override val pluginStorageFactory = object : PluginStorageFactory {
             override fun createStorage(pluginId: String): PluginStorageProvider = storage
         }
@@ -1027,15 +1032,35 @@ class FlowControllerTest {
     @Test
     fun `headless controller resolves boss tool node kinds so MCP flow_run can use them`() = runBlocking {
         val storage = DesktopStorage()
-        val ctx = contextWithBossTool(storage, "demo")
+        val ctx = contextWithBossTool(storage, FakeBossRegistry("demo"))
         val controller = buildHeadlessController(ctx, PromptRegistry(storage), external = null, scope = scope)
-        // The tools StateFlow collector registers the kind asynchronously; wait for it.
-        withTimeout(2_000) {
-            while (controller.registry.resolve("tool:boss:demo").isUnavailable) delay(10)
+        try {
+            // The tools StateFlow collector registers the kind asynchronously; wait for it.
+            withTimeout(2_000) {
+                while (controller.registry.resolve("tool:boss:demo").isUnavailable) delay(10)
+            }
+            val spec = controller.registry.resolve("tool:boss:demo")
+            assertTrue(!spec.isUnavailable, "boss tool kind must be registered on the headless registry")
+            assertNotNull(spec.executor, "boss tool node must be runnable via flow_run")
+        } finally {
+            controller.dispose()
         }
-        val spec = controller.registry.resolve("tool:boss:demo")
-        assertTrue(!spec.isUnavailable, "boss tool kind must be registered on the headless registry")
-        assertNotNull(spec.executor, "boss tool node must be runnable via flow_run")
+    }
+
+    @Test
+    fun `headless tool sync is idempotent`() = runBlocking {
+        val storage = DesktopStorage()
+        val ctx = contextWithBossTool(storage, FakeBossRegistry("demo"))
+        val controller = FlowController(ctx)
+        try {
+            val first = controller.startToolRegistrySync(external = null)
+            val second = controller.startToolRegistrySync(external = null)
+
+            assertSame(first, second, "restarting sync must return the existing jobs")
+            assertEquals(1, first.size, "only one host registry collector should be installed")
+        } finally {
+            controller.dispose()
+        }
     }
 
     @Test
@@ -1043,16 +1068,9 @@ class FlowControllerTest {
         val storage = DesktopStorage()
         val bossRegistry = FakeBossRegistry("before-restart")
         var sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-        val ctx = object : PluginContext {
-            override val panelRegistry = PanelRegistry()
-            override val tabRegistry = TabRegistry()
-            override val pluginScope: CoroutineScope get() = sandboxScope
-            override val mcpToolRegistry: McpToolRegistry = bossRegistry
-            override val pluginStorageFactory = object : PluginStorageFactory {
-                override fun createStorage(pluginId: String): PluginStorageProvider = storage
-            }
-        }
+        val ctx = contextWithBossTool(storage, bossRegistry) { sandboxScope }
         val controller = buildHeadlessController(ctx, PromptRegistry(storage), external = null)
+        val syncJobs = controller.startToolRegistrySync(external = null)
 
         try {
             withTimeout(2_000) {
@@ -1066,12 +1084,19 @@ class FlowControllerTest {
             withTimeout(2_000) {
                 while (controller.registry.resolve("tool:boss:after-restart").isUnavailable) delay(10)
             }
-            assertTrue(controller.registry.resolve("tool:boss:before-restart").isUnavailable)
+            assertTrue(
+                controller.registry.resolve("tool:boss:before-restart").isUnavailable,
+                "a removed pre-restart tool must be unregistered",
+            )
 
             controller.dispose()
+            withTimeout(2_000) { syncJobs.forEach { it.join() } }
+            assertTrue(syncJobs.all { it.isCancelled }, "dispose must cancel every live sync job")
             bossRegistry.replaceWith("after-dispose")
-            delay(100)
-            assertTrue(controller.registry.resolve("tool:boss:after-dispose").isUnavailable)
+            assertTrue(
+                controller.registry.resolve("tool:boss:after-dispose").isUnavailable,
+                "disposed synchronization must not apply later registry updates",
+            )
         } finally {
             controller.dispose()
             sandboxScope.cancel()
