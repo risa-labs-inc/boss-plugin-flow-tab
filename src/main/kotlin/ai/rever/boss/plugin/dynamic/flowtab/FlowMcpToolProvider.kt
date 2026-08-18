@@ -8,7 +8,10 @@ import ai.rever.boss.plugin.api.McpToolResult
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
@@ -80,11 +83,24 @@ class FlowMcpToolProvider(
                 job.error?.let { put("error", it) }
             })
         },
-        def("flow_result", "Get a run's per-node outputs (status/output/error/logs).",
-            schema("""{"runId":{"type":"string"}}""", required = listOf("runId")), readOnly = true) { a ->
-            val runId = a.obj().str("runId") ?: return@def err("flow_result requires 'runId'")
+        def("flow_result", "Get a run's per-node status, errors, and bounded logs. " +
+            "Set includeOutput=true with nodeId to include that node's bounded output.",
+            schema(
+                """{"runId":{"type":"string"},"nodeId":{"type":"string"},"includeOutput":{"type":"boolean"}}""",
+                required = listOf("runId"),
+            ), readOnly = true) { a ->
+            val args = a.obj()
+            val runId = args.str("runId") ?: return@def err("flow_result requires 'runId'")
             val job = controller.runStatus(runId) ?: return@def err("Unknown runId '$runId'")
-            McpToolResult(json.encodeToString(RunJob.serializer(), job), false)
+            val nodeId = args.str("nodeId")
+            val includeOutput = args.bool("includeOutput")
+            if (includeOutput && nodeId == null) {
+                return@def err("flow_result requires 'nodeId' when includeOutput=true")
+            }
+            if (nodeId != null && nodeId !in job.nodes) {
+                return@def err("Unknown nodeId '$nodeId' for run '$runId'")
+            }
+            McpToolResult(json.encodeToString(JsonObject.serializer(), job.toMcpResult(includeOutput, nodeId)), false)
         },
         def("flow_list", "List every stored flow's tabId. Pass detail=true to also return " +
             "flowDetails with names, descriptions, node counts, and readability.",
@@ -179,11 +195,96 @@ class FlowMcpToolProvider(
     companion object {
         const val PROVIDER_ID = "flow-tab"
 
+        private const val RESULT_ERROR_MAX_BYTES = 8 * 1024
+        private const val RESULT_LOG_MAX_LINES = 20
+        private const val RESULT_LOG_LINE_MAX_BYTES = 1024
+        private const val RESULT_OUTPUT_STRING_MAX_BYTES = 4 * 1024
+
         /** Wrap a properties map into a minimal JSON-Schema object string. */
         private fun schema(properties: String, required: List<String> = emptyList()): String {
             val req = if (required.isEmpty()) "" else
                 ""","required":[${required.joinToString(",") { "\"$it\"" }}]"""
             return """{"type":"object","properties":$properties$req}"""
         }
+    }
+
+    private fun RunJob.toMcpResult(includeOutput: Boolean, nodeId: String?): JsonObject {
+        var contentTruncated = false
+        val selectedNodes = if (nodeId == null) nodes else mapOf(nodeId to nodes.getValue(nodeId))
+        val outputOmitted = !includeOutput && selectedNodes.values.any { it.output.isNotEmpty() }
+        val boundedNodes = selectedNodes.mapValues { (_, node) ->
+            val boundedError = node.error?.boundedUtf8(RESULT_ERROR_MAX_BYTES)?.also {
+                contentTruncated = contentTruncated || it.truncated
+            }?.value
+            val boundedLogs = node.logs.take(RESULT_LOG_MAX_LINES).map { line ->
+                line.boundedUtf8(RESULT_LOG_LINE_MAX_BYTES).also {
+                    contentTruncated = contentTruncated || it.truncated
+                }.value
+            }.toMutableList()
+            if (node.logs.size > RESULT_LOG_MAX_LINES) {
+                boundedLogs += "… [${node.logs.size - RESULT_LOG_MAX_LINES} log lines omitted]"
+                contentTruncated = true
+            }
+            val boundedOutput = if (includeOutput) {
+                node.output.map { output ->
+                    output.boundedOutput().also {
+                        contentTruncated = contentTruncated || it.truncated
+                    }.value.jsonObject
+                }
+            } else {
+                emptyList()
+            }
+            node.copy(error = boundedError, logs = boundedLogs, output = boundedOutput)
+        }
+        val boundedJobError = error?.boundedUtf8(RESULT_ERROR_MAX_BYTES)?.also {
+            contentTruncated = contentTruncated || it.truncated
+        }?.value
+        val base = json.encodeToJsonElement(
+            RunJob.serializer(),
+            copy(error = boundedJobError, nodes = boundedNodes),
+        ).jsonObject
+        return buildJsonObject {
+            base.forEach { (key, value) -> put(key, value) }
+            put("outputIncluded", includeOutput)
+            put("outputOmitted", outputOmitted)
+            put("truncated", contentTruncated)
+            nodeId?.let { put("nodeId", it) }
+        }
+    }
+
+    private data class Bounded<T>(val value: T, val truncated: Boolean)
+
+    private fun JsonElement.boundedOutput(): Bounded<JsonElement> = when (this) {
+        is JsonObject -> {
+            var truncated = false
+            val values = mapValues { (_, value) ->
+                value.boundedOutput().also { truncated = truncated || it.truncated }.value
+            }
+            Bounded(JsonObject(values), truncated)
+        }
+        is JsonArray -> {
+            var truncated = false
+            val values = map { value ->
+                value.boundedOutput().also { truncated = truncated || it.truncated }.value
+            }
+            Bounded(JsonArray(values), truncated)
+        }
+        is JsonPrimitive -> if (isString) {
+            content.boundedUtf8(RESULT_OUTPUT_STRING_MAX_BYTES).let {
+                Bounded(JsonPrimitive(it.value), it.truncated)
+            }
+        } else {
+            Bounded(this, false)
+        }
+    }
+
+    private fun String.boundedUtf8(maxBytes: Int): Bounded<String> {
+        val bytes = encodeToByteArray()
+        if (bytes.size <= maxBytes) return Bounded(this, false)
+        var end = maxBytes
+        while (end > 0 && bytes[end].toInt() and 0xC0 == 0x80) end--
+        val omitted = bytes.size - end
+        val prefix = bytes.copyOfRange(0, end).decodeToString()
+        return Bounded("$prefix… [truncated, $omitted bytes omitted]", true)
     }
 }
