@@ -17,6 +17,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -56,6 +57,7 @@ class AgentNodeTest {
             AssistantTurn(text = "final answer"),
         )
         val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
+        assertFalse(spec.usesSession)
         val reg = builtinNodeRegistry().also { it.register(spec) }
 
         val cfg = buildJsonObject {

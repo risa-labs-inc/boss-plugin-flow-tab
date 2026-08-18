@@ -193,6 +193,9 @@ fun agentNodeSpec(
     accent = AgentNode.ACCENT,
     description = "Run an LLM agent: a bounded tool-loop over an allowlist of tools.",
     runMode = RunMode.PER_ITEM,
+    // Must stay false: browser tools acquire the default session's non-reentrant
+    // mutex per call. Holding it around the whole Agent node would deadlock them.
+    usesSession = false,
     hasMetaRow = false,
     configFields = AgentNode.CONFIG_FIELDS,
     executor = AgentNodeExecutor(prompts, providerFor, toolSourceFor),
@@ -233,15 +236,22 @@ fun defaultAgentNodeSpec(
                 },
             )
         },
-        toolSourceFor = { ctx ->
-            val lanes = buildList {
-                context.mcpToolRegistry?.let { add(BossRegistryToolSource(it)) }
-                add(FlowBrowserToolSource(ctx.sessions))
-                external?.let { add(it) }
-            }
-            MergedToolSource(lanes)
-        },
+        toolSourceFor = { ctx -> defaultAgentToolSource(context, external, ctx) },
     )
+}
+
+/** Production Agent tool wiring, kept as a testable seam so default-session binding cannot regress. */
+internal fun defaultAgentToolSource(
+    context: PluginContext,
+    external: ExternalMcpManager?,
+    ctx: RunContext,
+): ToolSource {
+    val lanes = buildList {
+        context.mcpToolRegistry?.let { add(BossRegistryToolSource(it)) }
+        add(FlowBrowserToolSource(ctx.sessions, ctx.defaultSessionId))
+        external?.let { add(it) }
+    }
+    return MergedToolSource(lanes)
 }
 
 /**

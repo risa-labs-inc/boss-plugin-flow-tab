@@ -76,6 +76,25 @@ it must be a red node failure rather than a successful output carrying `stopReas
 partial answer. User-configured step, timeout, and token budgets must be positive whole numbers;
 zero does not mean unlimited.
 
+The agent's browser tool lane is bound to the run's `defaultSessionId`. In that lane,
+`session_id` is optional and omission means the same browser session native Open/Navigate/Click/
+Type/Extract nodes use. An explicit id still wins for multi-session agents. `browser_open` without
+an id opens the reserved default session when needed and reuses it when an upstream node already
+opened it, so it does not replace the page the flow established; explicitly naming that default id
+also reuses it for compatibility with old prompts. Named secondary sessions reuse too; an agent can
+close and reopen one when it needs a fresh page. Secondary sessions are always headless because the
+interactive UI owns only one visible-tab lifecycle slot; allowing another visible session would lose
+track of a Fluck tab. `browser_close` treats the run-owned default as a successful no-op even when
+explicitly named, preventing cleanup retry loops while the run retains ownership of the shared page.
+An agent may close additional sessions it opened under other ids. Close results use a boolean
+`closed` plus `session_id`; `closed: false` means the flow retained its run-owned session.
+A default-constructed `FlowBrowserToolSource` keeps the explicit-session contract and schemas.
+
+This binding is intentionally shared state. If the agent opens the default session, downstream
+native nodes inherit that page and its visibility. A later or parallel native Open Browser can
+replace the page, and the per-session fence serializes individual actions but does not make an
+agent branch atomic with respect to a parallel native branch; their actions may interleave.
+
 `plugin.json` declares `ai.rever.boss.plugin.dynamic.aigateway` as an **optional** dependency.
 Declaring it makes the host's one existing check work - `DynamicPluginManager.checkCanUnload`
 refuses to uninstall a plugin a loaded plugin depends on. Nothing reads `dependencies` at *install*

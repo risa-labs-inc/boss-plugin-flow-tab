@@ -103,6 +103,21 @@ class SessionRegistry(
     }
 
     /**
+     * Open [id] only when it is absent, under the same per-session fence used by
+     * browser actions. Returns true when an existing session was reused. This keeps
+     * a run-bound agent open atomic with native browser nodes on the default session.
+     */
+    suspend fun openIfAbsent(headless: Boolean, id: String, log: (String) -> Unit = {}): Boolean =
+        mutexFor(id).withLock {
+            if (entries.containsKey(id)) {
+                true
+            } else {
+                open(headless, id, log)
+                false
+            }
+        }
+
+    /**
      * Run [action] against the session named [id] while holding that session's fence,
      * so two callers never drive the same page concurrently. Throws [ExecError] if the
      * session isn't open.
