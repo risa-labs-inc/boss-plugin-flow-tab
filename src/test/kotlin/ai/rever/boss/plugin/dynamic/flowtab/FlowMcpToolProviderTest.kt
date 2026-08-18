@@ -18,9 +18,11 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.test.Test
 import kotlin.test.assertContains
@@ -191,6 +193,78 @@ class FlowMcpToolProviderTest {
         assertEquals("SUCCEEDED", state)
         val result = obj(call(p, "flow_result", """{"runId":"$runId"}"""))
         assertTrue(result.getValue("nodes").jsonObject.containsKey(set))
+        assertEquals("false", result.getValue("outputIncluded").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `flow_result omits output by default and bounds explicit node output`() = runBlocking {
+        val largeValue = "🙂".repeat(15_000)
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "LARGE_OUTPUT",
+                    label = "Large Output",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    executor = NodeExecutor { _, _, _, log ->
+                        repeat(25) { index -> log("request-$index:$largeValue") }
+                        NodeOutput.single(
+                            listOf(
+                                Item(
+                                    buildJsonObject {
+                                        put("html", largeValue)
+                                        put("nested", buildJsonObject { put("svg", largeValue) })
+                                    }
+                                )
+                            )
+                        )
+                    },
+                )
+            )
+        }
+        val p = provider(registry = registry)
+        val tabId = obj(call(p, "flow_create")).getValue("tabId").jsonPrimitive.content
+        val nodeId = obj(
+            call(p, "flow_add_node", """{"tabId":"$tabId","kind":"LARGE_OUTPUT"}""")
+        ).getValue("nodeId").jsonPrimitive.content
+        val runId = obj(call(p, "flow_run", """{"tabId":"$tabId"}"""))
+            .getValue("runId").jsonPrimitive.content
+
+        withTimeout(5_000) {
+            while (obj(call(p, "flow_status", """{"runId":"$runId"}"""))
+                    .getValue("state").jsonPrimitive.content == "RUNNING") {
+                delay(10)
+            }
+        }
+
+        val summaryResult = call(p, "flow_result", """{"runId":"$runId"}""")
+        val summary = obj(summaryResult)
+        val summaryNode = summary.getValue("nodes").jsonObject.getValue(nodeId).jsonObject
+        assertTrue(summaryResult.text.encodeToByteArray().size < 30_000)
+        assertEquals("false", summary.getValue("outputIncluded").jsonPrimitive.content)
+        assertEquals("true", summary.getValue("outputOmitted").jsonPrimitive.content)
+        assertEquals(0, summaryNode.getValue("output").jsonArray.size)
+        assertContains(summaryNode.getValue("logs").jsonArray.last().jsonPrimitive.content, "log lines omitted")
+
+        assertTrue(call(p, "flow_result", """{"runId":"$runId","includeOutput":true}""").isError)
+        val detailResult = call(
+            p,
+            "flow_result",
+            """{"runId":"$runId","nodeId":"$nodeId","includeOutput":true}""",
+        )
+        val detail = obj(detailResult)
+        val detailNode = detail.getValue("nodes").jsonObject.getValue(nodeId).jsonObject
+        val output = detailNode.getValue("output").jsonArray.single().jsonObject
+        assertTrue(detailResult.text.encodeToByteArray().size < 40_000)
+        assertEquals("true", detail.getValue("outputIncluded").jsonPrimitive.content)
+        assertEquals("true", detail.getValue("truncated").jsonPrimitive.content)
+        assertContains(output.getValue("html").jsonPrimitive.content, "bytes omitted")
+        assertContains(
+            output.getValue("nested").jsonObject.getValue("svg").jsonPrimitive.content,
+            "bytes omitted",
+        )
     }
 
     @Test

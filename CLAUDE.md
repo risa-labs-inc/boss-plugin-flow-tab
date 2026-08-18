@@ -140,6 +140,10 @@ matching open tab first. The launcher uses the same controller and storage names
 contracts, lets users rename readable flows, and asks for confirmation before deletion. An open
 flow shows its current name in the canvas toolbar with an edit action; that path persists the live
 snapshot immediately, so even a brand-new tab can be named before its debounced autosave runs.
+`flow_result` returns status, errors, and bounded logs by default, with node outputs omitted so
+large HTML/SVG values cannot exhaust the MCP response path. A caller may pass `nodeId` together
+with `includeOutput: true` to fetch that node's recursively bounded output; explicit response flags
+report whether output was omitted or included and whether any content was truncated.
 The launcher/controller and an open tab are independent full-snapshot writers for the same graph
 key. Controller/MCP mutations and open-tab autosave therefore serialize through
 `FlowPersistenceCoordinator`. Controller writes publish revisioned snapshots that an open canvas
