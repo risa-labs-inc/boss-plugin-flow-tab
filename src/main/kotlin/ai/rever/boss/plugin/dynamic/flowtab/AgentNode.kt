@@ -42,7 +42,12 @@ object AgentNode {
         ConfigField(PROMPT_ID_KEY, "Prompt id (optional)", FieldType.TEXT, placeholder = "a saved prompt's id"),
         ConfigField(SYSTEM_KEY, "System prompt (inline)", FieldType.TEXTAREA, placeholder = "You are…"),
         ConfigField(INPUT_KEY, "Input", FieldType.TEXTAREA, placeholder = "task, or {{ \$json.text }}"),
-        ConfigField(ALLOWLIST_KEY, "Tool allowlist", FieldType.JSON, placeholder = """["tool_a","tool_b"]"""),
+        ConfigField(
+            ALLOWLIST_KEY,
+            "Tool allowlist",
+            FieldType.JSON,
+            placeholder = """["tool:boss:docker_ps"] or ["docker_ps"]""",
+        ),
         ConfigField(
             OUTPUT_SCHEMA_KEY,
             "Output JSON Schema (optional)",
@@ -253,7 +258,7 @@ class AgentNodeExecutor(
                 when {
                     raw.isEmpty() -> emptyList()
                     raw.startsWith("[") || raw.startsWith("{") -> {
-                        val parsed = runCatching { Json.parseToJsonElement(raw) }.getOrElse { error ->
+                        val parsed = runCatching { ALLOWLIST_JSON.parseToJsonElement(raw) }.getOrElse { error ->
                             throw ExecError(
                                 "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) must be a valid JSON array: " +
                                     safeAllowlistError(error),
@@ -297,6 +302,7 @@ class AgentNodeExecutor(
 
     private companion object {
         const val MAX_ALLOWLIST_ERROR_DETAIL_CHARS = 240
+        val ALLOWLIST_JSON = Json { isLenient = false }
     }
 }
 

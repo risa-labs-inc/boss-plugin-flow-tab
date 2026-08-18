@@ -162,7 +162,7 @@ class AgentRuntimeTest {
     }
 
     @Test
-    fun `an unmatched allowlist entry fails closed before requesting the model`() = runBlocking {
+    fun `unmatched allowlist entries remain exact and fail as configuration before the model`() = runBlocking {
         val logs = mutableListOf<String>()
         val providerCalls = AtomicInteger()
         val provider = FakeProvider { _, _, _, _ ->
@@ -175,17 +175,20 @@ class AgentRuntimeTest {
                 .run(
                     system = "s",
                     input = "go",
-                    allowlist = setOf("allowed", "missing\nspoofed"),
+                    allowlist = setOf("allowed", "docker ps", "missing\nspoofed"),
                     log = logs::add,
                 )
         }.exceptionOrNull()
 
-        assertTrue(failure is AgentRunFailure)
-        assertTrue(failure.message.orEmpty().contains("unavailable tool(s): missing_spoofed"))
+        assertTrue(failure is AgentConfigurationError)
+        assertEquals(
+            "Agent tool allowlist contains 2 unavailable entries: 'docker ps', 'missing\\nspoofed'",
+            failure.message,
+        )
         assertEquals(0, providerCalls.get())
         assertEquals("agent tools resolved: 1 (allowed)", logs.first())
         assertTrue(logs.none { '\n' in it })
-        assertEquals("agent stopped: FAILED (0 completed step(s), 0 attempted tool call(s))", logs.last())
+        assertEquals("agent configuration failed", logs.last())
     }
 
     // ---- bounds -------------------------------------------------------------

@@ -156,6 +156,32 @@ class AgentNodeTest {
     }
 
     @Test
+    fun `unavailable allowlist entry becomes a plain node configuration error`() {
+        val providerCalls = AtomicInteger()
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls.incrementAndGet()
+            AssistantTurn(text = "must not run")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(listOf("lookup")) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.ALLOWLIST_KEY, """["missing"]""")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertEquals("Agent tool allowlist contains 1 unavailable entry: 'missing'", state.error)
+        assertEquals(0, providerCalls.get())
+        assertEquals("agent configuration failed", state.logs.last())
+    }
+
+    @Test
     fun `structured mode advertises the schema tool and emits only its validated object`() {
         val source = RecordingSource(listOf("lookup"))
         var seenSystem = ""
@@ -333,6 +359,40 @@ class AgentNodeTest {
         assertEquals(RunStatus.SUCCESS, notAllowlisted.status)
         assertEquals(1, providerCalls.get())
         assertTrue(source.invoked.isEmpty())
+    }
+
+    @Test
+    fun `reserved output tool is rejected as redundant when no real tool shadows it`() {
+        val providerCalls = AtomicInteger()
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls.incrementAndGet()
+            AssistantTurn(text = "must not run")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.OUTPUT_SCHEMA_KEY, """{"type":"object"}""")
+            put(
+                AgentNode.ALLOWLIST_KEY,
+                buildJsonArray { add(JsonPrimitive(AgentStructuredOutput.TOOL_NAME)) },
+            )
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertEquals(
+            "Agent output tool 'flow_submit_output' is added automatically when outputSchema is set; " +
+                "remove it from toolAllowlist",
+            state.error,
+        )
+        assertEquals(0, providerCalls.get())
+        assertEquals("agent configuration failed", state.logs.last())
     }
 
     @Test
