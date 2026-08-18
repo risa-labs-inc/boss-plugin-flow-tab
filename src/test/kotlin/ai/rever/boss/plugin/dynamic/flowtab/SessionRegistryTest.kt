@@ -403,7 +403,12 @@ class SessionRegistryTest {
         assertEquals(2, svc.pages.size)
         assertEquals(listOf("https://extra.example", "https://extra-reused.example"), svc.pages[1].navigated)
 
-        assertFalse(src.invoke("browser_close", """{"session_id":"agent-extra"}""").isError)
+        val closedExtra = src.invoke("browser_close", """{"session_id":"agent-extra"}""")
+        assertFalse(closedExtra.isError)
+        assertEquals(
+            true,
+            JSON.parseToJsonElement(closedExtra.text).jsonObject["closed"]!!.jsonPrimitive.booleanOrNull,
+        )
         assertTrue(svc.pages[1].disposed)
 
         val omittedClose = src.invoke("browser_close", "{}")
@@ -509,6 +514,19 @@ class SessionRegistryTest {
     }
 
     @Test
+    fun `unbound browser_open honors an explicit session id`() = runBlocking {
+        val (reg, _) = registry()
+        val result = FlowBrowserToolSource(reg)
+            .invoke("browser_open", """{"session_id":"mine","headless":true}""")
+
+        assertFalse(result.isError)
+        val json = JSON.parseToJsonElement(result.text).jsonObject
+        assertEquals("mine", json["session_id"]!!.jsonPrimitive.content)
+        assertEquals(true, json["closable"]!!.jsonPrimitive.booleanOrNull)
+        assertNotNull(reg.get("mine"))
+    }
+
+    @Test
     fun `browser tools drive the session named by session_id`() = runBlocking {
         val (reg, svc) = registry { FakePage(responder = { script ->
             if (script.contains("JSON.stringify")) """{"ok":true,"value":"Hello"}""" else true
@@ -552,6 +570,9 @@ class SessionRegistryTest {
         assertNotNull(reg.get(id))
         val res = src.invoke("browser_close", """{"session_id":"$id"}""")
         assertTrue(!res.isError)
+        val json = JSON.parseToJsonElement(res.text).jsonObject
+        assertEquals(true, json["closed"]!!.jsonPrimitive.booleanOrNull)
+        assertEquals(id, json["session_id"]!!.jsonPrimitive.content)
         assertNull(reg.get(id))
     }
 }

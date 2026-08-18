@@ -61,7 +61,14 @@ class FlowBrowserToolSource(
         val requested = args.str("session_id")
         val boundDefault = defaultSessionId
         val (id, reused) = when {
-            boundDefault == null -> sessions.open(args.bool("headless")) to false
+            boundDefault == null -> {
+                val opened = if (requested.isBlank()) {
+                    sessions.open(args.bool("headless"))
+                } else {
+                    sessions.open(args.bool("headless"), requested)
+                }
+                opened to false
+            }
             else -> {
                 val target = requested.ifBlank { boundDefault }
                 target to sessions.openIfAbsent(args.bool("headless"), target)
@@ -142,7 +149,10 @@ class FlowBrowserToolSource(
             })
         }
         sessions.close(id)
-        return ok(buildJsonObject { put("closed", id) })
+        return ok(buildJsonObject {
+            put("closed", true)
+            put("session_id", id)
+        })
     }
 
     // ---- helpers ------------------------------------------------------------
@@ -210,7 +220,7 @@ class FlowBrowserToolSource(
             } else {
                 "Open or reuse a browser session (headless or visible) and optionally navigate; " +
                     "returns its session_id, whether it was reused, and whether it is closable. " +
-                    "Reuse keeps the existing visibility."
+                    "Reuse keeps the existing visibility; close a named secondary session first for a fresh page."
             }
             val closeDescription = if (sessionRequired) {
                 "Close an explicitly named open browser session."
