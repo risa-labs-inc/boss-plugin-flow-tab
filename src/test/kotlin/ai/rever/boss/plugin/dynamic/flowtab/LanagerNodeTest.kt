@@ -11,6 +11,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -18,6 +19,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -31,6 +33,11 @@ import kotlin.test.assertTrue
 class LanagerNodeTest {
 
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    @AfterTest
+    fun tearDown() {
+        scope.cancel()
+    }
 
     private fun context(storage: PluginStorageProvider): PluginContext = object : PluginContext {
         override val panelRegistry = PanelRegistry()
@@ -81,6 +88,8 @@ class LanagerNodeTest {
         assertEquals(RunStatus.SUCCESS, lanagerOut.status)
         // The lanager node reports the sub-run it launched.
         assertEquals(child, lanagerOut.output.single()["subFlow"]!!.jsonPrimitive.content)
+        val childRunId = lanagerOut.output.single()["runId"]!!.jsonPrimitive.content
+        assertEquals(RunJobState.SUCCEEDED, fc.runStatus(childRunId)!!.state)
     }
 
     @Test
@@ -121,6 +130,7 @@ class LanagerNodeTest {
 
         val parentRunId = fc.startRun(parent)
         withTimeout(5_000) { childEntered.await() }
+        // TestStorage exposes logical run: keys; child persistence precedes childEntered.
         val childRunId = storage.map.keys
             .single { it.startsWith(FlowController.RUN_PREFIX) && it != "${FlowController.RUN_PREFIX}$parentRunId" }
             .removePrefix(FlowController.RUN_PREFIX)

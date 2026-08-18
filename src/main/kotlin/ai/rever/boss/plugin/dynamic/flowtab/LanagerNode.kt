@@ -29,6 +29,8 @@ object LanagerNode {
  *
  * It then polls the sub-run to a terminal state; a failed sub-run fails this node (its
  * error propagates), a succeeded one emits a small descriptor [Item] pointing at the run.
+ * The sub-run's lifetime is bound to this node: cancellation or timeout explicitly stops
+ * it, and nested lanagers cascade that stop to their own children.
  */
 class LanagerNodeExecutor(
     private val controller: FlowController,
@@ -54,6 +56,8 @@ class LanagerNodeExecutor(
         } finally {
             // startRun launches on the controller scope, not as a child of this node.
             // Explicitly stop an active sub-run when the parent is cancelled or times out.
+            // stopRun publishes FAILED and requests cancellation without joining: teardown stays bounded,
+            // while the child's session cleanup may briefly overlap a subsequent run.
             withContext(NonCancellable) { controller.stopRun(runId) }
         }
 
