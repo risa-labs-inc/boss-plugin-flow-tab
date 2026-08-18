@@ -1,17 +1,26 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.McpToolProvider
+import ai.rever.boss.plugin.api.McpToolRegistry
+import ai.rever.boss.plugin.api.McpToolResult
 import ai.rever.boss.plugin.api.PanelRegistry
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.PluginStorageFactory
 import ai.rever.boss.plugin.api.PluginStorageProvider
+import ai.rever.boss.plugin.api.RegisteredMcpTool
 import ai.rever.boss.plugin.api.TabRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -51,7 +60,11 @@ class FlowTabDynamicPluginTest {
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     /** Captures MCP provider register/unregister so we can assert the wiring. */
-    private class CapturingContext(scope: CoroutineScope, storage: PluginStorageProvider) : PluginContext {
+    private class CapturingContext(
+        scope: CoroutineScope,
+        storage: PluginStorageProvider,
+        override val mcpToolRegistry: McpToolRegistry? = null,
+    ) : PluginContext {
         override val panelRegistry = PanelRegistry()
         override val tabRegistry = TabRegistry()
         override val pluginScope = scope
@@ -62,6 +75,20 @@ class FlowTabDynamicPluginTest {
         val unregistered = mutableListOf<String>()
         override fun registerMcpToolProvider(provider: McpToolProvider) { registered += provider }
         override fun unregisterMcpToolProvider(providerId: String) { unregistered += providerId }
+    }
+
+    private class TrackingRegistry : McpToolRegistry {
+        private val delegate = MutableStateFlow(emptyList<RegisteredMcpTool>())
+        val collectorStarts = AtomicInteger()
+        val activeCollectors: Int get() = delegate.subscriptionCount.value
+        override val tools: StateFlow<List<RegisteredMcpTool>> get() {
+            collectorStarts.incrementAndGet()
+            return delegate
+        }
+        override val allTools: StateFlow<List<RegisteredMcpTool>> get() = delegate
+        override val disabledToolNames: StateFlow<Set<String>> = MutableStateFlow(emptySet())
+        override fun setToolEnabled(toolName: String, enabled: Boolean) {}
+        override suspend fun invoke(toolName: String, arguments: String): McpToolResult = McpToolResult("ok", false)
     }
 
     @Test
@@ -84,5 +111,36 @@ class FlowTabDynamicPluginTest {
 
         plugin.dispose()
         assertTrue(FlowMcpToolProvider.PROVIDER_ID in ctx.unregistered, "dispose() must unregister by providerId")
+    }
+
+    @Test
+    fun `register twice disposes the previous headless registry collector`() {
+        val registry = TrackingRegistry()
+        val ctx = CapturingContext(scope, FakeStorage(), registry)
+        val plugin = FlowTabDynamicPlugin()
+
+        try {
+            plugin.register(ctx)
+            runBlocking {
+                withTimeout(2_000) {
+                    while (registry.collectorStarts.get() < 1 || registry.activeCollectors != 1) delay(10)
+                }
+            }
+
+            plugin.register(ctx)
+            runBlocking {
+                withTimeout(2_000) {
+                    while (registry.collectorStarts.get() < 2 || registry.activeCollectors != 1) delay(10)
+                }
+            }
+            assertEquals(2, registry.collectorStarts.get(), "each registration should start one headless collector")
+        } finally {
+            plugin.dispose()
+            runBlocking {
+                withTimeout(2_000) {
+                    while (registry.activeCollectors != 0) delay(10)
+                }
+            }
+        }
     }
 }

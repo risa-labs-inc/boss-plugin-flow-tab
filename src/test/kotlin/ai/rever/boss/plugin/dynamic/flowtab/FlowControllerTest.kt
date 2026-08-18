@@ -1064,6 +1064,19 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `tool sync startup after controller disposal fails explicitly`() {
+        val storage = DesktopStorage()
+        val ctx = contextWithBossTool(storage, FakeBossRegistry("demo"))
+        val controller = FlowController(ctx)
+        controller.dispose()
+
+        val failure = assertFailsWith<IllegalStateException> {
+            controller.startToolRegistrySync(external = null)
+        }
+        assertContains(failure.message.orEmpty(), "after controller disposal")
+    }
+
+    @Test
     fun `headless tool sync survives sandbox scope replacement and stops on dispose`() = runBlocking {
         val storage = DesktopStorage()
         val bossRegistry = FakeBossRegistry("before-restart")

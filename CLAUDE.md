@@ -158,9 +158,6 @@ api symbol came back "unresolved reference" with no hint the filename was stale.
 
 ## Essential Commands
 
-Headless registry synchronization is owned by `FlowController`, not `PluginContext.pluginScope`.
-Every `buildHeadlessController` caller must call `dispose()`; its optional scope controls runs only.
-
 ```bash
 ./gradlew buildPluginJar    # Build plugin JAR (output: build/libs/)
 ./gradlew deployPlugin       # Build + copy JAR to ~/.boss/plugins/
@@ -205,6 +202,11 @@ build.gradle.kts   → Build config + version (single source of truth)
 - UI: `TabComponentWithUI` with `@Composable Content()`.
 - Persistence: graph JSON saved per-tab via `context.pluginStorageFactory`.
 - Null-safe provider access: providers may be null, UI must handle gracefully.
+
+Headless registry synchronization is owned by `FlowController`, not `PluginContext.pluginScope`.
+Every `buildHeadlessController` caller must call `dispose()`; its optional scope controls runs only.
+Visible tabs deliberately synchronize tools on their tab scope instead because their lifetime ends
+with `FlowTabComponent`.
 
 ### Plugin storage JSON keys
 

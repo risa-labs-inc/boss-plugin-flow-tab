@@ -144,13 +144,17 @@ fun toolNodeSpec(desc: ToolDescriptor, source: ToolSource): NodeSpec = NodeSpec(
 class ToolNodeSync(
     private val source: ToolSource,
     private val registry: NodeRegistry,
+    private val buildSpec: (ToolDescriptor) -> NodeSpec = { toolNodeSpec(it, source) },
 ) {
     private var current: Set<String> = emptySet()
 
     fun apply(descriptors: List<ToolDescriptor>) {
-        val next = descriptors.map { it.ref.kindId }.toSet()
+        // Prepare every spec before mutating the registry. If one descriptor is bad,
+        // current and the registry stay aligned for the next update.
+        val specs = descriptors.map(buildSpec)
+        val next = specs.map { it.id }.toSet()
         (current - next).forEach { registry.unregister(it) }
-        descriptors.forEach { registry.register(toolNodeSpec(it, source)) }
+        specs.forEach(registry::register)
         current = next
     }
 }
@@ -174,13 +178,24 @@ fun syncBossTools(context: PluginContext, registry: NodeRegistry, scope: Corouti
 internal suspend fun collectBossToolUpdates(
     updates: Flow<List<RegisteredMcpTool>>,
     apply: (List<ToolDescriptor>) -> Unit,
+    convert: (RegisteredMcpTool) -> ToolDescriptor = { it.toDescriptor() },
     reportFailure: (Exception) -> Unit = { failure ->
-        println("[flow-tab] failed to synchronize host tools: ${failure.message}")
+        println("[flow-tab] failed to synchronize host tools: ${toolSyncFailureMessage(failure)}")
     },
 ) {
     updates.collect { tools ->
+        val descriptors = tools.mapNotNull { tool ->
+            try {
+                convert(tool)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                reportFailure(failure)
+                null
+            }
+        }
         try {
-            apply(tools.map { it.toDescriptor() })
+            apply(descriptors)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
@@ -188,3 +203,11 @@ internal suspend fun collectBossToolUpdates(
         }
     }
 }
+
+internal const val MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH = 200
+
+internal fun toolSyncFailureMessage(failure: Exception): String =
+    (failure.message ?: "unknown error")
+        .take(MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH)
+        .replace('\n', ' ')
+        .replace('\r', ' ')

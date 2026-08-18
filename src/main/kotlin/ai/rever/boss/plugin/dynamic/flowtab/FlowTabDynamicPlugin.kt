@@ -37,6 +37,10 @@ class FlowTabDynamicPlugin : DynamicPlugin {
     private var headlessController: FlowController? = null
 
     override fun register(context: PluginContext) {
+        // Some hosts may re-register after replacing pluginScope without first calling
+        // dispose(). Reap the old controller-owned collector before losing its reference.
+        headlessController?.dispose()
+        headlessController = null
         pluginContext = context
 
         // Bring up the shared external-MCP manager (does not connect anything until the

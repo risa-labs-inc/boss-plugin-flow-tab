@@ -11,6 +11,7 @@ import ai.rever.boss.plugin.api.RegisteredMcpTool
 import ai.rever.boss.plugin.api.TabRegistry
 import androidx.compose.ui.geometry.Offset
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +31,8 @@ import kotlinx.serialization.json.put
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -210,38 +213,95 @@ class ToolNodeTest {
     }
 
     @Test
+    fun `sync prepares every spec before mutating registry state`() {
+        val fake = FakeRegistry(emptyList()) { _, _ -> McpToolResult("", false) }
+        val source = BossRegistryToolSource(fake)
+        val registry = builtinNodeRegistry()
+        var rejectBad = false
+        val sync = ToolNodeSync(source, registry) { descriptor ->
+            if (rejectBad && descriptor.name == "bad") error("bad spec")
+            toolNodeSpec(descriptor, source)
+        }
+        fun descriptor(name: String) = ToolDescriptor(ToolRef(ToolScope.BOSS, name), name, "", "{}")
+
+        sync.apply(listOf(descriptor("before")))
+        rejectBad = true
+        assertFailsWith<IllegalStateException> {
+            sync.apply(listOf(descriptor("partially-built"), descriptor("bad")))
+        }
+
+        assertNotNull(registry["tool:boss:before"], "failed preparation must preserve the previous registry")
+        assertNull(registry["tool:boss:partially-built"], "prepared specs must not register before all succeed")
+        assertNull(registry["tool:boss:bad"])
+
+        rejectBad = false
+        sync.apply(listOf(descriptor("after")))
+        assertNull(registry["tool:boss:before"], "the next successful diff must use the previous current set")
+        assertNotNull(registry["tool:boss:after"])
+    }
+
+    @Test
     fun `syncBossTools degrades to null when the host has no registry`() {
         val job = syncBossTools(minimalContext(null), builtinNodeRegistry(), CoroutineScope(Dispatchers.Default))
         assertNull(job)
     }
 
     @Test
-    fun `boss tool collector continues after one update fails`() = runBlocking {
+    fun `boss tool collector skips one malformed descriptor and applies healthy peers`() = runBlocking {
         val updates = MutableSharedFlow<List<RegisteredMcpTool>>()
         val failures = mutableListOf<Exception>()
         val applied = CompletableDeferred<List<ToolDescriptor>>()
-        var attempts = 0
         val job = launch(start = CoroutineStart.UNDISPATCHED) {
             collectBossToolUpdates(
                 updates = updates,
-                apply = { descriptors ->
-                    attempts++
-                    if (attempts == 1) error("bad tool update")
-                    applied.complete(descriptors)
+                apply = { applied.complete(it) },
+                convert = { registered ->
+                    if (registered.definition.name == "broken") error("bad descriptor")
+                    registered.toDescriptor()
                 },
                 reportFailure = failures::add,
             )
         }
 
         try {
-            updates.emit(listOf(tool("broken", "{}")))
-            updates.emit(listOf(tool("healthy", "{}")))
+            updates.emit(listOf(tool("broken", "{}"), tool("healthy", "{}")))
 
             assertEquals("healthy", withTimeout(2_000) { applied.await() }.single().name)
-            assertEquals(listOf("bad tool update"), failures.map { it.message })
+            assertEquals(listOf("bad descriptor"), failures.map { it.message })
             assertTrue(job.isActive, "one rejected update must not terminate the collector")
         } finally {
             job.cancelAndJoin()
         }
+    }
+
+    @Test
+    fun `boss tool descriptor conversion preserves cancellation`() = runBlocking {
+        val updates = MutableSharedFlow<List<RegisteredMcpTool>>()
+        val failures = mutableListOf<Exception>()
+        var applied = false
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            collectBossToolUpdates(
+                updates = updates,
+                apply = { applied = true },
+                convert = { throw CancellationException("cancel conversion") },
+                reportFailure = failures::add,
+            )
+        }
+
+        updates.emit(listOf(tool("cancelled", "{}")))
+        withTimeout(2_000) { job.join() }
+
+        assertTrue(job.isCancelled, "conversion cancellation must terminate the collector")
+        assertFalse(applied, "a cancelled batch must not reach registry application")
+        assertTrue(failures.isEmpty(), "cancellation must not be logged as a malformed tool")
+    }
+
+    @Test
+    fun `tool sync failure messages are single line and bounded`() {
+        val message = toolSyncFailureMessage(IllegalStateException("x".repeat(250) + "\nsecret"))
+
+        assertEquals(MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH, message.length)
+        assertFalse('\n' in message)
+        assertFalse("secret" in message)
     }
 }

@@ -86,6 +86,7 @@ class FlowController(
     private val lifecycleScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val toolSyncLock = Any()
     private var toolSyncJobs: List<Job>? = null
+    private var disposed = false
 
     /**
      * Keep the headless registry synchronized for this controller's whole lifetime.
@@ -96,6 +97,7 @@ class FlowController(
      */
     internal fun startToolRegistrySync(external: ExternalMcpManager?): List<Job> {
         return synchronized(toolSyncLock) {
+            check(!disposed) { "Cannot start tool registry synchronization after controller disposal" }
             toolSyncJobs?.let { return@synchronized it }
             val started = mutableListOf<Job>()
             try {
@@ -500,6 +502,15 @@ class FlowController(
 
     /** Release controller-owned registry sync and run monitors on tab/plugin teardown. */
     fun dispose() {
+        val shouldDispose = synchronized(toolSyncLock) {
+            if (disposed) {
+                false
+            } else {
+                disposed = true
+                true
+            }
+        }
+        if (!shouldDispose) return
         executions.values.forEach { it.cancel(CancellationException("Flow controller disposed")) }
         lifecycleScope.cancel()
     }
