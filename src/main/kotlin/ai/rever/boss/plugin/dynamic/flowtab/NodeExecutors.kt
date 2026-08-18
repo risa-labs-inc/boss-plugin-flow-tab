@@ -131,17 +131,24 @@ class RunContext(
 /**
  * Resolves `{{ $secret.name }}` references without passing them through
  * [ExpressionEval], whose deliberately small expression language treats unknown
- * roots as empty strings. A resolver instance lives for one HTTP execution, so a
- * repeated name is fetched once and discarded with that request.
+ * roots as empty strings. A resolver instance lives for one node execution, so a
+ * repeated name is fetched once and discarded when that node finishes.
  */
 internal class SecretTemplateResolver(private val secrets: SecretResolver) {
     private val values = mutableMapOf<String, String>()
 
-    suspend fun resolve(template: String, interpolate: (String) -> String): String {
+    suspend fun resolve(template: String, interpolate: (String) -> String): String =
+        resolve(template, transformSecret = { it }, interpolate = interpolate)
+
+    suspend fun resolve(
+        template: String,
+        transformSecret: (String) -> String,
+        interpolate: (String) -> String,
+    ): String {
         val malformed = SECRET_EXPRESSION.findAll(template)
             .firstOrNull { SECRET_REFERENCE.matchEntire(it.value) == null }
         if (malformed != null) {
-            throw ExecError("HTTP secret reference is invalid — use {{ \$secret.name }}")
+            throw ExecError("Secret reference is invalid — use {{ \$secret.name }}")
         }
 
         val out = StringBuilder(template.length)
@@ -150,9 +157,9 @@ internal class SecretTemplateResolver(private val secrets: SecretResolver) {
             out.append(interpolate(template.substring(cursor, match.range.first)))
             val name = match.groupValues[1]
             val value = values[name] ?: runCatching { secrets.get(name) }.getOrNull()
-                ?: throw ExecError("HTTP secret '$name' was not found")
+                ?: throw ExecError("Secret '$name' was not found")
             values[name] = value
-            out.append(value)
+            out.append(transformSecret(value))
             cursor = match.range.last + 1
         }
         out.append(interpolate(template.substring(cursor)))
@@ -275,7 +282,7 @@ object NodeCatalog {
         NodeType.TYPE -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
             val type = cfg.str("selectorType", "css")
-            val text = cfg.str("text")
+            val text = SecretTemplateResolver(ctx.secrets).resolve(cfg.raw("text"), cfg::interpolate)
             val session = ctx.requireSession()
             if (!session.awaitElement(type, sel)) throw ExecError("Type: no element matched '$sel'")
             val ok = session.executeJavaScript(BrowserScripts.inputScript(type, sel, text)) == true
@@ -317,7 +324,11 @@ object NodeCatalog {
         }
 
         NodeType.INJECT -> NodeExecutor { ctx, cfg, inputs, log ->
-            val script = cfg.str("script")
+            val script = SecretTemplateResolver(ctx.secrets).resolve(
+                cfg.raw("script"),
+                BrowserScripts::escapeSingleQuotedContent,
+                cfg::interpolate,
+            )
             if (script.isBlank()) throw ExecError("Inject needs a script")
             ctx.requireSession().executeJavaScript(script)
             log("Ran injected script")
