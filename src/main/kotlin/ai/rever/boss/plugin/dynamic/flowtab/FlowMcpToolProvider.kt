@@ -47,6 +47,19 @@ class FlowMcpToolProvider(
             val meta = o.metaOrNull()
             ok(buildJsonObject { put("tabId", controller.createFlow(meta)) })
         },
+        def("flow_rename", "Rename a flow without rebuilding it. Returns {ok,tabId,name}.",
+            schema("""{"tabId":{"type":"string"},"name":{"type":"string"}}""",
+                required = listOf("tabId", "name")), readOnly = false) { a ->
+            val o = a.obj()
+            val tabId = o.str("tabId") ?: return@def err("flow_rename requires 'tabId'")
+            val name = o.str("name") ?: return@def err("flow_rename requires 'name'")
+            val renamed = controller.renameFlow(tabId, name)
+            ok(buildJsonObject {
+                put("ok", true)
+                put("tabId", renamed.tabId)
+                put("name", renamed.name)
+            })
+        },
         def("flow_add_node", "Add a node of the given kind-id to a flow. Returns {nodeId}. " +
             "config is an object of the node's config fields.",
             schema("""{"tabId":{"type":"string"},"kind":{"type":"string"},"config":{"type":"object"}}""",
@@ -56,6 +69,29 @@ class FlowMcpToolProvider(
             val kind = o.str("kind") ?: return@def err("flow_add_node requires 'kind'")
             val config = o["config"] as? JsonObject ?: JsonObject(emptyMap())
             ok(buildJsonObject { put("nodeId", controller.addNode(tabId, kind, config)) })
+        },
+        def("flow_update_node", "Patch a node's title and/or config. Config keys are merged over " +
+            "the existing config. Returns {ok,nodeId,title}.",
+            schema("""{"tabId":{"type":"string"},"nodeId":{"type":"string"},"title":{"type":"string"},"config":{"type":"object"}}""",
+                required = listOf("tabId", "nodeId")), readOnly = false) { a ->
+            val o = a.obj()
+            val tabId = o.str("tabId") ?: return@def err("flow_update_node requires 'tabId'")
+            val nodeId = o.str("nodeId") ?: return@def err("flow_update_node requires 'nodeId'")
+            val title = o.str("title")
+            val config = when (val raw = o["config"]) {
+                null -> null
+                is JsonObject -> raw
+                else -> return@def err("flow_update_node requires 'config' to be an object")
+            }
+            if (title == null && config == null) {
+                return@def err("flow_update_node requires 'title' and/or 'config'")
+            }
+            val updated = controller.updateNode(tabId, nodeId, title, config)
+            ok(buildJsonObject {
+                put("ok", true)
+                put("nodeId", updated.id)
+                put("title", updated.title)
+            })
         },
         def("flow_connect", "Connect an output port of one node to an input port of another. " +
             "Ports default to 0. Returns {edgeId}.",
@@ -68,11 +104,48 @@ class FlowMcpToolProvider(
             val edgeId = controller.connect(tabId, from, o.int("fromPort"), to, o.int("toPort"))
             ok(buildJsonObject { put("ok", true); put("edgeId", edgeId) })
         },
+        def("flow_delete_node", "Delete a node and all edges connected to it. " +
+            "Returns {ok,nodeId,deletedEdgeCount}.",
+            schema("""{"tabId":{"type":"string"},"nodeId":{"type":"string"}}""",
+                required = listOf("tabId", "nodeId")), readOnly = false) { a ->
+            val o = a.obj()
+            val tabId = o.str("tabId") ?: return@def err("flow_delete_node requires 'tabId'")
+            val nodeId = o.str("nodeId") ?: return@def err("flow_delete_node requires 'nodeId'")
+            val deletedEdgeCount = controller.deleteNode(tabId, nodeId)
+            ok(buildJsonObject {
+                put("ok", true)
+                put("nodeId", nodeId)
+                put("deletedEdgeCount", deletedEdgeCount)
+            })
+        },
+        def("flow_delete_edge", "Delete one connection by edgeId. Returns {ok,edgeId}.",
+            schema("""{"tabId":{"type":"string"},"edgeId":{"type":"string"}}""",
+                required = listOf("tabId", "edgeId")), readOnly = false) { a ->
+            val o = a.obj()
+            val tabId = o.str("tabId") ?: return@def err("flow_delete_edge requires 'tabId'")
+            val edgeId = o.str("edgeId") ?: return@def err("flow_delete_edge requires 'edgeId'")
+            controller.deleteEdge(tabId, edgeId)
+            ok(buildJsonObject { put("ok", true); put("edgeId", edgeId) })
+        },
         def("flow_run", "Start a flow running asynchronously. Returns {runId}; poll flow_status/flow_result.",
             schema("""{"tabId":{"type":"string"}}""", required = listOf("tabId")), readOnly = false) { a ->
             val tabId = a.obj().str("tabId") ?: return@def err("flow_run requires 'tabId'")
             if (controller.getFlow(tabId) == null) return@def err("No flow '$tabId'")
             ok(buildJsonObject { put("runId", controller.startRun(tabId)) })
+        },
+        def("flow_stop", "Stop a running flow by runId. Idempotently reports an already-terminal run.",
+            schema("""{"runId":{"type":"string"}}""", required = listOf("runId")), readOnly = false) { a ->
+            val runId = a.obj().str("runId") ?: return@def err("flow_stop requires 'runId'")
+            val before = controller.runStatus(runId) ?: return@def err("Unknown runId '$runId'")
+            val stopped = if (before.isTerminal) null else controller.stopRun(runId)
+            val final = stopped ?: controller.runStatus(runId) ?: before
+            ok(buildJsonObject {
+                put("ok", true)
+                put("runId", runId)
+                put("stopped", stopped != null)
+                put("state", final.state.name)
+                final.error?.let { put("error", it) }
+            })
         },
         def("flow_status", "Get a run's state: RUNNING | SUCCEEDED | FAILED (+ error).",
             schema("""{"runId":{"type":"string"}}""", required = listOf("runId")), readOnly = true) { a ->
