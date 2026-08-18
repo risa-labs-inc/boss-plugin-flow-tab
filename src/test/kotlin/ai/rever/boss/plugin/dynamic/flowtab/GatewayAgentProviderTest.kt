@@ -76,7 +76,7 @@ class GatewayAgentProviderTest {
             assertTrue(turn.toolCalls.isEmpty())
             assertNull(gateway.steps.single().first.temperature)
             assertEquals(
-                GatewayAgentProvider.DEFAULT_REQUEST_TIMEOUT_MS,
+                AiRequest().timeoutMs,
                 gateway.steps.single().first.timeoutMs,
             )
         }
@@ -97,6 +97,7 @@ class GatewayAgentProviderTest {
             assertEquals(0.25f, request.temperature)
             assertEquals(12_345L, request.timeoutMs)
             assertEquals(GatewayAgentProvider.DEFAULT_MAX_TOKENS, request.maxTokens)
+            assertTrue(request.extras.keys.none { it.equals(AgentNode.MODEL_KEY, ignoreCase = true) })
         }
 
     @Test

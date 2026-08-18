@@ -10,8 +10,8 @@ import kotlinx.serialization.json.put
 /**
  * Config keys + constants for the `agent` node. Per red-team F6, an agent's entire
  * configuration lives inside `node.config` (no sidecar map): the prompt (inline or a
- * [PromptRegistry] id), the tool allowlist, optional sampling temperature, and the run budget. `__`-free
- * keys so they render as ordinary inspector fields.
+ * [PromptRegistry] id), the tool allowlist, optional sampling temperature, and the
+ * run budget. `__`-free keys so they render as ordinary inspector fields.
  */
 object AgentNode {
     const val KIND = "agent"
@@ -28,6 +28,9 @@ object AgentNode {
 
     const val ACCENT = 0xFF6D4AFF
 
+    /** Leaves one minute for the flow controller to persist and report a timed-out node. */
+    const val MAX_TIMEOUT_MS = 14 * 60 * 1_000L
+
     val CONFIG_FIELDS: List<ConfigField> = listOf(
         ConfigField(PROMPT_ID_KEY, "Prompt id (optional)", FieldType.TEXT, placeholder = "a saved prompt's id"),
         ConfigField(SYSTEM_KEY, "System prompt (inline)", FieldType.TEXTAREA, placeholder = "You are…"),
@@ -37,13 +40,14 @@ object AgentNode {
             MODEL_KEY,
             "Model",
             FieldType.INFO,
-            placeholder = "Uses the active model selected in Settings → AI Providers.",
+            note = "Uses the active model selected in Settings → AI Providers. " +
+                "Any legacy model value in JSON is retained for compatibility and ignored.",
         ),
         ConfigField(
             TEMPERATURE_KEY,
             "Temperature (optional)",
             FieldType.NUMBER,
-            placeholder = "blank = omit; for example 0.2",
+            placeholder = "blank = use provider setting; ranges vary by provider (for example 0.2)",
         ),
         ConfigField(MAX_STEPS_KEY, "Max steps", FieldType.NUMBER, default = "8"),
         ConfigField(
@@ -51,7 +55,7 @@ object AgentNode {
             "Timeout (ms)",
             FieldType.NUMBER,
             default = "120000",
-            placeholder = "blank = 120000; must be greater than 0",
+            placeholder = "blank = 120000; capped at 840000 (14 minutes)",
         ),
         ConfigField(
             MAX_TOKENS_KEY,
@@ -134,6 +138,7 @@ class AgentNodeExecutor(
         val input = inlineInput.ifBlank { inputs.firstOrNull()?.json?.toString() ?: "" }
         val maxSteps = cfg.positiveInt(AgentNode.MAX_STEPS_KEY, 8, "Agent max steps")
         val timeoutMs = cfg.positiveLong(AgentNode.TIMEOUT_KEY, 120_000, "Agent timeout")
+            .coerceAtMost(AgentNode.MAX_TIMEOUT_MS)
         val maxTokens = cfg.positiveInt(AgentNode.MAX_TOKENS_KEY, Int.MAX_VALUE, "Agent max tokens")
         return AgentSettings(
             promptId = cfg.str(AgentNode.PROMPT_ID_KEY).ifBlank { null },
@@ -243,6 +248,9 @@ fun defaultAgentNodeSpec(
                     Unit
                 },
                 temperature = settings.temperature,
+                // AgentRuntime applies the decreasing remaining whole-run budget to each
+                // turn. Forwarding the capped budget relaxes the gateway's shorter default;
+                // the runtime remains the authoritative timeout and fires first.
                 requestTimeoutMs = settings.budget.timeoutMs,
             )
         },

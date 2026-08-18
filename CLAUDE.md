@@ -53,9 +53,11 @@ Model selection belongs to Settings → AI Providers because `AiGatewayAPI` expo
 not a per-request override. The Parameters tab therefore renders a non-editable explanation rather
 than the old editable `claude-sonnet-5` value that never affected execution. The legacy `model` key
 remains untouched in raw saved JSON for compatibility but is not parsed or sent. Optional Agent
-temperature is a real request parameter: blank sends `null` so AI Gateway v1.1.2+ omits it entirely,
-while an explicit finite non-negative value is forwarded. The node timeout is also forwarded as the
-gateway request timeout in addition to bounding the whole Agent runtime.
+temperature is a real request parameter: blank defers to the active provider setting (AI Gateway
+v1.1.2+ omits it when that setting is also absent), while an explicit finite non-negative value is
+forwarded. Provider-specific temperature ranges still apply. The node timeout is capped at 14 minutes
+so it remains below the flow controller watchdog, then forwarded to relax the gateway's shorter
+per-turn default; `AgentRuntime` still enforces the decreasing whole-run time remaining and fires first.
 
 `maxTokens` is still overridden per request (4096, not the provider's chat-completion default of
 2000) because a bounded tool-use loop needs the headroom. A run is bounded by `AgentBudget`.

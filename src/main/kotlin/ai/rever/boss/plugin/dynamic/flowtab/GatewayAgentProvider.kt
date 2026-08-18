@@ -33,7 +33,7 @@ internal class GatewayAgentProvider(
     private val gateway: () -> AiGatewayAPI?,
     private val maxTokens: Int = DEFAULT_MAX_TOKENS,
     private val temperature: Float? = null,
-    private val requestTimeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS,
+    private val requestTimeoutMs: Long? = null,
     /**
      * Explains why AI is unavailable and offers the fix. Fire-and-forget: the node still
      * fails, because a DAG step cannot wait on a dialog and a run that silently paused
@@ -89,21 +89,24 @@ internal class GatewayAgentProvider(
             pendingTurn = null
         }
 
+        val request =
+            AiRequest(
+                system = system,
+                // Tool rounds travel structurally in `rounds`, not as transcript
+                // text, so they are dropped here rather than sent twice.
+                messages = messages.mapNotNull(::toAiMessage),
+                // Null defers to the active provider setting. Gateway v1.1.2+ omits
+                // temperature when that setting is also absent.
+                temperature = temperature,
+                maxTokens = maxTokens,
+            ).let { base ->
+                requestTimeoutMs?.let { base.copy(timeoutMs = it) } ?: base
+            }
+
         val turn =
             api
                 .step(
-                    request =
-                        AiRequest(
-                            system = system,
-                            // Tool rounds travel structurally in `rounds`, not as transcript
-                            // text, so they are dropped here rather than sent twice.
-                            messages = messages.mapNotNull(::toAiMessage),
-                            // Null means omit. Gateway v1.1.2+ no longer falls back to an
-                            // invisible provider default that reasoning models may reject.
-                            temperature = temperature,
-                            maxTokens = maxTokens,
-                            timeoutMs = requestTimeoutMs,
-                        ),
+                    request = request,
                     tools =
                         tools.map { descriptor ->
                             AiToolSpec(
@@ -152,7 +155,5 @@ internal class GatewayAgentProvider(
          * per request rather than per provider.
          */
         const val DEFAULT_MAX_TOKENS = 4096
-        const val DEFAULT_REQUEST_TIMEOUT_MS = 120_000L
-
     }
 }
