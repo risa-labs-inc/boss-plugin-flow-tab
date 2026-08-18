@@ -48,6 +48,17 @@ class RpaRecorderImportTest {
     }
 
     @Test
+    fun `select waits for its target and reports a missing element`() {
+        val select = RpaRecorderImport.convert(sample).steps.first { it.title == "Select option" }
+
+        assertEquals("#s", (select.config["waitFor"] as? JsonPrimitive)?.content)
+        assertEquals("css", (select.config["waitForType"] as? JsonPrimitive)?.content)
+        val script = (select.config["script"] as? JsonPrimitive)?.content.orEmpty()
+        assertTrue("if(!el)return false" in script)
+        assertTrue("return true" in script)
+    }
+
+    @Test
     fun `empty or actionless config yields just an open-browser step`() {
         val result = RpaRecorderImport.convert("""{"name":"x","actions":[]}""")
         assertEquals(listOf("OPEN_BROWSER"), result.steps.map { it.kind })

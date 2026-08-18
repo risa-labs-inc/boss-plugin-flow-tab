@@ -66,4 +66,24 @@ class FlowNodeViewTest {
         assertEquals(listOf("css", "secret value"), nodeMetaChips(secret))
         assertEquals(listOf("POST", "uses secret"), nodeMetaChips(authenticatedHttp))
     }
+
+    @Test
+    fun `inject summary and metadata make wait behavior visible`() {
+        val immediate = node(NodeType.INJECT, "script" to "window.scrollTo(0, 0)")
+        val waiting = node(
+            NodeType.INJECT,
+            "waitForType" to "xpath",
+            "waitFor" to "//section[@data-ready]",
+            "waitMs" to "5000",
+            "script" to "window.didRun=true",
+        )
+
+        assertEquals("Runs custom JavaScript in the page", nodeSummary(immediate))
+        assertEquals(listOf("runs immediately"), nodeMetaChips(immediate))
+        assertEquals(
+            "Waits for //section[@data-ready], then runs JavaScript",
+            nodeSummary(waiting),
+        )
+        assertEquals(listOf("xpath", "5000ms wait"), nodeMetaChips(waiting))
+    }
 }

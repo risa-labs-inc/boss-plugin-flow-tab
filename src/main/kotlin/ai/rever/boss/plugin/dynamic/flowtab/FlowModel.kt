@@ -88,7 +88,7 @@ enum class NodeType(
      * [nodeHeight] stays a pure function of type and ports never drift.
      */
     fun hasMetaRow(): Boolean = when (this) {
-        OPEN_BROWSER, HTTP, CLICK, TYPE, EXTRACT -> true
+        OPEN_BROWSER, HTTP, CLICK, TYPE, EXTRACT, INJECT -> true
         else -> false
     }
 
@@ -119,6 +119,20 @@ enum class NodeType(
             ConfigField("multiple", "All matches", FieldType.BOOL, default = "false")
         )
         INJECT -> listOf(
+            ConfigField(
+                "waitForType",
+                "Wait selector type",
+                FieldType.SELECT,
+                listOf("css", "xpath", "text"),
+                default = "css",
+            ),
+            ConfigField(
+                "waitFor",
+                "Wait for selector (optional)",
+                FieldType.TEXT,
+                placeholder = "#content-ready",
+            ),
+            ConfigField("waitMs", "Wait timeout (ms)", FieldType.NUMBER, default = "20000"),
             ConfigField(
                 "script",
                 "JavaScript",

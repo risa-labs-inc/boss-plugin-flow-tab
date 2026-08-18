@@ -330,8 +330,18 @@ object NodeCatalog {
                 cfg::interpolate,
             )
             if (script.isBlank()) throw ExecError("Inject needs a script")
-            ctx.requireSession().executeJavaScript(script)
-            log("Ran injected script")
+            val session = ctx.requireSession()
+            val waitFor = cfg.str("waitFor").trim()
+            if (waitFor.isNotEmpty()) {
+                val waitType = cfg.str("waitForType", "css")
+                val waitMs = cfg.int("waitMs", ELEMENT_WAIT_MS).coerceAtLeast(0)
+                if (!session.awaitElement(waitType, waitFor, timeoutMs = waitMs)) {
+                    throw ExecError("Inject: no element matched '$waitFor' within ${waitMs}ms")
+                }
+            }
+            val result = session.executeJavaScript(script)
+            if (result == false) throw ExecError("Inject script returned false")
+            log(if (waitFor.isEmpty()) "Ran injected script" else "Waited for '$waitFor' and ran injected script")
             NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
         }
 

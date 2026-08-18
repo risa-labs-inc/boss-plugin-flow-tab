@@ -134,7 +134,13 @@ fun nodeSummary(node: FlowNode): String {
             val mode = c("mode").ifBlank { "text" }
             withTarget("Extracts $mode from", c("selector"), "Extracts $mode from the page")
         }
-        "INJECT" -> "Runs custom JavaScript in the page"
+        "INJECT" -> c("waitFor").let { waitFor ->
+            if (waitFor.isBlank()) {
+                "Runs custom JavaScript in the page"
+            } else {
+                "Waits for ${waitFor.trim()}, then runs JavaScript"
+            }
+        }
         "HTTP" -> {
             val method = c("method").ifBlank { "GET" }.uppercase()
             withTarget("$method request to", c("url"), "Sends a $method request")
@@ -166,6 +172,15 @@ fun nodeMetaChips(node: FlowNode): List<String> {
         }
         "CLICK" -> listOf(c("selectorType").ifBlank { "css" })
         "TYPE" -> listOf(c("selectorType").ifBlank { "css" }, valueSource(c("text")))
+        "INJECT" -> {
+            val waitFor = c("waitFor")
+            if (waitFor.isBlank()) {
+                listOf("runs immediately")
+            } else {
+                val waitMs = c("waitMs").toIntOrNull() ?: 20_000
+                listOf(c("waitForType").ifBlank { "css" }, "${waitMs.coerceAtLeast(0)}ms wait")
+            }
+        }
         "EXTRACT" -> buildList {
             add(c("selectorType").ifBlank { "css" })
             add(c("mode").ifBlank { "text" })
