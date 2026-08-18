@@ -97,19 +97,29 @@ class AgentNodeTest {
 
     @Test
     fun `agent timeout fails the node instead of emitting a successful result`() {
-        val provider = FakeProvider { _, _, _, _ ->
-            delay(10_000)
-            AssistantTurn(text = "too late")
+        val provider = FakeProvider { step, _, _, _ ->
+            if (step == 0) {
+                AssistantTurn(
+                    text = "working answer",
+                    toolCalls = listOf(ToolCall("1", "step", "{}")),
+                )
+            } else {
+                delay(10_000)
+                AssistantTurn(text = "too late")
+            }
         }
         val spec = agentNodeSpec(
             prompts = null,
             providerFor = { provider },
-            toolSourceFor = { RecordingSource(emptyList()) },
+            toolSourceFor = { RecordingSource(listOf("step")) },
         )
         val reg = builtinNodeRegistry().also { it.register(spec) }
         val cfg = buildJsonObject {
             put(AgentNode.INPUT_KEY, "go")
             put(AgentNode.TIMEOUT_KEY, "100")
+            put(AgentNode.ALLOWLIST_KEY, buildJsonArray {
+                add(kotlinx.serialization.json.JsonPrimitive("step"))
+            })
         }
 
         val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
@@ -117,6 +127,7 @@ class AgentNodeTest {
         assertEquals(RunStatus.ERROR, states["a"]?.status)
         assertEquals("Agent timed out after 100ms", states["a"]?.error)
         assertTrue(states["a"]?.logs.orEmpty().any { it.startsWith("agent stopped: TIMEOUT") })
+        assertTrue(states["a"]?.logs.orEmpty().contains("agent partial text: working answer"))
         assertTrue(states["a"]?.output.orEmpty().isEmpty())
     }
 
