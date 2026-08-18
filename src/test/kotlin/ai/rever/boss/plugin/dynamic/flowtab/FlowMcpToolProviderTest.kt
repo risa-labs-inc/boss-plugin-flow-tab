@@ -445,7 +445,10 @@ class FlowMcpToolProviderTest {
         assertEquals("false", summary.getValue("outputIncluded").jsonPrimitive.content)
         assertEquals("true", summary.getValue("outputOmitted").jsonPrimitive.content)
         assertEquals(0, summaryNode.getValue("output").jsonArray.size)
-        assertContains(summaryNode.getValue("logs").jsonArray.last().jsonPrimitive.content, "log lines omitted")
+        val summaryLogs = summaryNode.getValue("logs").jsonArray.map { it.jsonPrimitive.content }
+        assertContains(summaryLogs.first(), "request-0:")
+        assertTrue(summaryLogs.any { "log lines omitted" in it })
+        assertContains(summaryLogs.last(), "request-24:")
 
         assertTrue(call(p, "flow_result", """{"runId":"$runId","includeOutput":true}""").isError)
         val detailResult = call(

@@ -199,7 +199,9 @@ adding another headless run entrypoint; otherwise each invocation leaks a Fluck 
 `flow_result` returns status, errors, and bounded logs by default, with node outputs omitted so
 large HTML/SVG values cannot exhaust the MCP response path. A caller may pass `nodeId` together
 with `includeOutput: true` to fetch that node's recursively bounded output; explicit response flags
-report whether output was omitted or included and whether any content was truncated.
+report whether output was omitted or included and whether any content was truncated. Oversized log
+lists retain both their beginning and tail around an omission marker so a terminal Agent stop or
+failure line is not discarded.
 The launcher/controller and an open tab are independent full-snapshot writers for the same graph
 key. Controller/MCP mutations and open-tab autosave therefore serialize through
 `FlowPersistenceCoordinator`. Controller writes publish revisioned snapshots that an open canvas

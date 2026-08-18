@@ -49,17 +49,24 @@ class AgentRuntimeTest {
 
     @Test
     fun `runs a tool call then returns the final text`() = runBlocking {
+        val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("lookup")), mapOf("lookup" to ToolResult("""{"n":42}""", false)))
         val provider = FakeProvider.scripted(
             AssistantTurn(toolCalls = listOf(call("lookup", """{"q":"x"}"""))),
             AssistantTurn(text = "the answer is 42"),
         )
-        val result = AgentRuntime(provider, source).run(system = "sys", input = "go", allowlist = setOf("lookup"))
+        val result = AgentRuntime(provider, source)
+            .run(system = "sys", input = "go", allowlist = setOf("lookup"), log = logs::add)
 
         assertEquals(StopReason.COMPLETED, result.stopReason)
         assertEquals("the answer is 42", result.finalText)
         assertEquals(1, result.toolCalls)
         assertTrue(source.invoked.contains("lookup"))
+        assertTrue("agent tool 1 'lookup': succeeded" in logs)
+        assertEquals(
+            "agent stopped: COMPLETED (2 completed step(s), 1 attempted tool call(s))",
+            logs.last(),
+        )
     }
 
     @Test
@@ -89,7 +96,7 @@ class AgentRuntimeTest {
         assertEquals(1, failure.steps)
         assertEquals(1, failure.toolCalls)
         assertEquals(
-            "Agent stopped: FAILED after 1 completed step(s), 1 tool call(s): " +
+            "Agent stopped: FAILED after 1 completed step(s), 1 attempted tool call(s): " +
                 "The provider rejected the request",
             failure.message,
         )
@@ -99,7 +106,7 @@ class AgentRuntimeTest {
                 "agent tool 1 'lookup': started",
                 "agent tool 1 'lookup': failed",
                 "agent step 2: requesting model",
-                "agent stopped: FAILED (1 completed step(s), 1 tool call(s))",
+                "agent stopped: FAILED (1 completed step(s), 1 attempted tool call(s))",
             ),
             logs,
         )
@@ -117,16 +124,19 @@ class AgentRuntimeTest {
 
     @Test
     fun `a tool outside the allowlist is never invoked and comes back as an error`() = runBlocking {
+        val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("allowed"), desc("blocked")))
         // The model tries the blocked tool first; after the error it answers.
         val provider = FakeProvider.scripted(
             AssistantTurn(toolCalls = listOf(call("blocked"))),
             AssistantTurn(text = "ok, done"),
         )
-        val result = AgentRuntime(provider, source).run(system = "s", input = "go", allowlist = setOf("allowed"))
+        val result = AgentRuntime(provider, source)
+            .run(system = "s", input = "go", allowlist = setOf("allowed"), log = logs::add)
 
         assertEquals(StopReason.COMPLETED, result.stopReason)
         assertFalse(source.invoked.contains("blocked")) // never reached the source
+        assertTrue("agent tool 1 'blocked': blocked (not in allowlist)" in logs)
     }
 
     @Test
@@ -245,6 +255,10 @@ class AgentRuntimeTest {
         assertEquals(TokenUsage(input = 4, output = 3), result.usage)
         assertTrue(elapsed < 2_000, "non-cooperative step held the caller for ${elapsed}ms")
         assertEquals(logsAtTimeout, logs, "late completion must not mutate published timeout logs")
+        assertEquals(
+            "agent stopped: TIMEOUT (1 completed step(s), 1 attempted tool call(s))",
+            logsAtTimeout.last(),
+        )
         assertEquals(setOf("first"), source.invoked)
     }
 
@@ -295,15 +309,38 @@ class AgentRuntimeTest {
 
         assertTrue(failure is AgentRunFailure)
         assertEquals(
-            "Agent stopped: FAILED after 0 completed step(s), 0 tool call(s): provider request aborted",
+            "Agent stopped: FAILED after 0 completed step(s), 0 attempted tool call(s): provider request aborted",
             failure.message,
         )
         assertEquals(
             listOf(
                 "agent step 1: requesting model",
-                "agent stopped: FAILED (0 completed step(s), 0 tool call(s))",
+                "agent stopped: FAILED (0 completed step(s), 0 attempted tool call(s))",
             ),
             logs,
+        )
+    }
+
+    @Test
+    fun `provider linkage error is converted to a logged Agent failure`() = runBlocking {
+        val logs = mutableListOf<String>()
+        val provider = FakeProvider { _, _, _, _ ->
+            throw NoSuchMethodError("gateway API skew")
+        }
+
+        val failure = runCatching {
+            AgentRuntime(provider, RecordingSource(emptyList()))
+                .run(system = "s", input = "go", allowlist = emptySet(), log = logs::add)
+        }.exceptionOrNull()
+
+        assertTrue(failure is AgentRunFailure)
+        assertEquals(
+            "Agent stopped: FAILED after 0 completed step(s), 0 attempted tool call(s): gateway API skew",
+            failure.message,
+        )
+        assertEquals(
+            "agent stopped: FAILED (0 completed step(s), 0 attempted tool call(s))",
+            logs.last(),
         )
     }
 
@@ -351,7 +388,7 @@ class AgentRuntimeTest {
         try {
             assertTrue(failure is AgentRunFailure)
             assertEquals(
-                "Agent stopped: FAILED after 0 completed step(s), 0 tool call(s): " +
+                "Agent stopped: FAILED after 0 completed step(s), 0 attempted tool call(s): " +
                     "Agent execution capacity is busy; retry after other Agent runs finish",
                 failure.message,
             )

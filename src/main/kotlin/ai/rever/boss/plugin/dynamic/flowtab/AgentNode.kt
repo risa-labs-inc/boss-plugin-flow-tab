@@ -110,7 +110,7 @@ class AgentNodeExecutor(
         if (result.stopReason == StopReason.TIMEOUT) {
             throw ExecError(
                 "Agent stopped: TIMEOUT after ${result.steps} completed step(s), " +
-                    "${result.toolCalls} tool call(s); timeout was ${settings.budget.timeoutMs}ms",
+                    "${result.toolCalls} attempted tool call(s); timeout was ${settings.budget.timeoutMs}ms",
             )
         }
         return NodeOutput.single(listOf(

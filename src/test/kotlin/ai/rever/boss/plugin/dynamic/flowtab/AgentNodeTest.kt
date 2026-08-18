@@ -128,7 +128,7 @@ class AgentNodeTest {
 
         assertEquals(RunStatus.ERROR, states["a"]?.status)
         assertEquals(
-            "Agent stopped: TIMEOUT after 1 completed step(s), 1 tool call(s); timeout was 100ms",
+            "Agent stopped: TIMEOUT after 1 completed step(s), 1 attempted tool call(s); timeout was 100ms",
             states["a"]?.error,
         )
         assertTrue(states["a"]?.logs.orEmpty().any { it.startsWith("agent stopped: TIMEOUT") })
@@ -160,14 +160,14 @@ class AgentNodeTest {
 
         assertEquals(RunStatus.ERROR, state.status)
         assertEquals(
-            "Agent stopped: FAILED after 0 completed step(s), 0 tool call(s): " +
+            "Agent stopped: FAILED after 0 completed step(s), 0 attempted tool call(s): " +
                 "The provider does not offer the selected model",
             state.error,
         )
         assertEquals(
             listOf(
                 "agent step 1: requesting model",
-                "agent stopped: FAILED (0 completed step(s), 0 tool call(s))",
+                "agent stopped: FAILED (0 completed step(s), 0 attempted tool call(s))",
             ),
             state.logs,
         )

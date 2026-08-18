@@ -92,7 +92,7 @@ class AgentRunFailure(
     val toolCalls: Int,
     cause: Throwable,
 ) : Exception(
-    "Agent stopped: FAILED after $steps completed step(s), $toolCalls tool call(s): " +
+    "Agent stopped: FAILED after $steps completed step(s), $toolCalls attempted tool call(s): " +
         (cause.message ?: cause::class.simpleName ?: "unknown error"),
     cause,
 )
@@ -169,6 +169,19 @@ class AgentRuntime(
         val successfulCompletion = AtomicReference<AgentResult?>(null)
         val failure = AtomicReference<Throwable?>(null)
         val logGate = LogGate(log)
+        fun terminalLog(message: String) {
+            // Closing waits for any in-flight worker write. The direct write afterward
+            // is therefore guaranteed to be the final line even when the worker ignores
+            // cancellation and finishes a host call after this run returns.
+            logGate.close()
+            log(message)
+        }
+        fun wrappedFailure(cause: Throwable): AgentRunFailure {
+            val snapshot = progress.get()
+            return if (cause is AgentRunFailure) cause else {
+                AgentRunFailure(snapshot.steps, snapshot.toolCalls, cause)
+            }
+        }
         val loopStarted = CompletableDeferred<Unit>()
         val execution = executionScope.async {
             loopStarted.complete(Unit)
@@ -197,8 +210,7 @@ class AgentRuntime(
         if (!admitted) {
             val cause = ExecError("Agent execution capacity is busy; retry after other Agent runs finish")
             val wrapped = AgentRunFailure(steps = 0, toolCalls = 0, cause = cause)
-            logGate.write(failureLog(wrapped))
-            logGate.close()
+            terminalLog(failureLog(wrapped))
             executionScope.cancel(CancellationException("Agent execution lane unavailable"))
             throw wrapped
         }
@@ -221,7 +233,7 @@ class AgentRuntime(
                         snapshot.usage,
                     )
                 }
-            logGate.write(stopLog(completed))
+            terminalLog(stopLog(completed))
             return completed
         } catch (cancelled: CancellationException) {
             if (!currentCoroutineContext().isActive) throw cancelled
@@ -229,16 +241,19 @@ class AgentRuntime(
             // signal while the calling flow is still active. Preserve real caller
             // cancellation, but diagnose a boundary-local cancellation like any other
             // provider failure.
-            val snapshot = progress.get()
-            val wrapped = AgentRunFailure(snapshot.steps, snapshot.toolCalls, cancelled)
-            logGate.write(failureLog(wrapped))
+            val wrapped = wrappedFailure(cancelled)
+            terminalLog(failureLog(wrapped))
             throw wrapped
         } catch (cause: Exception) {
-            val snapshot = progress.get()
-            val wrapped = if (cause is AgentRunFailure) cause else {
-                AgentRunFailure(snapshot.steps, snapshot.toolCalls, cause)
-            }
-            logGate.write(failureLog(wrapped))
+            val wrapped = wrappedFailure(cause)
+            terminalLog(failureLog(wrapped))
+            throw wrapped
+        } catch (cause: LinkageError) {
+            // Optional plugin/API skew reaches Kotlin as NoClassDefFoundError,
+            // NoSuchMethodError, or AbstractMethodError rather than Exception. Diagnose
+            // those expected boundary failures without swallowing VM-fatal Errors.
+            val wrapped = wrappedFailure(cause)
+            terminalLog(failureLog(wrapped))
             throw wrapped
         } finally {
             logGate.close()
@@ -316,10 +331,12 @@ class AgentRuntime(
         AgentResult(text, reason, steps, toolCalls, usage)
 
     private fun stopLog(result: AgentResult): String =
-        "agent stopped: ${result.stopReason} (${result.steps} step(s), ${result.toolCalls} tool call(s))"
+        "agent stopped: ${result.stopReason} " +
+            "(${result.steps} completed step(s), ${result.toolCalls} attempted tool call(s))"
 
     private fun failureLog(failure: AgentRunFailure): String =
-        "agent stopped: FAILED (${failure.steps} completed step(s), ${failure.toolCalls} tool call(s))"
+        "agent stopped: FAILED " +
+            "(${failure.steps} completed step(s), ${failure.toolCalls} attempted tool call(s))"
 
     private fun Long.saturatingPlus(other: Long): Long =
         if (this > Long.MAX_VALUE - other) Long.MAX_VALUE else this + other

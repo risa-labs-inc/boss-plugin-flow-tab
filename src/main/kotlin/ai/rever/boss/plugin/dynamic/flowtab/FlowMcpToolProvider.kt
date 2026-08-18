@@ -289,13 +289,21 @@ class FlowMcpToolProvider(
             val boundedError = node.error?.boundedUtf8(RESULT_ERROR_MAX_BYTES)?.also {
                 contentTruncated = contentTruncated || it.truncated
             }?.value
-            val boundedLogs = node.logs.take(RESULT_LOG_MAX_LINES).map { line ->
+            val selectedLogs = if (node.logs.size <= RESULT_LOG_MAX_LINES) {
+                node.logs
+            } else {
+                val headSize = RESULT_LOG_MAX_LINES / 2
+                val tailSize = RESULT_LOG_MAX_LINES - headSize
+                node.logs.take(headSize) +
+                    "… [${node.logs.size - RESULT_LOG_MAX_LINES} log lines omitted]" +
+                    node.logs.takeLast(tailSize)
+            }
+            val boundedLogs = selectedLogs.map { line ->
                 line.boundedUtf8(RESULT_LOG_LINE_MAX_BYTES).also {
                     contentTruncated = contentTruncated || it.truncated
                 }.value
             }.toMutableList()
             if (node.logs.size > RESULT_LOG_MAX_LINES) {
-                boundedLogs += "… [${node.logs.size - RESULT_LOG_MAX_LINES} log lines omitted]"
                 contentTruncated = true
             }
             val boundedOutput = if (includeOutput) {
