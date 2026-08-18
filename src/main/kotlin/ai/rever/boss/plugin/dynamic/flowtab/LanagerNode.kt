@@ -29,8 +29,11 @@ object LanagerNode {
  *
  * It then polls the sub-run to a terminal state; a failed sub-run fails this node (its
  * error propagates), a succeeded one emits a small descriptor [Item] pointing at the run.
- * The sub-run's lifetime is bound to this node: cancellation or timeout explicitly stops
- * it, and nested lanagers cascade that stop to their own children.
+ * The sub-run's lifetime is bound to this node: Canvas Stop, `flow_stop`, or a parent
+ * watchdog timeout explicitly stops it, and nested lanagers cascade that stop to their
+ * own children. Stop transitions a still-running child before requesting cancellation,
+ * so it can win a race with terminal publication and record FAILED even when the child's
+ * work just completed and its node snapshot contains only successful nodes.
  */
 class LanagerNodeExecutor(
     private val controller: FlowController,
@@ -56,8 +59,9 @@ class LanagerNodeExecutor(
         } finally {
             // startRun launches on the controller scope, not as a child of this node.
             // Explicitly stop an active sub-run when the parent is cancelled or times out.
-            // stopRun publishes FAILED and requests cancellation without joining: teardown stays bounded,
-            // while the child's session cleanup may briefly overlap a subsequent run.
+            // stopRun publishes FAILED and requests cancellation without joining, so child execution
+            // and session cleanup may briefly overlap a subsequent run. Its persistence has no separate
+            // deadline, however, and may delay this finally when host storage is slow.
             withContext(NonCancellable) { controller.stopRun(runId) }
         }
 
@@ -76,8 +80,8 @@ class LanagerNodeExecutor(
 
     /**
      * Await the sub-run's terminal state without layering on a second, conflicting timeout.
-     * Every controller run is independently bounded by [FlowController.DEFAULT_RUN_TIMEOUT_MS],
-     * while individual nodes retain their tighter agent, HTTP, and element-wait limits.
+     * Every controller run is independently bounded by its configured watchdog timeout, while
+     * individual nodes retain their tighter agent, HTTP, and element-wait limits.
      */
     private suspend fun awaitTerminal(runId: String): RunJob {
         while (controller.runStatus(runId)?.state == RunJobState.RUNNING) delay(POLL_MS)

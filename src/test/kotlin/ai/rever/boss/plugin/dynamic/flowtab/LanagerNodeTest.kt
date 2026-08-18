@@ -54,8 +54,9 @@ class LanagerNodeTest {
         maxDepth: Int = 3,
         storage: PluginStorageProvider = TestStorage(),
         registry: NodeRegistry = builtinNodeRegistry(),
+        runTimeoutMs: Long = FlowController.DEFAULT_RUN_TIMEOUT_MS,
     ): FlowController {
-        val fc = FlowController(context(storage), { scope }, registry)
+        val fc = FlowController(context(storage), { scope }, registry, runTimeoutMs)
         fc.registry.register(lanagerNodeSpec(fc, maxDepth = maxDepth))
         return fc
     }
@@ -65,6 +66,45 @@ class LanagerNodeTest {
             while (fc.runStatus(runId)?.state == RunJobState.RUNNING) delay(10)
             fc.runStatus(runId)!!
         }
+
+    private fun blockingRegistry(
+        entered: CompletableDeferred<Unit>,
+        cancelled: CompletableDeferred<Unit>,
+    ): NodeRegistry = builtinNodeRegistry().also {
+        it.register(
+            NodeSpec(
+                id = "BLOCK",
+                label = "Block",
+                inputs = 0,
+                outputs = 1,
+                accent = 0,
+                description = "test only",
+                runMode = RunMode.ONCE,
+                executor = NodeExecutor { _, _, _, _ ->
+                    entered.complete(Unit)
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        cancelled.complete(Unit)
+                    }
+                },
+            ),
+        )
+    }
+
+    private suspend fun runIdFor(
+        fc: FlowController,
+        storage: TestStorage,
+        tabId: String,
+    ): String {
+        val matching = mutableListOf<String>()
+        for (key in storage.getAllKeys()) {
+            if (!key.startsWith(FlowController.RUN_PREFIX)) continue
+            val runId = key.removePrefix(FlowController.RUN_PREFIX)
+            if (fc.runStatus(runId)?.tabId == tabId) matching += runId
+        }
+        return matching.single()
+    }
 
     @Test
     fun `a lanager node runs its sub-flow to success`() = runBlocking {
@@ -97,27 +137,7 @@ class LanagerNodeTest {
         val storage = TestStorage()
         val childEntered = CompletableDeferred<Unit>()
         val childCancelled = CompletableDeferred<Unit>()
-        val registry = builtinNodeRegistry().also {
-            it.register(
-                NodeSpec(
-                    id = "BLOCK",
-                    label = "Block",
-                    inputs = 0,
-                    outputs = 1,
-                    accent = 0,
-                    description = "test only",
-                    runMode = RunMode.ONCE,
-                    executor = NodeExecutor { _, _, _, _ ->
-                        childEntered.complete(Unit)
-                        try {
-                            awaitCancellation()
-                        } finally {
-                            childCancelled.complete(Unit)
-                        }
-                    },
-                ),
-            )
-        }
+        val registry = blockingRegistry(childEntered, childCancelled)
         val fc = controllerWithLanager(storage = storage, registry = registry)
 
         val child = fc.createFlow(FlowMeta(name = "child"))
@@ -131,9 +151,7 @@ class LanagerNodeTest {
         val parentRunId = fc.startRun(parent)
         withTimeout(5_000) { childEntered.await() }
         // TestStorage exposes logical run: keys; child persistence precedes childEntered.
-        val childRunId = storage.map.keys
-            .single { it.startsWith(FlowController.RUN_PREFIX) && it != "${FlowController.RUN_PREFIX}$parentRunId" }
-            .removePrefix(FlowController.RUN_PREFIX)
+        val childRunId = runIdFor(fc, storage, child)
 
         fc.stopRun(parentRunId)
 
@@ -143,6 +161,99 @@ class LanagerNodeTest {
         assertEquals(RunJobState.FAILED, parentJob.state)
         assertEquals(RunJobState.FAILED, childJob.state)
         assertTrue(childJob.error!!.contains("stopped by caller", ignoreCase = true))
+    }
+
+    @Test
+    fun `parent watchdog timeout stops its active sub-flow`() = runBlocking {
+        val storage = TestStorage()
+        val childEntered = CompletableDeferred<Unit>()
+        val childCancelled = CompletableDeferred<Unit>()
+        val registry = blockingRegistry(childEntered, childCancelled).also {
+            it.register(
+                NodeSpec(
+                    id = "PARENT_DELAY",
+                    label = "Parent Delay",
+                    inputs = 1,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, inputs, _ ->
+                        delay(2_000)
+                        NodeOutput.single(inputs)
+                    },
+                ),
+            )
+        }
+        val fc = controllerWithLanager(
+            storage = storage,
+            registry = registry,
+            runTimeoutMs = 5_000,
+        )
+
+        val child = fc.createFlow(FlowMeta(name = "child"))
+        fc.addNode(child, "BLOCK", JsonObject(emptyMap()))
+
+        val parent = fc.createFlow(FlowMeta(name = "parent"))
+        val pt = fc.addNode(parent, "TRIGGER", JsonObject(emptyMap()))
+        val pd = fc.addNode(parent, "PARENT_DELAY", JsonObject(emptyMap()))
+        val pl = fc.addNode(parent, "lanager", buildJsonObject { put(LanagerNode.FLOW_ID_KEY, child) })
+        fc.connect(parent, pt, 0, pd, 0)
+        fc.connect(parent, pd, 0, pl, 0)
+
+        val parentRunId = fc.startRun(parent)
+        withTimeout(5_000) { childEntered.await() }
+        val childRunId = runIdFor(fc, storage, child)
+
+        val parentJob = awaitTerminal(fc, parentRunId)
+        assertEquals(RunJobState.FAILED, parentJob.state)
+        assertTrue(parentJob.error!!.contains("timeout", ignoreCase = true))
+        // The child watchdog started about two seconds later; only the parent cascade can stop it here.
+        withTimeout(1_000) { childCancelled.await() }
+        val childJob = awaitTerminal(fc, childRunId)
+        assertEquals(RunJobState.FAILED, childJob.state)
+        assertTrue(childJob.error!!.contains("stopped by caller", ignoreCase = true))
+    }
+
+    @Test
+    fun `stopping a parent cascades through child to grandchild`() = runBlocking {
+        val storage = TestStorage()
+        val grandchildEntered = CompletableDeferred<Unit>()
+        val grandchildCancelled = CompletableDeferred<Unit>()
+        val fc = controllerWithLanager(
+            storage = storage,
+            registry = blockingRegistry(grandchildEntered, grandchildCancelled),
+        )
+
+        val grandchild = fc.createFlow(FlowMeta(name = "grandchild"))
+        fc.addNode(grandchild, "BLOCK", JsonObject(emptyMap()))
+
+        val child = fc.createFlow(FlowMeta(name = "child"))
+        val ct = fc.addNode(child, "TRIGGER", JsonObject(emptyMap()))
+        val cl = fc.addNode(child, "lanager", buildJsonObject { put(LanagerNode.FLOW_ID_KEY, grandchild) })
+        fc.connect(child, ct, 0, cl, 0)
+
+        val parent = fc.createFlow(FlowMeta(name = "parent"))
+        val pt = fc.addNode(parent, "TRIGGER", JsonObject(emptyMap()))
+        val pl = fc.addNode(parent, "lanager", buildJsonObject { put(LanagerNode.FLOW_ID_KEY, child) })
+        fc.connect(parent, pt, 0, pl, 0)
+
+        val parentRunId = fc.startRun(parent)
+        withTimeout(5_000) { grandchildEntered.await() }
+        val childRunId = runIdFor(fc, storage, child)
+        val grandchildRunId = runIdFor(fc, storage, grandchild)
+
+        fc.stopRun(parentRunId)
+
+        withTimeout(5_000) { grandchildCancelled.await() }
+        val parentJob = awaitTerminal(fc, parentRunId)
+        val childJob = awaitTerminal(fc, childRunId)
+        val grandchildJob = awaitTerminal(fc, grandchildRunId)
+        assertEquals(RunJobState.FAILED, parentJob.state)
+        assertEquals(RunJobState.FAILED, childJob.state)
+        assertEquals(RunJobState.FAILED, grandchildJob.state)
+        assertTrue(childJob.error!!.contains("stopped by caller", ignoreCase = true))
+        assertTrue(grandchildJob.error!!.contains("stopped by caller", ignoreCase = true))
     }
 
     @Test
