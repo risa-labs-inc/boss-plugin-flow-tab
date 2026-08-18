@@ -92,6 +92,7 @@ data class AgentResult(
  *    interprets returned text as new instructions.
  *  - **Bounded:** the loop stops cleanly at [AgentBudget.maxSteps], [AgentBudget.timeoutMs],
  *    or [AgentBudget.maxTokens], reporting the [StopReason] rather than running away.
+ *    [AgentNodeExecutor] escalates [StopReason.TIMEOUT] to a node error.
  */
 class AgentRuntime(
     private val provider: AgentProvider,
@@ -105,7 +106,10 @@ class AgentRuntime(
         val usage: TokenUsage = TokenUsage(),
     )
 
-    /** Serializes the worker's writes with closing the gate at the timeout boundary. */
+    /**
+     * Serializes the worker's writes with closing the gate at the timeout boundary.
+     * [sink] must stay non-blocking because timeout closure waits for an in-flight write.
+     */
     private class LogGate(private val sink: (String) -> Unit) {
         private val lock = Any()
         private var accepting = true
@@ -133,29 +137,36 @@ class AgentRuntime(
         if (timeoutMs == 0L) {
             return done("", StopReason.TIMEOUT, steps = 0, toolCalls = 0, usage = TokenUsage())
         }
+        val started = System.currentTimeMillis()
+        val hardTimeoutMs = timeoutMs.saturatingPlus(HARD_TIMEOUT_GRACE_MS)
 
         // Provider and tool integrations are host/plugin boundaries and may block without
         // cooperating with coroutine cancellation. Keep their loop in an independently
         // owned scope so the caller can publish TIMEOUT at the configured wall-clock
         // deadline instead of waiting for a late host call to return. Cancellation remains
         // best-effort; a late result has no path back to the already-returned AgentResult.
-        val executionScope = CoroutineScope(SupervisorJob() + agentExecutionDispatcher)
+        val executionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
         val progress = AtomicReference(Progress())
+        val successfulCompletion = AtomicReference<AgentResult?>(null)
         val failure = AtomicReference<Throwable?>(null)
         val logGate = LogGate(log)
         val execution = executionScope.async {
-            runLoop(system, input, allowlist, progress, logGate::write)
+            runLoop(system, input, allowlist, started, progress, logGate::write)
+                .also { successfulCompletion.set(it) }
         }
         execution.invokeOnCompletion { cause ->
             if (cause != null && cause !is CancellationException) failure.compareAndSet(null, cause)
         }
         val result = try {
-            withTimeoutOrNull(timeoutMs) { execution.await() }
+            // Let the loop's cooperative timeout publish its complete result first. The
+            // small grace is only an escape hatch for a host call that ignores cancellation.
+            withTimeoutOrNull(hardTimeoutMs) { execution.await() }
         } finally {
             logGate.close()
             executionScope.cancel(CancellationException("Agent execution ended"))
         }
         if (result != null) return result
+        successfulCompletion.get()?.let { return it }
 
         // Preserve a provider failure that completed at the deadline instead of replacing
         // it with a misleading timeout. A still-running non-cooperative call has no failure.
@@ -174,10 +185,10 @@ class AgentRuntime(
         system: String,
         input: String,
         allowlist: Set<String>,
+        started: Long,
         progress: AtomicReference<Progress>,
         log: (String) -> Unit,
     ): AgentResult {
-        val started = System.currentTimeMillis()
         val allowed = source.list().filter { it.ref.name in allowlist }
         val allowedNames = allowed.map { it.ref.name }.toSet()
 
@@ -236,9 +247,10 @@ class AgentRuntime(
     private fun done(text: String, reason: StopReason, steps: Int, toolCalls: Int, usage: TokenUsage) =
         AgentResult(text, reason, steps, toolCalls, usage)
 
+    private fun Long.saturatingPlus(other: Long): Long =
+        if (this > Long.MAX_VALUE - other) Long.MAX_VALUE else this + other
+
     private companion object {
-        // A permanently wedged provider can occupy at most this many shared IO workers.
-        // Later Agent runs queue on this lane and still time out at their own deadlines.
-        val agentExecutionDispatcher = Dispatchers.IO.limitedParallelism(4)
+        const val HARD_TIMEOUT_GRACE_MS = 100L
     }
 }

@@ -119,12 +119,27 @@ class AgentRuntimeTest {
         // Without a per-call timeout the budget is only checked BETWEEN steps, so a hung
         // model/tool call runs unbounded (red-team S3). The runtime must interrupt it.
         val source = RecordingSource(listOf(desc("x")))
-        val provider = FakeProvider { _, _, _, _ -> delay(10_000); AssistantTurn(text = "too late") }
+        val provider = FakeProvider { step, _, _, _ ->
+            if (step == 0) {
+                AssistantTurn(
+                    text = "partial",
+                    toolCalls = listOf(call("x")),
+                    usage = TokenUsage(input = 2, output = 1),
+                )
+            } else {
+                delay(10_000)
+                AssistantTurn(text = "too late")
+            }
+        }
         val started = System.currentTimeMillis()
         val result = AgentRuntime(provider, source, AgentBudget(timeoutMs = 200))
             .run(system = "s", input = "go", allowlist = setOf("x"))
         val elapsed = System.currentTimeMillis() - started
         assertEquals(StopReason.TIMEOUT, result.stopReason)
+        assertEquals("partial", result.finalText)
+        assertEquals(1, result.steps)
+        assertEquals(1, result.toolCalls)
+        assertEquals(TokenUsage(input = 2, output = 1), result.usage)
         assertTrue(elapsed < 3_000, "hung step must be cut near the budget, not after the full hang (was ${elapsed}ms)")
     }
 

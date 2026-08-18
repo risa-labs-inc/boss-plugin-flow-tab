@@ -50,7 +50,13 @@ object AgentNode {
             placeholder = "Set by the active AI provider; kept for existing flows",
         ),
         ConfigField(MAX_STEPS_KEY, "Max steps", FieldType.NUMBER, default = "8"),
-        ConfigField(TIMEOUT_KEY, "Timeout (ms)", FieldType.NUMBER, default = "120000"),
+        ConfigField(
+            TIMEOUT_KEY,
+            "Timeout (ms)",
+            FieldType.NUMBER,
+            default = "120000",
+            placeholder = "must be greater than 0",
+        ),
         ConfigField(MAX_TOKENS_KEY, "Max tokens", FieldType.NUMBER, placeholder = "unbounded if blank"),
     )
 }
@@ -120,6 +126,8 @@ class AgentNodeExecutor(
     private fun parse(cfg: ConfigReader, inputs: List<Item>): AgentSettings {
         val inlineInput = cfg.str(AgentNode.INPUT_KEY)
         val input = inlineInput.ifBlank { inputs.firstOrNull()?.json?.toString() ?: "" }
+        val timeoutMs = cfg.str(AgentNode.TIMEOUT_KEY).trim().toLongOrNull() ?: 120_000
+        if (timeoutMs <= 0) throw ExecError("Agent timeout (timeoutMs) must be greater than 0")
         return AgentSettings(
             promptId = cfg.str(AgentNode.PROMPT_ID_KEY).ifBlank { null },
             system = cfg.str(AgentNode.SYSTEM_KEY),
@@ -128,7 +136,7 @@ class AgentNodeExecutor(
             model = cfg.str(AgentNode.MODEL_KEY).ifBlank { AgentNode.DEFAULT_MODEL },
             budget = AgentBudget(
                 maxSteps = cfg.int(AgentNode.MAX_STEPS_KEY, 8),
-                timeoutMs = (cfg.str(AgentNode.TIMEOUT_KEY).trim().toLongOrNull() ?: 120_000).coerceAtLeast(0),
+                timeoutMs = timeoutMs,
                 maxTokens = cfg.int(AgentNode.MAX_TOKENS_KEY, Int.MAX_VALUE),
             ),
         )
