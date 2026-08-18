@@ -1,7 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 /**
- * Builds a [NodeRegistry] pre-populated with the 12 built-in kinds.
+ * Builds a [NodeRegistry] pre-populated with the built-in kinds.
  *
  * During the migration this derives each [NodeSpec] from the legacy [NodeType]
  * enum + [NodeCatalog], guaranteeing byte-for-byte parity with the pre-registry

@@ -43,6 +43,7 @@ class SessionRegistry(
 ) {
     private class Entry(
         val integration: BrowserIntegration,
+        val visibleTabId: String? = null,
         val closer: suspend () -> Unit,
     )
 
@@ -63,6 +64,19 @@ class SessionRegistry(
 
     /** The [BrowserIntegration] for [id], or null if no such session is open. */
     fun get(id: String): BrowserIntegration? = entries[id]?.integration
+
+    /** Focus the visible host tab backing [id]. Headless sessions return false. */
+    suspend fun focus(id: String): Boolean {
+        val tabId = entries[id]?.visibleTabId ?: return false
+        val tabs = context.activeTabsProvider ?: return false
+        return withContext(Dispatchers.Main) {
+            tabs.refreshTabs()
+            val panelId = tabs.activeTabs.value.firstOrNull { it.tabId == tabId }?.panelId
+                ?: return@withContext false
+            tabs.selectTab(tabId, panelId)
+            true
+        }
+    }
 
     /**
      * Open a browser session and register it under [id] (a fresh id by default).
@@ -143,11 +157,15 @@ class SessionRegistry(
             val integration = withContext(Dispatchers.Main) { tabs.getBrowserIntegration(tabId) }
             if (integration != null) {
                 onVisibleTab(tabId)
-                return Entry(LoadAwaitingIntegration(integration)) {
-                    if (closeVisibleTabsOnClose) {
-                        withContext(Dispatchers.Main) { tabs.closeTab(tabId) }
-                    }
-                }
+                return Entry(
+                    integration = LoadAwaitingIntegration(integration),
+                    visibleTabId = tabId,
+                    closer = {
+                        if (closeVisibleTabsOnClose) {
+                            withContext(Dispatchers.Main) { tabs.closeTab(tabId) }
+                        }
+                    },
+                )
             }
             delay(POLL_INTERVAL_MS.toLong()); waited += POLL_INTERVAL_MS
         }

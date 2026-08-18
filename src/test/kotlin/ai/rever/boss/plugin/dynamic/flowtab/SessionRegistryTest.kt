@@ -1,5 +1,8 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import ai.rever.boss.plugin.api.ActiveTabData
+import ai.rever.boss.plugin.api.ActiveTabsProvider
+import ai.rever.boss.plugin.api.BrowserIntegration
 import ai.rever.boss.plugin.api.PanelRegistry
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.TabRegistry
@@ -8,11 +11,19 @@ import ai.rever.boss.plugin.browser.BrowserHandle
 import ai.rever.boss.plugin.browser.BrowserService
 import ai.rever.boss.plugin.browser.ContextMenuCallback
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.graphics.vector.ImageVector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -118,16 +129,70 @@ class SessionRegistryTest {
         override fun getActiveBrowserCount() = pages.size
     }
 
-    private class Ctx(private val service: BrowserService?) : PluginContext {
+    private class Ctx(
+        private val service: BrowserService?,
+        private val tabs: ActiveTabsProvider? = null,
+    ) : PluginContext {
         override val panelRegistry = PanelRegistry()
         override val tabRegistry = TabRegistry()
         override val pluginScope = CoroutineScope(Dispatchers.Default)
         override val browserService: BrowserService? get() = service
+        override val activeTabsProvider: ActiveTabsProvider? get() = tabs
+    }
+
+    private class FakeTabs(private val integration: BrowserIntegration) : ActiveTabsProvider {
+        override val activeTabs: StateFlow<List<ActiveTabData>> = MutableStateFlow(
+            listOf(
+                ActiveTabData(
+                    tabId = "browser-1",
+                    typeId = "fluck",
+                    title = "Browser",
+                    workspaceId = "workspace-1",
+                    workspaceName = "Workspace",
+                    panelId = "panel-1",
+                    windowId = "window-1",
+                ),
+            ),
+        )
+        var selected: Pair<String, String>? = null
+
+        override suspend fun refreshTabs() = Unit
+        override fun selectTab(tabId: String, panelId: String) {
+            selected = tabId to panelId
+        }
+        override fun getTabUrl(tabId: String): String? = null
+        override fun getFaviconCacheKey(tabId: String): String? = null
+        @Composable override fun loadFavicon(cacheKey: String?): Painter? = null
+        override fun getFallbackIcon(typeId: String): ImageVector? = null
+        override fun getBrowserIntegration(tabId: String): BrowserIntegration? = integration
+        override fun createBrowserTab(url: String, title: String): String = "browser-1"
+        override fun createBrowserTabInRightSplit(url: String, title: String): String = "browser-1"
+        override fun closeTab(tabId: String): Boolean = true
     }
 
     private fun registry(make: () -> FakePage = { FakePage() }): Pair<SessionRegistry, MultiFakeService> {
         val svc = MultiFakeService(make)
         return SessionRegistry(Ctx(svc)) to svc
+    }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    @Test
+    fun `focus selects the visible browser tab and panel`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val page = FakePage()
+            val service = MultiFakeService { FakePage() }
+            val tabs = FakeTabs(BrowserHandleIntegration(page))
+            val registry = SessionRegistry(Ctx(service, tabs))
+            val id = registry.newSessionId()
+
+            registry.open(headless = false, id = id)
+
+            assertTrue(registry.focus(id))
+            assertEquals("browser-1" to "panel-1", tabs.selected)
+        } finally {
+            Dispatchers.resetMain()
+        }
     }
 
     // ---- lifecycle ----------------------------------------------------------

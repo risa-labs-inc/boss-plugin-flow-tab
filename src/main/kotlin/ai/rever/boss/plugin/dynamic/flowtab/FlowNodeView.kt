@@ -27,6 +27,7 @@ import androidx.compose.material.Icon
 import androidx.compose.material.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CallSplit
+import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.automirrored.filled.MergeType
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Build
@@ -86,6 +87,7 @@ fun iconForKind(kind: String): ImageVector = when (kind) {
     "TRIGGER" -> Icons.Filled.Bolt
     "OPEN_BROWSER" -> Icons.Filled.Public
     "NAVIGATE" -> Icons.Filled.Navigation
+    "AWAIT_LOGIN" -> Icons.AutoMirrored.Filled.Login
     "CLICK" -> Icons.Filled.TouchApp
     "TYPE" -> Icons.Filled.Keyboard
     "EXTRACT" -> Icons.Filled.Download
@@ -128,6 +130,7 @@ fun nodeSummary(node: FlowNode): String {
         "TRIGGER" -> "Starts this flow"
         "OPEN_BROWSER" -> withTarget("Opens", c("url"), "Opens a browser session")
         "NAVIGATE" -> withTarget("Navigates to", c("url"), "Navigates to a URL")
+        "AWAIT_LOGIN" -> withTarget("Waits for sign-in marker", c("selector"), "Waits for a human to sign in")
         "CLICK" -> withTarget("Clicks", c("selector"), "Clicks a page element")
         "TYPE" -> withTarget("Types into", c("selector"), "Types text into a page field")
         "EXTRACT" -> {
@@ -164,21 +167,37 @@ fun nodeMetaChips(node: FlowNode): List<String> {
         "{{" in value -> "dynamic value"
         else -> "fixed value"
     }
+    fun customWaitChip(default: Int = ELEMENT_WAIT_MS): String? {
+        val configured = c("waitMs").toIntOrNull() ?: return null
+        val bounded = configured.coerceIn(0, MAX_ELEMENT_WAIT_MS)
+        return if (bounded == default) null else "${bounded}ms wait"
+    }
     return when (node.kind) {
         "OPEN_BROWSER" -> listOf(if (c("headless").equals("true", true)) "headless" else "visible")
+        "AWAIT_LOGIN" -> {
+            val waitMs = c("waitMs").toIntOrNull()?.coerceIn(0, MAX_ELEMENT_WAIT_MS) ?: LOGIN_WAIT_MS
+            listOf(c("selectorType").ifBlank { "css" }, "${waitMs}ms wait")
+        }
         "HTTP" -> buildList {
             add(c("method").ifBlank { "GET" }.uppercase())
             if ("\$secret." in c("headers") || "\$secret." in c("body") || "\$secret." in c("url")) add("uses secret")
         }
-        "CLICK" -> listOf(c("selectorType").ifBlank { "css" })
-        "TYPE" -> listOf(c("selectorType").ifBlank { "css" }, valueSource(c("text")))
+        "CLICK" -> buildList {
+            add(c("selectorType").ifBlank { "css" })
+            customWaitChip()?.let(::add)
+        }
+        "TYPE" -> buildList {
+            add(c("selectorType").ifBlank { "css" })
+            add(valueSource(c("text")))
+            customWaitChip()?.let(::add)
+        }
         "INJECT" -> {
             val waitFor = c("waitFor")
             if (waitFor.isBlank()) {
                 listOf("runs immediately")
             } else {
-                val waitMs = c("waitMs").toIntOrNull() ?: 20_000
-                listOf(c("waitForType").ifBlank { "css" }, "${waitMs.coerceAtLeast(0)}ms wait")
+                val waitMs = c("waitMs").toIntOrNull()?.coerceIn(0, MAX_ELEMENT_WAIT_MS) ?: ELEMENT_WAIT_MS
+                listOf(c("waitForType").ifBlank { "css" }, "${waitMs}ms wait")
             }
         }
         "EXTRACT" -> buildList {
@@ -186,6 +205,7 @@ fun nodeMetaChips(node: FlowNode): List<String> {
             add(c("mode").ifBlank { "text" })
             if (c("multiple").equals("true", true)) add("all matches")
             if (c("optional").equals("true", true)) add("optional")
+            customWaitChip()?.let(::add)
         }
         else -> emptyList()
     }
@@ -252,9 +272,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode, displayNumber: Int) {
                         val change = event.changes.firstOrNull { it.id == down.id } ?: break
                         if (!change.pressed) break
                         val delta = change.positionChange()
-                        if (delta != Offset.Zero) {
-                            node.x += delta.x
-                            node.y += delta.y
+                        if (state.moveNodeBy(node, delta)) {
                             change.consume()
                         }
                     }

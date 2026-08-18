@@ -78,7 +78,7 @@ class FlowLayoutTest {
 
     @Test
     fun `new node placement reuses a deleted slot without colliding`() {
-        val step = nodeOuterWidth() + 120f
+        val step = newNodeStepX()
         val position = collisionFreeNodePosition(
             existing = listOf(
                 node("first", x = NEW_NODE_ORIGIN_X, y = NEW_NODE_ORIGIN_Y),
@@ -88,6 +88,19 @@ class FlowLayoutTest {
         )
 
         assertEquals(Offset(NEW_NODE_ORIGIN_X + step, NEW_NODE_ORIGIN_Y), position)
+    }
+
+    @Test
+    fun `off-grid card searches enough standard slots before falling back`() {
+        val position = collisionFreeNodePosition(
+            existing = listOf(node("between-slots", x = 500f, y = NEW_NODE_ORIGIN_Y)),
+            newNodeHeight = 100f,
+        )
+
+        assertEquals(
+            Offset(NEW_NODE_ORIGIN_X + newNodeStepX() * 2, NEW_NODE_ORIGIN_Y),
+            position,
+        )
     }
 
     @Test
@@ -105,5 +118,55 @@ class FlowLayoutTest {
         assertFalse(state.canUndoTidyLayout)
         assertEquals(original.getValue(first.id), Offset(first.x, first.y))
         assertEquals(original.getValue(second.id), Offset(second.x, second.y))
+    }
+
+    @Test
+    fun `manual movement retires tidy undo instead of discarding later work`() {
+        val state = FlowGraphState()
+        val first = state.addNode(NodeType.TRIGGER.name, Offset(200f, 200f))
+        val second = state.addNode(NodeType.SET.name, Offset(200f, 200f))
+        state.connect(first.id, 0, second.id, 0)
+        assertTrue(state.tidyLayout())
+
+        val delta = Offset(45f, 30f)
+        val beforeMove = Offset(second.x, second.y)
+        assertTrue(state.moveNodeBy(second.id, delta))
+
+        assertFalse(state.canUndoTidyLayout)
+        assertFalse(state.undoTidyLayout())
+        assertEquals(beforeMove + delta, Offset(second.x, second.y))
+    }
+
+    @Test
+    fun `tidy is idempotent and load clears its undo snapshot`() {
+        val state = FlowGraphState()
+        val first = state.addNode(NodeType.TRIGGER.name, Offset(200f, 200f))
+        val second = state.addNode(NodeType.SET.name, Offset(200f, 200f))
+        state.connect(first.id, 0, second.id, 0)
+
+        assertTrue(state.tidyLayout())
+        assertFalse(state.tidyLayout())
+        assertTrue(state.canUndoTidyLayout)
+
+        assertTrue(state.load(state.toSnapshot()))
+        assertFalse(state.canUndoTidyLayout)
+    }
+
+    @Test
+    fun `topology edits and clear retire tidy undo`() {
+        val state = FlowGraphState()
+        val first = state.addNode(NodeType.TRIGGER.name, Offset(200f, 200f))
+        val second = state.addNode(NodeType.SET.name, Offset(200f, 200f))
+        state.connect(first.id, 0, second.id, 0)
+        assertTrue(state.tidyLayout())
+
+        state.addNode(NodeType.CODE.name, Offset(900f, 200f))
+        assertFalse(state.canUndoTidyLayout)
+
+        assertTrue(state.tidyLayout())
+        state.clearGraph()
+        assertFalse(state.canUndoTidyLayout)
+        assertTrue(state.nodes.isEmpty())
+        assertTrue(state.edges.isEmpty())
     }
 }

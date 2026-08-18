@@ -495,10 +495,8 @@ class FlowTabComponent(
             visibleTabId.getAndSet(null)?.let { id ->
                 runCatching { context.activeTabsProvider?.closeTab(id) }
             }
-            state.nodes.clear()
-            state.edges.clear()
+            state.clearGraph()
             state.clearRun()
-            state.selection = null
             // Component scope survives split-collapse recomposition. Closing the Flow
             // tab itself still cancels this scope before an undispatched clear can start.
             coroutineScope.launch(Dispatchers.IO) {

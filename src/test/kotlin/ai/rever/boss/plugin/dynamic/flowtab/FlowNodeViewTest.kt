@@ -53,6 +53,15 @@ class FlowNodeViewTest {
     }
 
     @Test
+    fun `action metadata surfaces only a customized element wait`() {
+        val normal = node(NodeType.CLICK, "selector" to "button")
+        val slow = node(NodeType.CLICK, "selector" to "button", "waitMs" to "60000")
+
+        assertEquals(listOf("css"), nodeMetaChips(normal))
+        assertEquals(listOf("css", "60000ms wait"), nodeMetaChips(slow))
+    }
+
+    @Test
     fun `metadata identifies dynamic and secret value sources without rendering values`() {
         val dynamic = node(NodeType.TYPE, "selectorType" to "xpath", "text" to "{{ \$json.name }}")
         val secret = node(NodeType.TYPE, "text" to "{{ \$secret.account_password }}")
@@ -98,5 +107,21 @@ class FlowNodeViewTest {
             nodeSummary(waiting),
         )
         assertEquals(listOf("xpath", "5000ms wait"), nodeMetaChips(waiting))
+    }
+
+    @Test
+    fun `await login card explains its marker and human wait`() {
+        val login = node(
+            NodeType.AWAIT_LOGIN,
+            "selectorType" to "xpath",
+            "selector" to "//button[@aria-label='Account']",
+            "waitMs" to "300000",
+        )
+
+        assertEquals(
+            "Waits for sign-in marker //button[@aria-label='Account']",
+            nodeSummary(login),
+        )
+        assertEquals(listOf("xpath", "300000ms wait"), nodeMetaChips(login))
     }
 }

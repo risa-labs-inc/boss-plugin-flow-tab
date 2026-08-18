@@ -146,8 +146,12 @@ class FlowControllerTest {
             fc.addNode(tabId, "__invalid_probe_kind__")
         }
 
-        assertContains(failure.message.orEmpty(), "__invalid_probe_kind__")
-        assertContains(failure.message.orEmpty(), "Valid kinds: CLICK, CODE")
+        val message = failure.message.orEmpty()
+        assertContains(message, "__invalid_probe_kind__")
+        assertContains(message, "Valid kinds:")
+        assertContains(message, "AWAIT_LOGIN")
+        assertContains(message, "CLICK")
+        assertContains(message, "CODE")
         assertTrue(fc.getFlow(tabId)!!.nodes.isEmpty())
     }
 

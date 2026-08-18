@@ -158,7 +158,8 @@ class FlowGraphState(
      */
     fun importChain(steps: List<ImportStep>, origin: Offset) {
         if (steps.isEmpty()) return
-        val stepX = nodeOuterWidth() + 120f
+        invalidateTidyUndo()
+        val stepX = newNodeStepX()
         var prevId: String? = null
         var firstId: String? = null
         steps.forEachIndexed { i, step ->
@@ -255,12 +256,44 @@ class FlowGraphState(
         return changed
     }
 
+    /** A later position or topology edit makes the one-step tidy snapshot unsafe. */
+    private fun invalidateTidyUndo() {
+        preTidyPositions = null
+    }
+
+    /** Move an already-resolved node from direct manipulation in O(1). */
+    fun moveNodeBy(node: FlowNode, delta: Offset): Boolean {
+        if (delta == Offset.Zero) return false
+        invalidateTidyUndo()
+        node.x += delta.x
+        node.y += delta.y
+        return true
+    }
+
+    /** Id-based convenience for non-pointer callers and tests. */
+    fun moveNodeBy(id: String, delta: Offset): Boolean =
+        nodeById(id)?.let { moveNodeBy(it, delta) } ?: false
+
+    /** Clear graph authoring state, including any pending tidy undo. */
+    fun clearGraph() {
+        invalidateTidyUndo()
+        nodes.clear()
+        edges.clear()
+        selection = null
+        pendingConnection = null
+        connecting = false
+        connectSnap = null
+        hoveredEdgeId = null
+        pickerRequest = null
+    }
+
     // ---- mutations ----------------------------------------------------------
 
     private fun newId(prefix: String): String = "$prefix${idCounter++}"
 
     /** Add a node of [spec] centered on [worldCenter]; returns and selects it. */
     fun addNode(spec: NodeSpec, worldCenter: Offset): FlowNode {
+        invalidateTidyUndo()
         val h = nodeHeight(spec)
         val node = FlowNode(
             id = newId("n"),
@@ -282,12 +315,16 @@ class FlowGraphState(
     fun nodeById(id: String): FlowNode? = nodes.firstOrNull { it.id == id }
 
     fun removeNode(id: String) {
+        if (nodes.none { it.id == id }) return
+        invalidateTidyUndo()
         edges.removeAll { it.fromNode == id || it.toNode == id }
         nodes.removeAll { it.id == id }
         if (selection == Selection.Node(id)) selection = null
     }
 
     fun removeEdge(id: String) {
+        if (edges.none { it.id == id }) return
+        invalidateTidyUndo()
         edges.removeAll { it.id == id }
         if (selection == Selection.Edge(id)) selection = null
     }
@@ -312,6 +349,7 @@ class FlowGraphState(
                 it.toNode == toNode && it.toPort == toPort
         }
         if (duplicate) return false
+        invalidateTidyUndo()
         edges.add(EdgeModel(newId("e"), fromNode, fromPort, toNode, toPort))
         return true
     }
@@ -406,8 +444,7 @@ class FlowGraphState(
             )
             return false
         }
-        nodes.clear()
-        edges.clear()
+        clearGraph()
         metadata = snapshot.metadata
         snapshot.nodes.forEach { nodes.add(FlowNode(it.id, registry.resolve(it.type), it.title, it.x, it.y, it.config)) }
         edges.addAll(snapshot.edges)
@@ -416,9 +453,6 @@ class FlowGraphState(
             .mapNotNull { it.drop(1).toLongOrNull() }
             .maxOrNull() ?: 0L
         idCounter = max(snapshot.nextId, maxExisting + 1)
-        selection = null
-        pendingConnection = null
-        preTidyPositions = null
         return true
     }
 

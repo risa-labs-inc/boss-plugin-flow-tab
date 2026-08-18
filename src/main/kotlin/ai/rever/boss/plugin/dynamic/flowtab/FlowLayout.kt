@@ -17,6 +17,10 @@ internal const val LAYOUT_ROW_GAP = 72f
 internal const val NEW_NODE_ORIGIN_X = 320f
 internal const val NEW_NODE_ORIGIN_Y = 200f
 internal const val NEW_NODE_GAP = 40f
+internal const val NEW_NODE_COLUMN_GAP = 120f
+
+/** Authoring uses a wider pitch than tidy columns so manually moved cards leave breathing room. */
+internal fun newNodeStepX(): Float = nodeOuterWidth() + NEW_NODE_COLUMN_GAP
 
 /**
  * Assign a deterministic left-to-right layered layout.
@@ -110,8 +114,10 @@ internal fun collisionFreeNodePosition(
     existing: List<LayoutNode>,
     newNodeHeight: Float,
 ): Offset {
-    val stepX = nodeOuterWidth() + 120f
-    for (column in 0..existing.size) {
+    val stepX = newNodeStepX()
+    // An off-grid card can straddle two standard slots, so inspect up to two
+    // candidates per existing card before using the guaranteed-right fallback.
+    for (column in 0..existing.size * 2) {
         val candidate = Offset(NEW_NODE_ORIGIN_X + column * stepX, NEW_NODE_ORIGIN_Y)
         if (existing.none { it.overlaps(candidate, newNodeHeight) }) return candidate
     }
