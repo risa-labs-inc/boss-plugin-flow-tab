@@ -6,6 +6,7 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.TabRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
@@ -13,6 +14,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -91,6 +93,141 @@ class AgentNodeTest {
         )
         assertEquals(RunStatus.SUCCESS, states["a"]!!.status)
         assertTrue(source.invoked.isEmpty()) // 'danger' was gated, 'safe' never called
+    }
+
+    @Test
+    fun `agent timeout fails the node instead of emitting a successful result`() {
+        val provider = FakeProvider { _, _, _, _ ->
+            delay(10_000)
+            AssistantTurn(text = "too late")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.TIMEOUT_KEY, "100")
+        }
+
+        val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
+
+        assertEquals(RunStatus.ERROR, states["a"]?.status)
+        assertEquals("Agent timed out after 100ms", states["a"]?.error)
+        assertTrue(states["a"]?.logs.orEmpty().any { it.startsWith("agent stopped: TIMEOUT") })
+        assertTrue(states["a"]?.output.orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `negative timeout is rejected before provider work starts`() {
+        val providerCalls = AtomicInteger()
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = {
+                FakeProvider { _, _, _, _ ->
+                    providerCalls.incrementAndGet()
+                    AssistantTurn(text = "should not run")
+                }
+            },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.TIMEOUT_KEY, "-5")
+        }
+
+        val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
+
+        assertEquals(RunStatus.ERROR, states["a"]?.status)
+        assertEquals("Agent timeout (timeoutMs) must be greater than 0", states["a"]?.error)
+        assertEquals(0, providerCalls.get())
+    }
+
+    @Test
+    fun `malformed timeout and non-positive max steps are configuration errors`() {
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { FakeProvider.scripted(AssistantTurn(text = "should not run")) },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val malformedTimeout = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.TIMEOUT_KEY, "1e3")
+        }
+        val zeroSteps = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.MAX_STEPS_KEY, "0")
+        }
+
+        val timeoutState = runFlow(
+            reg,
+            listOf(PlanNode("timeout", AgentNode.KIND, "Agent", malformedTimeout)),
+            emptyList(),
+        )["timeout"]
+        val stepsState = runFlow(
+            reg,
+            listOf(PlanNode("steps", AgentNode.KIND, "Agent", zeroSteps)),
+            emptyList(),
+        )["steps"]
+
+        assertEquals(RunStatus.ERROR, timeoutState?.status)
+        assertEquals(
+            "Agent timeout (timeoutMs) must be a whole number greater than 0",
+            timeoutState?.error,
+        )
+        assertEquals(RunStatus.ERROR, stepsState?.status)
+        assertEquals("Agent max steps (maxSteps) must be greater than 0", stepsState?.error)
+    }
+
+    @Test
+    fun `max steps remains a successful bounded result`() {
+        val source = RecordingSource(listOf("spin"))
+        val provider = FakeProvider { _, _, _, _ ->
+            AssistantTurn(toolCalls = listOf(ToolCall("1", "spin", "{}")))
+        }
+        val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.MAX_STEPS_KEY, "1")
+            put(AgentNode.ALLOWLIST_KEY, buildJsonArray {
+                add(kotlinx.serialization.json.JsonPrimitive("spin"))
+            })
+        }
+
+        val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
+
+        assertEquals(RunStatus.SUCCESS, states["a"]?.status)
+        assertEquals("MAX_STEPS", states["a"]?.output?.single()?.json?.get("stopReason")?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `token budget remains a successful bounded result`() {
+        val source = RecordingSource(listOf("spin"))
+        val provider = FakeProvider { _, _, _, _ ->
+            AssistantTurn(
+                toolCalls = listOf(ToolCall("1", "spin", "{}")),
+                usage = TokenUsage(input = 5, output = 5),
+            )
+        }
+        val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.MAX_TOKENS_KEY, "1")
+            put(AgentNode.ALLOWLIST_KEY, buildJsonArray {
+                add(kotlinx.serialization.json.JsonPrimitive("spin"))
+            })
+        }
+
+        val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
+
+        assertEquals(RunStatus.SUCCESS, states["a"]?.status)
+        assertEquals("TOKEN_BUDGET", states["a"]?.output?.single()?.json?.get("stopReason")?.jsonPrimitive?.content)
     }
 
     @Test

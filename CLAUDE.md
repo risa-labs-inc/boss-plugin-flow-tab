@@ -58,6 +58,24 @@ default that used to live on `AnthropicProvider`.
 `maxTokens` is still overridden per request (4096, not the provider's chat-completion default of
 2000) because a bounded tool-use loop needs the headroom. A run is bounded by `AgentBudget`.
 
+`timeoutMs` is a hard node deadline, not merely a check between agent steps. `AgentRuntime` owns
+its loop on a 64-call, concurrency-limited elastic IO view so a non-cooperative provider or tool
+boundary cannot prevent the caller from publishing TIMEOUT or consume every unrelated host IO
+permit. The budget clock starts only after the loop is admitted to that lane. If all slots remain
+occupied, a short bounded admission wait fails explicitly as Agent capacity exhaustion instead of
+pretending a provider timed out without running. The loop gets the configured cooperative deadline;
+a watchdog grace (at least 500ms, or 5% for longer runs) lets it publish complete counters normally
+before the hard caller deadline abandons a non-cooperative call. The scope is cancelled best-effort,
+no new host work starts after the deadline, and progress counters are snapshotted for the timeout
+diagnostic. A call that ignores cancellation may still finish against run-scoped state while cleanup
+is running; the lane bound contains that residue but cannot interrupt arbitrary host code. A
+serialized log gate closes before return so late completion cannot mutate the already-published node
+state. An agent TIMEOUT is converted to `ExecError` by `AgentNodeExecutor`;
+it must be a red node failure rather than a successful output carrying `stopReason: TIMEOUT`.
+`MAX_STEPS` and `TOKEN_BUDGET` remain successful bounded results because they may carry a usable
+partial answer. User-configured step, timeout, and token budgets must be positive whole numbers;
+zero does not mean unlimited.
+
 `plugin.json` declares `ai.rever.boss.plugin.dynamic.aigateway` as an **optional** dependency.
 Declaring it makes the host's one existing check work - `DynamicPluginManager.checkCanUnload`
 refuses to uninstall a plugin a loaded plugin depends on. Nothing reads `dependencies` at *install*

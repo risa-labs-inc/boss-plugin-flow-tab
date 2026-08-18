@@ -1,8 +1,17 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -113,13 +122,169 @@ class AgentRuntimeTest {
         // Without a per-call timeout the budget is only checked BETWEEN steps, so a hung
         // model/tool call runs unbounded (red-team S3). The runtime must interrupt it.
         val source = RecordingSource(listOf(desc("x")))
-        val provider = FakeProvider { _, _, _, _ -> delay(10_000); AssistantTurn(text = "too late") }
+        val provider = FakeProvider { step, _, _, _ ->
+            if (step == 0) {
+                AssistantTurn(
+                    text = "partial",
+                    toolCalls = listOf(call("x")),
+                    usage = TokenUsage(input = 2, output = 1),
+                )
+            } else {
+                delay(10_000)
+                AssistantTurn(text = "too late")
+            }
+        }
         val started = System.currentTimeMillis()
         val result = AgentRuntime(provider, source, AgentBudget(timeoutMs = 200))
             .run(system = "s", input = "go", allowlist = setOf("x"))
         val elapsed = System.currentTimeMillis() - started
         assertEquals(StopReason.TIMEOUT, result.stopReason)
+        assertEquals("partial", result.finalText)
+        assertEquals(1, result.steps)
+        assertEquals(1, result.toolCalls)
+        assertEquals(TokenUsage(input = 2, output = 1), result.usage)
         assertTrue(elapsed < 3_000, "hung step must be cut near the budget, not after the full hang (was ${elapsed}ms)")
+    }
+
+    @Test
+    fun `a non-cooperative provider cannot hold the caller past the wall-clock budget`() = runBlocking {
+        val source = RecordingSource(listOf(desc("first"), desc("late")))
+        val logs = mutableListOf<String>()
+        val providerBlocked = CompletableDeferred<Unit>()
+        val releaseProvider = CountDownLatch(1)
+        val providerFinished = CompletableDeferred<Unit>()
+        val provider = FakeProvider { step, _, _, _ ->
+            if (step == 0) {
+                AssistantTurn(
+                    text = "partial answer",
+                    toolCalls = listOf(call("first")),
+                    usage = TokenUsage(input = 4, output = 3),
+                )
+            } else {
+                providerBlocked.complete(Unit)
+                try {
+                    releaseProvider.await() // deliberately ignores coroutine cancellation
+                    AssistantTurn(toolCalls = listOf(call("late")))
+                } finally {
+                    providerFinished.complete(Unit)
+                }
+            }
+        }
+        val started = System.currentTimeMillis()
+        val running = async {
+            AgentRuntime(provider, source, AgentBudget(timeoutMs = 500))
+                .run(system = "s", input = "go", allowlist = setOf("first", "late"), log = logs::add)
+        }
+        var logsAtTimeout = emptyList<String>()
+
+        val result = try {
+            withTimeout(5_000) { providerBlocked.await() }
+            running.await().also { logsAtTimeout = logs.toList() }
+        } finally {
+            releaseProvider.countDown()
+            withTimeout(5_000) { providerFinished.await() }
+            yield()
+        }
+        val elapsed = System.currentTimeMillis() - started
+
+        assertEquals(StopReason.TIMEOUT, result.stopReason)
+        assertEquals("partial answer", result.finalText)
+        assertEquals(1, result.steps)
+        assertEquals(1, result.toolCalls)
+        assertEquals(TokenUsage(input = 4, output = 3), result.usage)
+        assertTrue(elapsed < 2_000, "non-cooperative step held the caller for ${elapsed}ms")
+        assertEquals(logsAtTimeout, logs, "late completion must not mutate published timeout logs")
+        assertEquals(setOf("first"), source.invoked)
+    }
+
+    @Test
+    fun `a zero timeout returns before provider work starts`() = runBlocking {
+        var providerCalls = 0
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls++
+            AssistantTurn(text = "should not run")
+        }
+
+        val result = AgentRuntime(provider, RecordingSource(emptyList()), AgentBudget(timeoutMs = 0))
+            .run(system = "s", input = "go", allowlist = emptySet())
+
+        assertEquals(StopReason.TIMEOUT, result.stopReason)
+        assertEquals(0, providerCalls)
+    }
+
+    @Test
+    fun `caller cancellation is not converted to a timeout`() = runBlocking {
+        val providerStarted = CompletableDeferred<Unit>()
+        val provider = FakeProvider { _, _, _, _ ->
+            providerStarted.complete(Unit)
+            awaitCancellation()
+        }
+        val running = async {
+            AgentRuntime(provider, RecordingSource(emptyList()), AgentBudget(timeoutMs = 10_000))
+                .run(system = "s", input = "go", allowlist = emptySet())
+        }
+        withTimeout(5_000) { providerStarted.await() }
+
+        running.cancel()
+
+        assertTrue(runCatching { running.await() }.exceptionOrNull() is CancellationException)
+    }
+
+    @Test
+    fun `a saturated execution lane fails admission without invoking another provider`() = runBlocking {
+        val lane = Dispatchers.IO.limitedParallelism(1)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CountDownLatch(1)
+        val firstFinished = CompletableDeferred<Unit>()
+        val firstProvider = FakeProvider { _, _, _, _ ->
+            firstStarted.complete(Unit)
+            try {
+                releaseFirst.await()
+                AssistantTurn(text = "released")
+            } finally {
+                firstFinished.complete(Unit)
+            }
+        }
+        val first = async {
+            AgentRuntime(
+                firstProvider,
+                RecordingSource(emptyList()),
+                AgentBudget(timeoutMs = 5_000),
+                executionDispatcher = lane,
+            ).run(system = "s", input = "go", allowlist = emptySet())
+        }
+        withTimeout(5_000) { firstStarted.await() }
+
+        val secondCalls = AtomicInteger()
+        val secondProvider = FakeProvider { _, _, _, _ ->
+            secondCalls.incrementAndGet()
+            AssistantTurn(text = "must not run")
+        }
+        val started = System.currentTimeMillis()
+        val failure = runCatching {
+            AgentRuntime(
+                secondProvider,
+                RecordingSource(emptyList()),
+                AgentBudget(timeoutMs = 200),
+                executionDispatcher = lane,
+            ).run(system = "s", input = "go", allowlist = emptySet())
+        }.exceptionOrNull()
+        val elapsed = System.currentTimeMillis() - started
+
+        try {
+            assertTrue(failure is ExecError)
+            assertEquals(
+                "Agent execution capacity is busy; retry after other Agent runs finish",
+                failure.message,
+            )
+            assertEquals(0, secondCalls.get())
+            assertTrue(elapsed < 2_000, "capacity admission waited ${elapsed}ms")
+        } finally {
+            first.cancel()
+            releaseFirst.countDown()
+            withTimeout(5_000) { firstFinished.await() }
+            runCatching { first.await() }
+        }
     }
 
     // ---- tool output is data, not instructions ------------------------------
