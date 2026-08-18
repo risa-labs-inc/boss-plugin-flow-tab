@@ -168,6 +168,16 @@ single-quoted JavaScript literals. `BrowserScripts` escapes quotes, backslashes,
 line terminator, and ASCII control characters before interpolation; keep all new browser-script
 string inputs on that shared escaping path.
 
+### Template expression resolution
+
+Flow templates are deterministic JSON paths, not JavaScript. They support `$json` and
+`$node["Title"].json` roots with `.key`, `.0`, `["key"]`, and `[index]` segments. Numeric dotted
+segments index arrays, so paths such as `$json.slides.0.title` are valid. A missing property,
+missing node output, malformed segment, or JavaScript-like property access throws a
+`TemplateResolutionException` naming the full expression; consuming nodes must preserve that
+message instead of converting it to empty text or masking it as malformed config. An explicitly
+present JSON null is resolved successfully and keeps its normal null/empty rendering semantics.
+
 ### Canvas node cards
 
 Nodes render a one-based creation-order badge, their registry type, custom title, and a concise

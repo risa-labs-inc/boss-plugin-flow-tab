@@ -385,9 +385,13 @@ object NodeCatalog {
 
         NodeType.SET -> NodeExecutor { _, cfg, inputs, _ ->
             val current = inputs.firstOrNull()?.json ?: JsonObject(emptyMap())
-            val assignments = runCatching {
+            val assignments = try {
                 EXEC_JSON.parseToJsonElement(cfg.str("assignments").ifEmpty { "{}" }).jsonObject
-            }.getOrElse { throw ExecError("Set: 'assignments' must be a JSON object") }
+            } catch (e: TemplateResolutionException) {
+                throw e
+            } catch (_: Exception) {
+                throw ExecError("Set: 'assignments' must be a JSON object")
+            }
             val merged = buildJsonObject {
                 current.forEach { (k, v) -> put(k, v) }
                 // assignment values are templates resolved against the current item
@@ -400,8 +404,13 @@ object NodeCatalog {
         }
 
         NodeType.CODE -> NodeExecutor { _, cfg, _, log ->
-            val rendered = runCatching { cfg.jsonTemplate("code") }
-                .getOrElse { throw ExecError("Code: 'code' must be valid JSON: ${it.message}") }
+            val rendered = try {
+                cfg.jsonTemplate("code")
+            } catch (e: TemplateResolutionException) {
+                throw e
+            } catch (e: Exception) {
+                throw ExecError("Code: 'code' must be valid JSON: ${e.message}")
+            }
                 ?: throw ExecError("Code needs an output JSON template")
             val obj = rendered as? JsonObject
                 ?: throw ExecError("Code: the JSON template must produce an object")

@@ -456,6 +456,23 @@ class FlowExecutorTest {
     }
 
     @Test
+    fun `set and code fail at an unresolved template expression`() {
+        val set = runGraph(
+            listOf(n("s", NodeType.SET, "assignments" to """{"message":"{{ ${'$'}json.missing }}"}""")),
+            emptyList(),
+        )
+        val code = runGraph(
+            listOf(n("c", NodeType.CODE, "code" to """{"message":"{{ ${'$'}json.missing }}"}""")),
+            emptyList(),
+        )
+
+        assertEquals(RunStatus.ERROR, set["s"]?.status)
+        assertEquals("Unresolved template expression '{{ ${'$'}json.missing }}'", set["s"]?.error)
+        assertEquals(RunStatus.ERROR, code["c"]?.status)
+        assertEquals("Unresolved template expression '{{ ${'$'}json.missing }}'", code["c"]?.error)
+    }
+
+    @Test
     fun `if independently routes multiple items through both output ports`() {
         val registry = builtinNodeRegistry().also { reg ->
             reg.register(
