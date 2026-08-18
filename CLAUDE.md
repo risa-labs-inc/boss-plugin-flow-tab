@@ -92,14 +92,16 @@ details remain visible there even though they are not copied into progress logs.
 remains its own plain capacity error because no Agent run started. Runtime-owned terminal logging is
 intentional—the executor cannot reliably log after a thrown provider boundary.
 
-Agent structured output is optional and backward-compatible. A non-blank `outputSchema` must be
-an object JSON Schema; Flow advertises a reserved `flow_submit_output` tool whose input schema is
-that exact contract and appends a system instruction requiring the model to call it alone for the
-final answer. Provider-side argument checking is not the trust boundary: Flow parses and validates
-the submitted object locally before it becomes an item. An invalid submission is returned as a
-tool error so the model can correct it within the existing step/token/time budgets. Plain-text
-answers receive a bounded correction prompt. If a valid object is never submitted, the node fails
-closed and withholds model prose. A valid structured object becomes the item itself, with no
+Agent structured output is optional and backward-compatible. A non-blank `outputSchema` must have
+root `"type": "object"`; Flow advertises a reserved `flow_submit_output` tool whose input schema
+is that exact contract and appends a system instruction requiring the model to call it alone for
+the final answer. Provider-side argument checking is not the trust boundary: Flow parses and
+validates the submitted object locally before it becomes an item. An invalid submission is returned
+as a tool error so the model can correct it within the existing step/token/time budgets. Structured
+mode permits three non-empty invalid attempts total—the initial attempt plus two corrections—and
+fails immediately on an empty model turn so provider transcripts cannot acquire adjacent user
+messages. If a valid object is never submitted, the node fails closed and withholds model prose. A
+valid structured object becomes the item itself, with no
 `text`, `stopReason`, or counter fields added; agents without `outputSchema` retain the historical
 free-text item shape exactly. Structured-output logs record only accepted/rejected/missing status,
 never submitted values.

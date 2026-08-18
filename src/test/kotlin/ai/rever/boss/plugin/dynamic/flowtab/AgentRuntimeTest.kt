@@ -193,6 +193,24 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `token budget wins when the same turn also exhausts max steps`() = runBlocking {
+        val source = RecordingSource(listOf(desc("spin")))
+        val provider = FakeProvider { _, _, _, _ ->
+            AssistantTurn(
+                toolCalls = listOf(call("spin")),
+                usage = TokenUsage(input = 1, output = 1),
+            )
+        }
+
+        val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 1, maxTokens = 1))
+            .run(system = "s", input = "go", allowlist = setOf("spin"))
+
+        assertEquals(StopReason.TOKEN_BUDGET, result.stopReason)
+        assertEquals(1, result.steps)
+        assertEquals(1, result.toolCalls)
+    }
+
+    @Test
     fun `a provider step that hangs is bounded by the wall-clock budget`() = runBlocking {
         // Without a per-call timeout the budget is only checked BETWEEN steps, so a hung
         // model/tool call runs unbounded (red-team S3). The runtime must interrupt it.

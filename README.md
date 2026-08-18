@@ -14,7 +14,7 @@ together with edges, n8n style.
 - **Agent structured output** optionally takes an object JSON Schema. In that mode the
   model submits its result through a schema-shaped tool, Flow validates it locally, and
   downstream nodes receive the parsed object instead of model prose. Invalid submissions
-  are returned to the model for correction and never enter the item stream.
+  get at most two correction rounds and never enter the item stream.
 - **Empty output stops a branch**: downstream nodes are marked Skipped rather than
   being seeded with a synthetic item and executed.
 - **If conditions** support whitespace-delimited `==`, `!=`, `>`, `>=`, `<`, and `<=`.

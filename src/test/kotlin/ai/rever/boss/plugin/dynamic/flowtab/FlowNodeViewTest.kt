@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.test.Test
@@ -161,6 +162,10 @@ class FlowNodeViewTest {
                     },
                 ),
             ),
+        )
+        assertEquals(
+            "Runs an AI agent with approved tools",
+            nodeSummary(agent(buildJsonObject { put(AgentNode.OUTPUT_SCHEMA_KEY, buildJsonArray {}) })),
         )
     }
 }

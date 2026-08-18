@@ -47,8 +47,13 @@ object AgentNode {
             "Output JSON Schema (optional)",
             FieldType.JSON,
             placeholder = """{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}""",
-            note = "Fixed per node; templates are not resolved. Basic object/property/type/required/enum schemas " +
-                "are the most portable across AI providers.",
+        ),
+        ConfigField(
+            "outputSchemaInfo",
+            "Structured output notes",
+            FieldType.INFO,
+            note = "The schema is fixed per node; templates are not resolved. Basic object/property/type/required/enum schemas " +
+                "are the most portable across AI providers. The tool name flow_submit_output is reserved.",
         ),
         ConfigField(
             MODEL_KEY,

@@ -69,6 +69,12 @@ class AgentStructuredOutputTest {
             "Agent output schema (outputSchema) must describe an object",
             assertFailsWith<ExecError> { AgentStructuredOutput.parse("""{"type":"string"}""") }.message,
         )
+        assertEquals(
+            "Agent output schema (outputSchema) must describe an object",
+            assertFailsWith<ExecError> {
+                AgentStructuredOutput.parse("""{"properties":{"answer":{"type":"string"}}}""")
+            }.message,
+        )
         assertContains(
             assertFailsWith<ExecError> {
                 AgentStructuredOutput.parse(
@@ -150,6 +156,29 @@ class AgentStructuredOutputTest {
         assertEquals(
             "$.specialCode is required",
             schema.validate(obj("""{"choice":"special","name":"ABC","count":4,"tags":[],"allowed":true}""")),
+        )
+    }
+
+    @Test
+    fun `numeric equality applies to const enum and unique items`() {
+        val schema = AgentStructuredOutput.parse(
+            """
+            {
+              "type":"object",
+              "properties":{
+                "constant":{"const":1},
+                "choice":{"enum":[1,2]},
+                "values":{"type":"array","uniqueItems":true}
+              },
+              "required":["constant","choice","values"]
+            }
+            """.trimIndent(),
+        )
+
+        assertNull(schema.validate(obj("""{"constant":1.0,"choice":2.0,"values":[1,2.0]}""")))
+        assertEquals(
+            "$.values must contain unique items",
+            schema.validate(obj("""{"constant":1.0,"choice":2.0,"values":[1,1.0]}""")),
         )
     }
 

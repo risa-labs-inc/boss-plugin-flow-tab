@@ -19,10 +19,11 @@ import kotlinx.serialization.json.intOrNull
  * but not trusted as the correctness boundary: [validate] checks the submitted value
  * again before it can enter the flow item stream.
  */
-data class AgentOutputSchema(
+class AgentOutputSchema internal constructor(
     val json: JsonObject,
-    val source: String,
 ) {
+    val source: String = json.toString()
+
     fun validate(value: JsonObject): String? = AgentStructuredOutput.validate(json, value)
 }
 
@@ -48,11 +49,11 @@ internal object AgentStructuredOutput {
         val root = parsed as? JsonObject
             ?: throw ExecError("Agent output schema (outputSchema) must be a JSON object")
         val rootTypes = schemaTypes(root, "\$")
-        if (rootTypes != null && "object" !in rootTypes) {
+        if (rootTypes != setOf("object")) {
             throw ExecError("Agent output schema (outputSchema) must describe an object")
         }
         validateSchema(root, "\$")
-        return AgentOutputSchema(root, root.toString())
+        return AgentOutputSchema(root)
     }
 
     fun descriptor(schema: AgentOutputSchema): ToolDescriptor = ToolDescriptor(
@@ -95,10 +96,12 @@ internal object AgentStructuredOutput {
         }
 
         obj["const"]?.let { expected ->
-            if (value != expected) return "$path must equal ${display(expected)}"
+            if (!jsonEqual(value, expected)) return "$path must equal ${display(expected)}"
         }
         (obj["enum"] as? JsonArray)?.let { allowed ->
-            if (value !in allowed) return "$path must be one of ${allowed.joinToString { display(it) }}"
+            if (allowed.none { jsonEqual(value, it) }) {
+                return "$path must be one of ${allowed.joinToString { display(it) }}"
+            }
         }
 
         val types = schemaTypes(obj, path)
@@ -117,7 +120,6 @@ internal object AgentStructuredOutput {
         }
         return null
     }
-
     private fun validateObject(schema: JsonObject, value: JsonObject, path: String): String? {
         val required = schema["required"] as? JsonArray
         required?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.forEach { key ->
@@ -155,9 +157,7 @@ internal object AgentStructuredOutput {
         }
         schema.nonNegativeInt("minItems")?.let { if (value.size < it) return "$path must have at least $it items" }
         schema.nonNegativeInt("maxItems")?.let { if (value.size > it) return "$path must have at most $it items" }
-        if ((schema["uniqueItems"] as? JsonPrimitive)?.strictBooleanOrNull() == true &&
-            value.distinct().size != value.size
-        ) {
+        if ((schema["uniqueItems"] as? JsonPrimitive)?.strictBooleanOrNull() == true && hasDuplicate(value)) {
             return "$path must contain unique items"
         }
         return null
@@ -289,6 +289,27 @@ internal object AgentStructuredOutput {
 
     private fun JsonPrimitive.strictBooleanOrNull(): Boolean? =
         takeUnless(JsonPrimitive::isString)?.booleanOrNull
+
+    private fun hasDuplicate(values: JsonArray): Boolean =
+        values.indices.any { left ->
+            ((left + 1) until values.size).any { right -> jsonEqual(values[left], values[right]) }
+        }
+
+    private fun jsonEqual(left: JsonElement, right: JsonElement): Boolean = when {
+        left is JsonPrimitive && right is JsonPrimitive &&
+            !left.isString && !right.isString &&
+            left.booleanOrNull == null && right.booleanOrNull == null &&
+            left !== JsonNull && right !== JsonNull -> {
+            val leftNumber = left.content.toBigDecimalOrNull()
+            val rightNumber = right.content.toBigDecimalOrNull()
+            leftNumber != null && rightNumber != null && leftNumber.compareTo(rightNumber) == 0
+        }
+        left is JsonArray && right is JsonArray ->
+            left.size == right.size && left.indices.all { jsonEqual(left[it], right[it]) }
+        left is JsonObject && right is JsonObject ->
+            left.keys == right.keys && left.all { (key, value) -> jsonEqual(value, right.getValue(key)) }
+        else -> left == right
+    }
 
     private fun propertyPath(parent: String, key: String): String =
         if (SIMPLE_PROPERTY.matches(key)) "$parent.$key" else "$parent[${display(JsonPrimitive(key))}]"

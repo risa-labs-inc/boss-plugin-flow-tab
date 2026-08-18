@@ -127,6 +127,7 @@ class AgentNodeTest {
         assertEquals(schema.toString(), seenTools.single { it.name == AgentStructuredOutput.TOOL_NAME }.inputSchema)
         assertTrue(source.invoked.isEmpty())
         assertTrue(state.logs.contains("agent structured output submission: accepted"))
+        assertTrue(state.logs.contains("agent non-structured text withheld (32 chars)"))
         assertFalse(state.logs.joinToString("\n").contains("#main"))
         assertFalse(state.logs.joinToString("\n").contains("this text must not become output"))
     }
@@ -210,6 +211,41 @@ class AgentNodeTest {
     }
 
     @Test
+    fun `structured mode can use a real tool before submitting its result`() {
+        val source = RecordingSource(listOf("lookup"))
+        var sawToolOutcome = false
+        val provider = FakeProvider { step, _, messages, _ ->
+            if (step == 0) {
+                AssistantTurn(toolCalls = listOf(ToolCall("lookup-1", "lookup", "{}")))
+            } else {
+                sawToolOutcome = (messages.last() as ToolResultsMsg).outcomes.single().name == "lookup"
+                AssistantTurn(
+                    toolCalls = listOf(
+                        ToolCall("output-1", AgentStructuredOutput.TOOL_NAME, """{"answer":"found"}"""),
+                    ),
+                )
+            }
+        }
+        val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "look it up")
+            put(
+                AgentNode.OUTPUT_SCHEMA_KEY,
+                """{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}""",
+            )
+            put(AgentNode.ALLOWLIST_KEY, buildJsonArray { add(JsonPrimitive("lookup")) })
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals("found", state.output.single().json.getValue("answer").jsonPrimitive.content)
+        assertTrue(sawToolOutcome)
+        assertTrue(source.invoked.contains("lookup"))
+    }
+
+    @Test
     fun `plain text is retried and fails closed when the step budget ends`() {
         var sawCorrection = false
         val provider = FakeProvider { _, _, messages, _ ->
@@ -242,6 +278,58 @@ class AgentNodeTest {
         assertTrue(state.output.isEmpty())
         assertTrue(state.logs.contains("agent non-structured final text withheld (28 chars)"))
         assertFalse(state.logs.joinToString("\n").contains("secret prose instead of json"))
+    }
+
+    @Test
+    fun `structured correction attempts have their own cap`() {
+        val providerCalls = AtomicInteger()
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls.incrementAndGet()
+            AssistantTurn(text = "still prose")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "answer")
+            put(AgentNode.MAX_STEPS_KEY, "8")
+            put(AgentNode.OUTPUT_SCHEMA_KEY, """{"type":"object","properties":{"answer":{"type":"string"}}}""")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertContains(state.error.orEmpty(), "did not produce valid structured output after 3 attempts")
+        assertEquals(3, providerCalls.get())
+        assertTrue(state.output.isEmpty())
+    }
+
+    @Test
+    fun `blank structured response fails without creating a correction turn`() {
+        val providerCalls = AtomicInteger()
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls.incrementAndGet()
+            AssistantTurn(text = null)
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.OUTPUT_SCHEMA_KEY, """{"type":"object","properties":{"answer":{"type":"string"}}}""")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertContains(state.error.orEmpty(), "returned an empty response instead of required structured output")
+        assertEquals(1, providerCalls.get())
+        assertTrue(state.output.isEmpty())
     }
 
     @Test

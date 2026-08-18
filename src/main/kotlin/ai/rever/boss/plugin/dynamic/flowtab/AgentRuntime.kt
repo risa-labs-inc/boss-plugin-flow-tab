@@ -298,12 +298,13 @@ class AgentRuntime(
         var toolCalls = 0
         var usage = TokenUsage()
         var lastText = ""
+        var structuredFailures = 0
 
         while (true) {
-            if (steps >= budget.maxSteps) return done(lastText, StopReason.MAX_STEPS, steps, toolCalls, usage)
             if (usage.total >= budget.maxTokens) {
                 return done(lastText, StopReason.TOKEN_BUDGET, steps, toolCalls, usage)
             }
+            if (steps >= budget.maxSteps) return done(lastText, StopReason.MAX_STEPS, steps, toolCalls, usage)
             if (System.currentTimeMillis() - started >= budget.timeoutMs)
                 return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
 
@@ -331,6 +332,9 @@ class AgentRuntime(
                             val parsed = AgentStructuredOutput.parseSubmission(call.argsJson, outputSchema)
                             val value = parsed.getOrNull()
                             if (value != null) {
+                                turn.text?.takeIf { it.isNotBlank() }?.let {
+                                    log("agent non-structured text withheld (${it.length} chars)")
+                                }
                                 log("agent structured output submission: accepted")
                                 return done(
                                     text = "",
@@ -350,20 +354,31 @@ class AgentRuntime(
                             )
                         } else {
                             val prefix = "agent tool $toolCalls '${safeToolName(call.name)}'"
-                            log("$prefix: blocked (structured output must be submitted alone)")
+                            log("$prefix: blocked (structured output must be submitted exactly once, alone)")
                             ToolOutcome(
                                 call.id,
                                 call.name,
-                                "flow_submit_output must be the only tool call in its turn",
+                                "flow_submit_output must be called exactly once and be the only tool call in its turn",
                                 isError = true,
                             )
                         }
+                    }
+                    structuredFailures++
+                    if (structuredFailures >= MAX_STRUCTURED_OUTPUT_FAILURES) {
+                        throw ExecError(STRUCTURED_OUTPUT_FAILURE_MESSAGE)
                     }
                     messages.add(ToolResultsMsg(outcomes))
                     continue
                 }
                 if (turn.toolCalls.isEmpty()) {
+                    if (turn.text.isNullOrBlank()) {
+                        throw ExecError("Agent returned an empty response instead of required structured output")
+                    }
                     log("agent structured output submission: missing")
+                    structuredFailures++
+                    if (structuredFailures >= MAX_STRUCTURED_OUTPUT_FAILURES) {
+                        throw ExecError(STRUCTURED_OUTPUT_FAILURE_MESSAGE)
+                    }
                     messages.add(UserMsg(AgentStructuredOutput.MISSING_SUBMISSION_MESSAGE))
                     continue
                 }
@@ -432,6 +447,9 @@ class AgentRuntime(
         const val ADMISSION_TIMEOUT_MS = 1_000L
         const val MIN_HARD_TIMEOUT_GRACE_MS = 500L
         const val MAX_LOG_TOOL_NAME_CHARS = 80
+        const val MAX_STRUCTURED_OUTPUT_FAILURES = 3
+        const val STRUCTURED_OUTPUT_FAILURE_MESSAGE =
+            "Agent did not produce valid structured output after 3 attempts (initial attempt plus 2 corrections)"
 
         // Dispatchers.IO's elastic limited view confines permanently wedged Flow Agent
         // calls without consuming every permit used by unrelated host IO. Once saturated,
