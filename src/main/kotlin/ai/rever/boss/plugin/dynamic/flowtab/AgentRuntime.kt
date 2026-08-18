@@ -301,6 +301,9 @@ class AgentRuntime(
 
         while (true) {
             if (steps >= budget.maxSteps) return done(lastText, StopReason.MAX_STEPS, steps, toolCalls, usage)
+            if (usage.total >= budget.maxTokens) {
+                return done(lastText, StopReason.TOKEN_BUDGET, steps, toolCalls, usage)
+            }
             if (System.currentTimeMillis() - started >= budget.timeoutMs)
                 return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
 
@@ -357,17 +360,11 @@ class AgentRuntime(
                         }
                     }
                     messages.add(ToolResultsMsg(outcomes))
-                    if (usage.total >= budget.maxTokens) {
-                        return done(lastText, StopReason.TOKEN_BUDGET, steps, toolCalls, usage)
-                    }
                     continue
                 }
                 if (turn.toolCalls.isEmpty()) {
                     log("agent structured output submission: missing")
                     messages.add(UserMsg(AgentStructuredOutput.MISSING_SUBMISSION_MESSAGE))
-                    if (usage.total >= budget.maxTokens) {
-                        return done(lastText, StopReason.TOKEN_BUDGET, steps, toolCalls, usage)
-                    }
                     continue
                 }
             }
@@ -398,8 +395,6 @@ class AgentRuntime(
             }
             messages.add(ToolResultsMsg(outcomes))
 
-            if (usage.total >= budget.maxTokens)
-                return done(lastText, StopReason.TOKEN_BUDGET, steps, toolCalls, usage)
         }
     }
 

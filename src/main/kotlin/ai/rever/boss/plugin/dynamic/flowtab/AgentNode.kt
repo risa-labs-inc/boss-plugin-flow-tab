@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.flowtab
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.PluginContext
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -46,6 +47,8 @@ object AgentNode {
             "Output JSON Schema (optional)",
             FieldType.JSON,
             placeholder = """{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}""",
+            note = "Fixed per node; templates are not resolved. Basic object/property/type/required/enum schemas " +
+                "are the most portable across AI providers.",
         ),
         ConfigField(
             MODEL_KEY,
@@ -191,6 +194,7 @@ class AgentNodeExecutor(
     private fun parseOutputSchema(cfg: ConfigReader): AgentOutputSchema? {
         val configured = cfg.element(AgentNode.OUTPUT_SCHEMA_KEY) ?: return null
         val raw = when (configured) {
+            JsonNull -> return null
             is JsonPrimitive -> configured.content
             is JsonObject -> configured.toString()
             else -> throw ExecError("Agent output schema (outputSchema) must be a JSON object")

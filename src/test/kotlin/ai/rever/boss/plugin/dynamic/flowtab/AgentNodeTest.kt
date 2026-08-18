@@ -9,16 +9,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -95,8 +97,18 @@ class AgentNodeTest {
         }
         val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
         val reg = builtinNodeRegistry().also { it.register(spec) }
-        val schema =
-            """{"type":"object","properties":{"selector":{"type":"string"},"found":{"type":"boolean"}},"required":["selector","found"],"additionalProperties":false}"""
+        val schema = buildJsonObject {
+            put("type", "object")
+            put("properties", buildJsonObject {
+                put("selector", buildJsonObject { put("type", "string") })
+                put("found", buildJsonObject { put("type", "boolean") })
+            })
+            put("required", buildJsonArray {
+                add(JsonPrimitive("selector"))
+                add(JsonPrimitive("found"))
+            })
+            put("additionalProperties", false)
+        }
         val cfg = buildJsonObject {
             put(AgentNode.SYSTEM_KEY, "Use the page evidence.")
             put(AgentNode.INPUT_KEY, "locate the section")
@@ -112,7 +124,7 @@ class AgentNodeTest {
         assertTrue(output.getValue("found").jsonPrimitive.boolean)
         assertEquals(setOf("selector", "found"), output.keys)
         assertTrue(AgentStructuredOutput.SYSTEM_INSTRUCTION in seenSystem)
-        assertEquals(schema, seenTools.single { it.name == AgentStructuredOutput.TOOL_NAME }.inputSchema)
+        assertEquals(schema.toString(), seenTools.single { it.name == AgentStructuredOutput.TOOL_NAME }.inputSchema)
         assertTrue(source.invoked.isEmpty())
         assertTrue(state.logs.contains("agent structured output submission: accepted"))
         assertFalse(state.logs.joinToString("\n").contains("#main"))
@@ -255,6 +267,89 @@ class AgentNodeTest {
         assertEquals(RunStatus.ERROR, state.status)
         assertEquals("Agent output schema (outputSchema) must describe an object", state.error)
         assertEquals(0, providerCalls.get())
+    }
+
+    @Test
+    fun `explicit null output schema disables structured mode`() {
+        val provider = FakeProvider.scripted(AssistantTurn(text = "ordinary answer"))
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "answer")
+            put(AgentNode.OUTPUT_SCHEMA_KEY, JsonNull)
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals("ordinary answer", state.output.single().json.getValue("text").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `structured mode reports token budget and timeout without emitting prose`() {
+        fun specFor(provider: AgentProvider) = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val schema = """{"type":"object","properties":{"answer":{"type":"string"}}}"""
+
+        val tokenRegistry = builtinNodeRegistry().also {
+            it.register(
+                specFor(
+                    FakeProvider.scripted(
+                        AssistantTurn(text = "token-limited prose", usage = TokenUsage(input = 1, output = 1)),
+                    ),
+                ),
+            )
+        }
+        val tokenConfig = buildJsonObject {
+            put(AgentNode.OUTPUT_SCHEMA_KEY, schema)
+            put(AgentNode.MAX_TOKENS_KEY, "1")
+        }
+        val tokenState = runFlow(
+            tokenRegistry,
+            listOf(PlanNode("token", AgentNode.KIND, "Agent", tokenConfig)),
+            emptyList(),
+        ).getValue("token")
+
+        assertEquals(RunStatus.ERROR, tokenState.status)
+        assertContains(tokenState.error.orEmpty(), "Agent stopped: TOKEN_BUDGET")
+        assertTrue(tokenState.output.isEmpty())
+        assertFalse(tokenState.logs.joinToString("\n").contains("token-limited prose"))
+
+        val timeoutRegistry = builtinNodeRegistry().also {
+            it.register(
+                specFor(
+                    FakeProvider { _, _, _, _ ->
+                        delay(10_000)
+                        AssistantTurn(text = "timeout prose")
+                    },
+                ),
+            )
+        }
+        val timeoutConfig = buildJsonObject {
+            put(AgentNode.OUTPUT_SCHEMA_KEY, schema)
+            put(AgentNode.TIMEOUT_KEY, "100")
+        }
+        val timeoutState = runFlow(
+            timeoutRegistry,
+            listOf(PlanNode("timeout", AgentNode.KIND, "Agent", timeoutConfig)),
+            emptyList(),
+        ).getValue("timeout")
+
+        assertEquals(RunStatus.ERROR, timeoutState.status)
+        assertEquals(
+            "Agent stopped: TIMEOUT after 0 completed step(s), 0 attempted tool call(s); " +
+                "timeout was 100ms; no valid structured output was produced",
+            timeoutState.error,
+        )
+        assertTrue(timeoutState.output.isEmpty())
+        assertFalse(timeoutState.logs.joinToString("\n").contains("timeout prose"))
     }
 
     @Test

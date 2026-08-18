@@ -70,8 +70,8 @@ internal object AgentStructuredOutput {
     }
 
     fun validate(schema: JsonElement, value: JsonElement, path: String = "\$"): String? {
-        if (schema is JsonPrimitive && schema.booleanOrNull != null) {
-            return if (schema.booleanOrNull == true) null else "$path is rejected by the schema"
+        if (schema is JsonPrimitive && schema.strictBooleanOrNull() != null) {
+            return if (schema.strictBooleanOrNull() == true) null else "$path is rejected by the schema"
         }
         val obj = schema as? JsonObject ?: return "$path has an invalid schema"
 
@@ -133,7 +133,7 @@ internal object AgentStructuredOutput {
 
         val extras = value.keys - properties.keys
         when (val additional = schema["additionalProperties"]) {
-            is JsonPrimitive -> if (additional.booleanOrNull == false && extras.isNotEmpty()) {
+            is JsonPrimitive -> if (additional.strictBooleanOrNull() == false && extras.isNotEmpty()) {
                 return "${propertyPath(path, extras.first())} is not allowed"
             }
             is JsonObject -> extras.forEach { key ->
@@ -155,7 +155,9 @@ internal object AgentStructuredOutput {
         }
         schema.nonNegativeInt("minItems")?.let { if (value.size < it) return "$path must have at least $it items" }
         schema.nonNegativeInt("maxItems")?.let { if (value.size > it) return "$path must have at most $it items" }
-        if ((schema["uniqueItems"] as? JsonPrimitive)?.booleanOrNull == true && value.distinct().size != value.size) {
+        if ((schema["uniqueItems"] as? JsonPrimitive)?.strictBooleanOrNull() == true &&
+            value.distinct().size != value.size
+        ) {
             return "$path must contain unique items"
         }
         return null
@@ -187,7 +189,7 @@ internal object AgentStructuredOutput {
     }
 
     private fun validateSchema(schema: JsonElement, path: String) {
-        if (schema is JsonPrimitive && schema.booleanOrNull != null) return
+        if (schema is JsonPrimitive && schema.strictBooleanOrNull() != null) return
         val obj = schema as? JsonObject ?: throw ExecError("Agent output schema at $path must be an object or boolean")
         val unsupported = UNSUPPORTED_KEYWORDS.firstOrNull { it in obj }
         if (unsupported != null) {
@@ -224,18 +226,19 @@ internal object AgentStructuredOutput {
             if (it !is JsonArray || it.isEmpty()) throw ExecError("Agent output schema at $path has invalid 'enum'")
         }
         for (keyword in NON_NEGATIVE_INTEGER_KEYWORDS) obj[keyword]?.let {
-            if ((it as? JsonPrimitive)?.intOrNull?.let { number -> number >= 0 } != true) {
+            val number = (it as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)?.intOrNull
+            if (number == null || number < 0) {
                 throw ExecError("Agent output schema at $path has invalid '$keyword'")
             }
         }
         for (keyword in NUMBER_KEYWORDS) obj[keyword]?.let {
-            val number = (it as? JsonPrimitive)?.doubleOrNull
+            val number = (it as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)?.doubleOrNull
             if (number == null || !number.isFinite() || (keyword == "multipleOf" && number <= 0)) {
                 throw ExecError("Agent output schema at $path has invalid '$keyword'")
             }
         }
         obj["uniqueItems"]?.let {
-            if ((it as? JsonPrimitive)?.booleanOrNull == null) {
+            if ((it as? JsonPrimitive)?.strictBooleanOrNull() == null) {
                 throw ExecError("Agent output schema at $path has non-boolean 'uniqueItems'")
             }
         }
@@ -268,17 +271,24 @@ internal object AgentStructuredOutput {
         "object" -> value is JsonObject
         "array" -> value is JsonArray
         "string" -> value is JsonPrimitive && value.isString
-        "boolean" -> value is JsonPrimitive && value.booleanOrNull != null
+        "boolean" -> value is JsonPrimitive && value.strictBooleanOrNull() != null
         "null" -> value === JsonNull
         "number" -> value is JsonPrimitive && !value.isString && value.doubleOrNull != null
         "integer" -> value is JsonPrimitive && !value.isString && value.doubleOrNull?.let { it % 1.0 == 0.0 } == true
         else -> false
     }
 
-    private fun JsonObject.nonNegativeInt(key: String): Int? = (this[key] as? JsonPrimitive)?.intOrNull
-    private fun JsonObject.number(key: String): Double? = (this[key] as? JsonPrimitive)?.doubleOrNull
+    private fun JsonObject.nonNegativeInt(key: String): Int? =
+        (this[key] as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)?.intOrNull
+
+    private fun JsonObject.number(key: String): Double? =
+        (this[key] as? JsonPrimitive)?.takeUnless(JsonPrimitive::isString)?.doubleOrNull
+
     private fun JsonObject.string(key: String): String? =
         (this[key] as? JsonPrimitive)?.takeIf(JsonPrimitive::isString)?.content
+
+    private fun JsonPrimitive.strictBooleanOrNull(): Boolean? =
+        takeUnless(JsonPrimitive::isString)?.booleanOrNull
 
     private fun propertyPath(parent: String, key: String): String =
         if (SIMPLE_PROPERTY.matches(key)) "$parent.$key" else "$parent[${display(JsonPrimitive(key))}]"

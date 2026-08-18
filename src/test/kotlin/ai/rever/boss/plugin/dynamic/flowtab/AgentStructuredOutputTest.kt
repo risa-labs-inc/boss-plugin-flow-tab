@@ -88,6 +88,69 @@ class AgentStructuredOutputTest {
         assertEquals(obj("""{"answer":true}"""), AgentStructuredOutput.parseSubmission("""{"answer":true}""", schema).getOrThrow())
         assertEquals("the submission must be a JSON object", AgentStructuredOutput.parseSubmission("[]", schema).exceptionOrNull()?.message)
         assertEquals("$.answer must be boolean", AgentStructuredOutput.parseSubmission("""{"answer":"yes"}""", schema).exceptionOrNull()?.message)
+        assertEquals("$.answer must be boolean", AgentStructuredOutput.parseSubmission("""{"answer":"true"}""", schema).exceptionOrNull()?.message)
+    }
+
+    @Test
+    fun `schema primitives and numeric keywords do not accept quoted lookalikes`() {
+        assertContains(
+            assertFailsWith<ExecError> {
+                AgentStructuredOutput.parse(
+                    """{"type":"object","properties":{"answer":"true"}}""",
+                )
+            }.message!!,
+            "$.answer must be an object or boolean",
+        )
+        assertContains(
+            assertFailsWith<ExecError> {
+                AgentStructuredOutput.parse(
+                    """{"type":"object","properties":{"answer":{"type":"string","minLength":"2"}}}""",
+                )
+            }.message!!,
+            "invalid 'minLength'",
+        )
+    }
+
+    @Test
+    fun `composed and type-specific constraints are enforced locally`() {
+        val schema = AgentStructuredOutput.parse(
+            """
+            {
+              "type":"object",
+              "properties":{
+                "choice":{"oneOf":[{"type":"string"},{"type":"integer"}]},
+                "name":{"type":"string","pattern":"^[A-Z]+${'$'}"},
+                "count":{"type":"number","multipleOf":2},
+                "tags":{"type":"array","uniqueItems":true},
+                "allowed":{"not":{"const":false}}
+              },
+              "required":["choice","name","count","tags","allowed"],
+              "additionalProperties":{"type":"integer"},
+              "minProperties":5,
+              "if":{"properties":{"choice":{"const":"special"}}},
+              "then":{"required":["specialCode"]}
+            }
+            """.trimIndent(),
+        )
+
+        assertNull(
+            schema.validate(
+                obj("""{"choice":2,"name":"ABC","count":4,"tags":["a","b"],"allowed":true,"extra":1}"""),
+            ),
+        )
+        assertContains(schema.validate(obj("""{"choice":true,"name":"ABC","count":4,"tags":[],"allowed":true}"""))!!, "$.choice")
+        assertContains(schema.validate(obj("""{"choice":2,"name":"abc","count":4,"tags":[],"allowed":true}"""))!!, "$.name")
+        assertContains(schema.validate(obj("""{"choice":2,"name":"ABC","count":3,"tags":[],"allowed":true}"""))!!, "$.count")
+        assertContains(schema.validate(obj("""{"choice":2,"name":"ABC","count":4,"tags":["a","a"],"allowed":true}"""))!!, "$.tags")
+        assertContains(schema.validate(obj("""{"choice":2,"name":"ABC","count":4,"tags":[],"allowed":false}"""))!!, "$.allowed")
+        assertEquals(
+            "$.extra must be integer",
+            schema.validate(obj("""{"choice":2,"name":"ABC","count":4,"tags":[],"allowed":true,"extra":"1"}""")),
+        )
+        assertEquals(
+            "$.specialCode is required",
+            schema.validate(obj("""{"choice":"special","name":"ABC","count":4,"tags":[],"allowed":true}""")),
+        )
     }
 
     private fun obj(source: String): JsonObject = json.parseToJsonElement(source) as JsonObject
