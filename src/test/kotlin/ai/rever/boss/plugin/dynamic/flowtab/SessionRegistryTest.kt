@@ -25,6 +25,7 @@ import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.util.concurrent.atomic.AtomicInteger
@@ -268,6 +269,80 @@ class SessionRegistryTest {
         assertTrue(tools.all { it.ref.scope == ToolScope.BROWSER })
         val names = tools.map { it.name }.toSet()
         assertTrue(names.containsAll(setOf("browser_open", "browser_navigate", "browser_click", "browser_type", "browser_extract", "browser_close")))
+    }
+
+    @Test
+    fun `unbound browser tools still require explicit session ids`() = runBlocking {
+        val (reg, _) = registry()
+        val tools = FlowBrowserToolSource(reg).list().associateBy { it.name }
+
+        val navigateRequired = JSON.parseToJsonElement(tools.getValue("browser_navigate").inputSchema)
+            .jsonObject.getValue("required").jsonArray.map { it.jsonPrimitive.content }
+        assertTrue("session_id" in navigateRequired)
+
+        val close = FlowBrowserToolSource(reg).invoke("browser_close", "{}")
+        assertTrue(close.isError)
+        assertTrue(close.text.contains("session_id"))
+    }
+
+    @Test
+    fun `run-bound browser tools default to the reserved session`() = runBlocking {
+        val (reg, svc) = registry { FakePage(responder = { script ->
+            if (script.contains("JSON.stringify")) """{"ok":true,"value":"Hello"}""" else true
+        }) }
+        val defaultId = reg.newSessionId()
+        val src = FlowBrowserToolSource(reg, defaultId)
+
+        val tools = src.list()
+        assertTrue(tools.all { descriptor ->
+            val required = JSON.parseToJsonElement(descriptor.inputSchema)
+                .jsonObject["required"]?.jsonArray.orEmpty().map { it.jsonPrimitive.content }
+            "session_id" !in required
+        })
+
+        val opened = src.invoke("browser_open", """{"headless":true}""")
+        assertFalse(opened.isError)
+        assertEquals(defaultId, JSON.parseToJsonElement(opened.text).jsonObject["session_id"]!!.jsonPrimitive.content)
+        assertNotNull(reg.get(defaultId))
+
+        // Opening again without an id reuses the page established for the run.
+        val reopened = src.invoke("browser_open", """{"headless":true,"url":"https://open.example"}""")
+        assertFalse(reopened.isError)
+        assertEquals(1, svc.pages.size)
+
+        assertFalse(src.invoke("browser_navigate", """{"url":"https://navigate.example"}""").isError)
+        assertFalse(src.invoke("browser_click", """{"selector":"#go"}""").isError)
+        assertFalse(src.invoke("browser_type", """{"selector":"#name","text":"Ada"}""").isError)
+        val extracted = src.invoke("browser_extract", """{"selector":"h1"}""")
+        assertFalse(extracted.isError)
+        assertTrue(extracted.text.contains("Hello"))
+
+        val page = svc.pages.single()
+        assertEquals(listOf("https://open.example", "https://navigate.example"), page.navigated)
+        assertTrue(page.jsCalls.any { it.contains("#go") })
+        assertTrue(page.jsCalls.any { it.contains("#name") })
+
+        assertFalse(src.invoke("browser_close", "{}").isError)
+        assertNull(reg.get(defaultId))
+        assertTrue(page.disposed)
+    }
+
+    @Test
+    fun `explicit session id overrides a run-bound default`() = runBlocking {
+        val (reg, svc) = registry()
+        val defaultId = reg.newSessionId()
+        reg.open(headless = true, id = defaultId)
+        val explicitId = reg.open(headless = true)
+        val src = FlowBrowserToolSource(reg, defaultId)
+
+        val result = src.invoke(
+            "browser_navigate",
+            """{"session_id":"$explicitId","url":"https://explicit.example"}""",
+        )
+
+        assertFalse(result.isError)
+        assertTrue(svc.pages[0].navigated.isEmpty())
+        assertEquals(listOf("https://explicit.example"), svc.pages[1].navigated)
     }
 
     @Test

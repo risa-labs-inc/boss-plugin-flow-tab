@@ -76,6 +76,13 @@ it must be a red node failure rather than a successful output carrying `stopReas
 partial answer. User-configured step, timeout, and token budgets must be positive whole numbers;
 zero does not mean unlimited.
 
+The agent's browser tool lane is bound to the run's `defaultSessionId`. In that lane,
+`session_id` is optional and omission means the same browser session native Open/Navigate/Click/
+Type/Extract nodes use. An explicit id still wins for multi-session agents. `browser_open` without
+an id opens the reserved default session when needed and reuses it when an upstream node already
+opened it, so it does not replace the page the flow established. Unbound `FlowBrowserToolSource`
+callers keep the explicit-session contract and schemas.
+
 `plugin.json` declares `ai.rever.boss.plugin.dynamic.aigateway` as an **optional** dependency.
 Declaring it makes the host's one existing check work - `DynamicPluginManager.checkCanUnload`
 refuses to uninstall a plugin a loaded plugin depends on. Nothing reads `dependencies` at *install*

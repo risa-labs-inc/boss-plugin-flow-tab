@@ -236,7 +236,7 @@ fun defaultAgentNodeSpec(
         toolSourceFor = { ctx ->
             val lanes = buildList {
                 context.mcpToolRegistry?.let { add(BossRegistryToolSource(it)) }
-                add(FlowBrowserToolSource(ctx.sessions))
+                add(FlowBrowserToolSource(ctx.sessions, ctx.defaultSessionId))
                 external?.let { add(it) }
             }
             MergedToolSource(lanes)
