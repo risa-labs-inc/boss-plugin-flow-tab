@@ -60,15 +60,22 @@ class FlowBrowserToolSource(
     private suspend fun browserOpen(args: JsonObject): ToolResult {
         val requested = args.str("session_id")
         val boundDefault = defaultSessionId
+        val reused = boundDefault != null &&
+            (requested.isBlank() || requested == boundDefault) &&
+            sessions.get(boundDefault) != null
         val id = when {
-            requested.isNotBlank() -> sessions.open(args.bool("headless"), requested)
+            requested.isNotBlank() && requested != boundDefault -> sessions.open(args.bool("headless"), requested)
             boundDefault == null -> sessions.open(args.bool("headless"))
-            sessions.get(boundDefault) != null -> boundDefault
+            reused -> boundDefault
             else -> sessions.open(args.bool("headless"), boundDefault)
         }
         val url = args.str("url")
         if (url.isNotBlank()) sessions.withSession(id) { it.navigate(url) }
-        return ok(buildJsonObject { put("session_id", id); if (url.isNotBlank()) put("url", url) })
+        return ok(buildJsonObject {
+            put("session_id", id)
+            put("reused", reused)
+            if (url.isNotBlank()) put("url", url)
+        })
     }
 
     private suspend fun browserNavigate(args: JsonObject): ToolResult {
@@ -127,7 +134,7 @@ class FlowBrowserToolSource(
     }
 
     private suspend fun browserClose(args: JsonObject): ToolResult {
-        val id = args.sessionId("browser_close")
+        val id = args.sessionId("browser_close", allowDefault = false)
         sessions.close(id)
         return ok(buildJsonObject { put("closed", id) })
     }
@@ -148,10 +155,16 @@ class FlowBrowserToolSource(
         return p.booleanOrNull ?: p.content.equals("true", ignoreCase = true)
     }
 
-    private fun JsonObject.sessionId(tool: String): String =
-        str("session_id").ifBlank {
-            defaultSessionId ?: throw ExecError("$tool needs a 'session_id'")
+    private fun JsonObject.sessionId(tool: String, allowDefault: Boolean = true): String {
+        val requested = str("session_id")
+        if (requested.isNotBlank()) return requested
+        val boundDefault = defaultSessionId
+        if (!allowDefault || boundDefault == null) throw ExecError("$tool needs a 'session_id'")
+        if (sessions.get(boundDefault) == null) {
+            throw ExecError("No browser session is open for this flow run — call browser_open first")
         }
+        return boundDefault
+    }
 
     companion object {
         private val JSON = Json { ignoreUnknownKeys = true; isLenient = true }
@@ -185,25 +198,25 @@ class FlowBrowserToolSource(
                     "Open or reuse a browser session (headless or visible) and optionally navigate; " +
                         "returns its session_id.$sessionHint",
                     schema(
-                        "\"headless\":{\"type\":\"boolean\"},\"url\":{\"type\":\"string\"},$SESSION_PROP",
+                        """"headless":{"type":"boolean"},"url":{"type":"string"},$SESSION_PROP""",
                         emptyList(),
                     ),
                 ),
                 desc(
                     "browser_navigate",
                     "Navigate an open browser session to a URL.$sessionHint",
-                    schema("$SESSION_PROP,\"url\":{\"type\":\"string\"}", session + "url"),
+                    schema("""$SESSION_PROP,"url":{"type":"string"}""", session + listOf("url")),
                 ),
                 desc(
                     "browser_click",
                     "Click the first element matching a selector in a browser session.$sessionHint",
-                    schema("$SESSION_PROP,$SELECTOR_PROPS", session + "selector"),
+                    schema("$SESSION_PROP,$SELECTOR_PROPS", session + listOf("selector")),
                 ),
                 desc(
                     "browser_type",
                     "Type text into the first element matching a selector in a browser session.$sessionHint",
                     schema(
-                        "$SESSION_PROP,$SELECTOR_PROPS,\"text\":{\"type\":\"string\"}",
+                        """$SESSION_PROP,$SELECTOR_PROPS,"text":{"type":"string"}""",
                         session + listOf("selector", "text"),
                     ),
                 ),
@@ -211,16 +224,14 @@ class FlowBrowserToolSource(
                     "browser_extract",
                     "Extract text/html/attribute from element(s) in a browser session.$sessionHint",
                     schema(
-                        "$SESSION_PROP,$SELECTOR_PROPS," +
-                            "\"mode\":{\"type\":\"string\",\"enum\":[\"text\",\"html\",\"attr\"]}," +
-                            "\"attr\":{\"type\":\"string\"},\"multiple\":{\"type\":\"boolean\"}",
-                        session + "selector",
+                        """$SESSION_PROP,$SELECTOR_PROPS,"mode":{"type":"string","enum":["text","html","attr"]},"attr":{"type":"string"},"multiple":{"type":"boolean"}""",
+                        session + listOf("selector"),
                     ),
                 ),
                 desc(
                     "browser_close",
-                    "Close an open browser session.$sessionHint",
-                    schema(SESSION_PROP, session),
+                    "Close an explicitly named open browser session.",
+                    schema(SESSION_PROP, listOf("session_id")),
                 ),
             )
         }

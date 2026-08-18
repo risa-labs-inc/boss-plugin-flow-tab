@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -262,6 +263,10 @@ class SessionRegistryTest {
 
     private val JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 
+    private fun ToolDescriptor.requiredProperties(): List<String> =
+        JSON.parseToJsonElement(inputSchema).jsonObject["required"]
+            ?.jsonArray.orEmpty().map { it.jsonPrimitive.content }
+
     @Test
     fun `browser tool source lists browser-scoped tools`() = runBlocking {
         val (reg, _) = registry()
@@ -276,9 +281,7 @@ class SessionRegistryTest {
         val (reg, _) = registry()
         val tools = FlowBrowserToolSource(reg).list().associateBy { it.name }
 
-        val navigateRequired = JSON.parseToJsonElement(tools.getValue("browser_navigate").inputSchema)
-            .jsonObject.getValue("required").jsonArray.map { it.jsonPrimitive.content }
-        assertTrue("session_id" in navigateRequired)
+        assertTrue("session_id" in tools.getValue("browser_navigate").requiredProperties())
 
         val close = FlowBrowserToolSource(reg).invoke("browser_close", "{}")
         assertTrue(close.isError)
@@ -293,21 +296,39 @@ class SessionRegistryTest {
         val defaultId = reg.newSessionId()
         val src = FlowBrowserToolSource(reg, defaultId)
 
-        val tools = src.list()
-        assertTrue(tools.all { descriptor ->
-            val required = JSON.parseToJsonElement(descriptor.inputSchema)
-                .jsonObject["required"]?.jsonArray.orEmpty().map { it.jsonPrimitive.content }
-            "session_id" !in required
-        })
+        val tools = src.list().associateBy { it.name }
+        assertEquals(6, tools.size)
+        listOf("browser_open", "browser_navigate", "browser_click", "browser_type", "browser_extract")
+            .forEach { name ->
+                assertTrue(tools.getValue(name).description.contains("Omit session_id"))
+                assertFalse("session_id" in tools.getValue(name).requiredProperties())
+            }
+        assertEquals(listOf("url"), tools.getValue("browser_navigate").requiredProperties())
+        assertEquals(listOf("selector"), tools.getValue("browser_click").requiredProperties())
+        assertEquals(listOf("selector", "text"), tools.getValue("browser_type").requiredProperties())
+        assertEquals(listOf("selector"), tools.getValue("browser_extract").requiredProperties())
+        assertEquals(listOf("session_id"), tools.getValue("browser_close").requiredProperties())
 
         val opened = src.invoke("browser_open", """{"headless":true}""")
         assertFalse(opened.isError)
-        assertEquals(defaultId, JSON.parseToJsonElement(opened.text).jsonObject["session_id"]!!.jsonPrimitive.content)
+        val openedJson = JSON.parseToJsonElement(opened.text).jsonObject
+        assertEquals(defaultId, openedJson["session_id"]!!.jsonPrimitive.content)
+        assertEquals("false", openedJson["reused"]!!.jsonPrimitive.content)
         assertNotNull(reg.get(defaultId))
 
         // Opening again without an id reuses the page established for the run.
         val reopened = src.invoke("browser_open", """{"headless":true,"url":"https://open.example"}""")
         assertFalse(reopened.isError)
+        assertEquals("true", JSON.parseToJsonElement(reopened.text).jsonObject["reused"]!!.jsonPrimitive.content)
+        assertEquals(1, svc.pages.size)
+
+        // Old prompts that explicitly name the default id must reuse it too.
+        val explicitDefault = src.invoke(
+            "browser_open",
+            """{"session_id":"$defaultId","headless":true,"url":"https://explicit-default.example"}""",
+        )
+        assertFalse(explicitDefault.isError)
+        assertEquals("true", JSON.parseToJsonElement(explicitDefault.text).jsonObject["reused"]!!.jsonPrimitive.content)
         assertEquals(1, svc.pages.size)
 
         assertFalse(src.invoke("browser_navigate", """{"url":"https://navigate.example"}""").isError)
@@ -318,13 +339,40 @@ class SessionRegistryTest {
         assertTrue(extracted.text.contains("Hello"))
 
         val page = svc.pages.single()
-        assertEquals(listOf("https://open.example", "https://navigate.example"), page.navigated)
+        assertEquals(
+            listOf("https://open.example", "https://explicit-default.example", "https://navigate.example"),
+            page.navigated,
+        )
         assertTrue(page.jsCalls.any { it.contains("#go") })
         assertTrue(page.jsCalls.any { it.contains("#name") })
 
-        assertFalse(src.invoke("browser_close", "{}").isError)
+        val omittedClose = src.invoke("browser_close", "{}")
+        assertTrue(omittedClose.isError)
+        assertTrue(omittedClose.text.contains("session_id"))
+        assertNotNull(reg.get(defaultId))
+        assertFalse(page.disposed)
+
+        assertFalse(src.invoke("browser_close", """{"session_id":"$defaultId"}""").isError)
         assertNull(reg.get(defaultId))
         assertTrue(page.disposed)
+    }
+
+    @Test
+    fun `run-bound tool error does not leak an unopened default session id`() = runBlocking {
+        val (reg, _) = registry()
+        val defaultId = reg.newSessionId()
+        val result = FlowBrowserToolSource(reg, defaultId)
+            .invoke("browser_navigate", """{"url":"https://example.com"}""")
+
+        assertTrue(result.isError)
+        assertTrue(result.text.contains("call browser_open first"))
+        assertFalse(result.text.contains(defaultId))
+    }
+
+    @Test
+    fun `run-bound source rejects a blank default session id`() {
+        val (reg, _) = registry()
+        assertFailsWith<IllegalArgumentException> { FlowBrowserToolSource(reg, "") }
     }
 
     @Test

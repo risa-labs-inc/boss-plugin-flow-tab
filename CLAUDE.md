@@ -80,8 +80,15 @@ The agent's browser tool lane is bound to the run's `defaultSessionId`. In that 
 `session_id` is optional and omission means the same browser session native Open/Navigate/Click/
 Type/Extract nodes use. An explicit id still wins for multi-session agents. `browser_open` without
 an id opens the reserved default session when needed and reuses it when an upstream node already
-opened it, so it does not replace the page the flow established. Unbound `FlowBrowserToolSource`
-callers keep the explicit-session contract and schemas.
+opened it, so it does not replace the page the flow established; explicitly naming that default id
+also reuses it for compatibility with old prompts. `browser_close` remains explicit-only so an
+agent cannot casually tear down the shared page before downstream native nodes run. A default-
+constructed `FlowBrowserToolSource` keeps the explicit-session contract and schemas.
+
+This binding is intentionally shared state. If the agent opens the default session, downstream
+native nodes inherit that page and its visibility. A later or parallel native Open Browser can
+replace the page, and the per-session fence serializes individual actions but does not make an
+agent branch atomic with respect to a parallel native branch; their actions may interleave.
 
 `plugin.json` declares `ai.rever.boss.plugin.dynamic.aigateway` as an **optional** dependency.
 Declaring it makes the host's one existing check work - `DynamicPluginManager.checkCanUnload`
