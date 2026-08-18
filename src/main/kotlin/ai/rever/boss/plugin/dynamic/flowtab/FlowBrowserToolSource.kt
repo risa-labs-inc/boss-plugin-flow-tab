@@ -71,15 +71,20 @@ class FlowBrowserToolSource(
             }
             else -> {
                 val target = requested.ifBlank { boundDefault }
-                target to sessions.openIfAbsent(args.bool("headless"), target)
+                // The UI owns one visible run tab. Secondary agent sessions must stay
+                // headless so they cannot overwrite that single lifecycle slot and leak.
+                val headless = target != boundDefault || args.bool("headless")
+                target to sessions.openIfAbsent(headless, target)
             }
         }
         val url = args.str("url")
         if (url.isNotBlank()) sessions.withSession(id) { it.navigate(url) }
         return ok(buildJsonObject {
             put("session_id", id)
-            put("reused", reused)
-            put("closable", id != boundDefault)
+            if (boundDefault != null) {
+                put("reused", reused)
+                put("closable", id != boundDefault)
+            }
             if (url.isNotBlank()) put("url", url)
         })
     }
@@ -220,7 +225,8 @@ class FlowBrowserToolSource(
             } else {
                 "Open or reuse a browser session (headless or visible) and optionally navigate; " +
                     "returns its session_id, whether it was reused, and whether it is closable. " +
-                    "Reuse keeps the existing visibility; close a named secondary session first for a fresh page."
+                    "Reuse keeps the existing visibility. Named secondary sessions are always headless; " +
+                    "close one first for a fresh page."
             }
             val closeDescription = if (sessionRequired) {
                 "Close an explicitly named open browser session."

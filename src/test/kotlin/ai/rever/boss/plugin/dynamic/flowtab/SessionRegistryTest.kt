@@ -130,9 +130,11 @@ class SessionRegistryTest {
         private val make: () -> FakePage,
     ) : BrowserService {
         val pages = mutableListOf<FakePage>()
+        val configs = mutableListOf<BrowserConfig>()
         override fun isAvailable() = true
         override suspend fun createBrowser(config: BrowserConfig): BrowserHandle {
             if (createDelayMs > 0) delay(createDelayMs)
+            configs.add(config)
             return make().also { pages.add(it) }
         }
         override suspend fun disposeBrowser(handle: BrowserHandle) { (handle as FakePage).disposed = true }
@@ -381,13 +383,14 @@ class SessionRegistryTest {
 
         val extra = src.invoke(
             "browser_open",
-            """{"session_id":"agent-extra","headless":true,"url":"https://extra.example"}""",
+            """{"session_id":"agent-extra","headless":false,"url":"https://extra.example"}""",
         )
         assertFalse(extra.isError)
         val extraJson = JSON.parseToJsonElement(extra.text).jsonObject
         assertEquals(false, extraJson["reused"]!!.jsonPrimitive.booleanOrNull)
         assertEquals(true, extraJson["closable"]!!.jsonPrimitive.booleanOrNull)
         assertEquals(2, svc.pages.size)
+        assertTrue(svc.configs[1].ephemeralProfile, "secondary Agent session is forced headless")
         assertEquals(
             listOf("https://open.example", "https://explicit-default.example", "https://navigate.example"),
             page.navigated,
@@ -461,8 +464,13 @@ class SessionRegistryTest {
         val source = defaultAgentToolSource(context, external = null, ctx = run)
         source.list()
 
+        val reused = source.invoke("browser_open", """{"headless":false}""")
         val result = source.invoke("browser_navigate", """{"url":"https://wired.example"}""")
 
+        assertFalse(reused.isError)
+        assertEquals(true, JSON.parseToJsonElement(reused.text).jsonObject["reused"]!!.jsonPrimitive.booleanOrNull)
+        assertEquals(1, svc.pages.size)
+        assertFalse(svc.pages.single().disposed)
         assertFalse(result.isError)
         assertEquals(listOf("https://wired.example"), svc.pages.single().navigated)
         assertTrue(run.session === opened)
@@ -522,7 +530,8 @@ class SessionRegistryTest {
         assertFalse(result.isError)
         val json = JSON.parseToJsonElement(result.text).jsonObject
         assertEquals("mine", json["session_id"]!!.jsonPrimitive.content)
-        assertEquals(true, json["closable"]!!.jsonPrimitive.booleanOrNull)
+        assertNull(json["reused"])
+        assertNull(json["closable"])
         assertNotNull(reg.get("mine"))
     }
 
