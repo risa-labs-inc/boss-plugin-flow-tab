@@ -643,7 +643,7 @@ class FlowExecutorTest {
     fun `optional extract emits null so If can route a missing element to fallback`() {
         val handle = FakeHandle(responder = { script ->
             if (script.contains("JSON.stringify")) {
-                """{"ok":false,"error":"no element matched"}"""
+                """{"ok":false,"error":"$EXTRACT_NO_MATCH_ERROR"}"""
             } else {
                 true
             }
@@ -669,6 +669,28 @@ class FlowExecutorTest {
         assertEquals(RunStatus.SKIPPED, states["primary"]?.status)
         assertEquals(RunStatus.SUCCESS, states["fallback"]?.status)
         assertEquals("fallback", states["fallback"]!!.output.single().json.str("branch"))
+    }
+
+    @Test
+    fun `non-optional extract preserves a missing-element failure`() {
+        val handle = FakeHandle(responder = { script ->
+            if (script.contains("JSON.stringify")) {
+                """{"ok":false,"error":"$EXTRACT_NO_MATCH_ERROR"}"""
+            } else {
+                true
+            }
+        })
+        val states = runGraph(
+            listOf(
+                n("open", NodeType.OPEN_BROWSER),
+                n("ex", NodeType.EXTRACT, "selector" to ".required"),
+            ),
+            listOf(e("open", "ex")),
+            FakeService(handle),
+        )
+
+        assertEquals(RunStatus.ERROR, states["ex"]?.status)
+        assertEquals("Extract failed: $EXTRACT_NO_MATCH_ERROR", states["ex"]?.error)
     }
 
     @Test

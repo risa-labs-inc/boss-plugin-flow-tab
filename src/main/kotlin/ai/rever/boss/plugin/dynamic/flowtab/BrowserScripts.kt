@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+internal const val EXTRACT_NO_MATCH_ERROR = "no element matched"
+
 /**
  * JavaScript builders for browser actions, run via [ai.rever.boss.plugin.browser.BrowserHandle.executeJavaScript].
  *
@@ -97,7 +99,7 @@ object BrowserScripts {
                 "catch(e){return JSON.stringify({ok:false, error:String(e)});}})()"
         } else {
             "(function(){try{var el=${elementExpr(selectorType, selector)}; " +
-                "if(!el) return JSON.stringify({ok:false, error:'no element matched'}); var f=$readOne; " +
+                "if(!el) return JSON.stringify({ok:false, error:'$EXTRACT_NO_MATCH_ERROR'}); var f=$readOne; " +
                 "return JSON.stringify({ok:true, value: f(el)});}" +
                 "catch(e){return JSON.stringify({ok:false, error:String(e)});}})()"
         }

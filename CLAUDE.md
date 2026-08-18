@@ -185,7 +185,10 @@ An Extract node normally fails when its selector matches no element. Enabling `o
 only that absence case: the node succeeds with one item whose configured output field is JSON
 `null`, including an empty `multiple` result. This preserves a data item so a following If node can
 route to a fallback branch. Selector syntax errors, browser failures, and other script errors still
-fail the node; optional extraction must not hide operational errors.
+fail the node; optional extraction must not hide operational errors. Optional Extract still uses
+the standard element wait before declaring a single match absent, so it does not turn slow-page
+loading into a false fallback. In attribute mode, a present element without the requested attribute
+also yields `null`; consumers that need a fallback for either case should guard the value with If.
 
 ### Template expression resolution
 

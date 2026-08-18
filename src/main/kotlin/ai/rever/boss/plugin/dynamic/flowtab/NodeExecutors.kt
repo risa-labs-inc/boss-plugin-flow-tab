@@ -314,7 +314,7 @@ object NodeCatalog {
             val obj = EXEC_JSON.parseToJsonElement(str).jsonObject
             if (obj["ok"]?.jsonPrimitive?.booleanOrNull != true) {
                 val error = obj["error"]?.jsonPrimitive?.content ?: "unknown"
-                if (optional && error == "no element matched") {
+                if (optional && error == EXTRACT_NO_MATCH_ERROR) {
                     log("Extract: no match for '$sel' (optional)")
                     return@NodeExecutor NodeOutput.single(
                         listOf(Item(buildJsonObject { put(field, JsonNull) })),
