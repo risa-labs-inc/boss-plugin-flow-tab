@@ -25,14 +25,15 @@ import ai.rever.boss.plugin.api.AiTurn
  * still work exactly as before. This class only translates between the runtime's transcript
  * types and the gateway's.
  *
- * The **model stays the node's** ([AgentSettings.model], a visible per-node config field).
- * The gateway uses whatever model the active provider has selected, so a node that names one
- * explicitly is documented as advisory rather than silently overriding a user's choice - see
- * [modelNote].
+ * Model selection stays with Settings → AI Providers. Flow's legacy `model` config key is
+ * preserved in saved JSON but is not sent: the gateway API intentionally exposes only the
+ * active model. Optional request parameters that the API does support are passed explicitly.
  */
 internal class GatewayAgentProvider(
     private val gateway: () -> AiGatewayAPI?,
     private val maxTokens: Int = DEFAULT_MAX_TOKENS,
+    private val temperature: Float? = null,
+    private val requestTimeoutMs: Long = DEFAULT_REQUEST_TIMEOUT_MS,
     /**
      * Explains why AI is unavailable and offers the fix. Fire-and-forget: the node still
      * fails, because a DAG step cannot wait on a dialog and a run that silently paused
@@ -97,7 +98,11 @@ internal class GatewayAgentProvider(
                             // Tool rounds travel structurally in `rounds`, not as transcript
                             // text, so they are dropped here rather than sent twice.
                             messages = messages.mapNotNull(::toAiMessage),
+                            // Null means omit. Gateway v1.1.2+ no longer falls back to an
+                            // invisible provider default that reasoning models may reject.
+                            temperature = temperature,
                             maxTokens = maxTokens,
+                            timeoutMs = requestTimeoutMs,
                         ),
                     tools =
                         tools.map { descriptor ->
@@ -147,6 +152,7 @@ internal class GatewayAgentProvider(
          * per request rather than per provider.
          */
         const val DEFAULT_MAX_TOKENS = 4096
+        const val DEFAULT_REQUEST_TIMEOUT_MS = 120_000L
 
     }
 }

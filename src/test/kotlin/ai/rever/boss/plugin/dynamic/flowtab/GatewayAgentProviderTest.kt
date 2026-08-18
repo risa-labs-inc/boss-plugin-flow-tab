@@ -74,6 +74,29 @@ class GatewayAgentProviderTest {
 
             assertEquals("the answer", turn.text)
             assertTrue(turn.toolCalls.isEmpty())
+            assertNull(gateway.steps.single().first.temperature)
+            assertEquals(
+                GatewayAgentProvider.DEFAULT_REQUEST_TIMEOUT_MS,
+                gateway.steps.single().first.timeoutMs,
+            )
+        }
+
+    @Test
+    fun `optional request parameters are forwarded to the gateway`() =
+        runBlocking {
+            val gateway = RecordingGateway(listOf(AiTurn(text = "ok")))
+            val provider = GatewayAgentProvider(
+                gateway = { gateway },
+                temperature = 0.25f,
+                requestTimeoutMs = 12_345L,
+            )
+
+            provider.step("s", listOf(UserMsg("q")), emptyList())
+
+            val request = gateway.steps.single().first
+            assertEquals(0.25f, request.temperature)
+            assertEquals(12_345L, request.timeoutMs)
+            assertEquals(GatewayAgentProvider.DEFAULT_MAX_TOKENS, request.maxTokens)
         }
 
     @Test

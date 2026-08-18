@@ -181,6 +181,13 @@ private fun ParametersTab(node: FlowNode) {
                     val on = configValue(node, field).equals("true", true)
                     SelectChip(if (on) "On" else "Off", on) { setConfig(node, field.key, (!on).toString()) }
                 }
+                // Explanatory text only. Deliberately ignore node.config so a legacy
+                // stored value cannot masquerade as a live editable setting.
+                FieldType.INFO -> Text(
+                    field.placeholder.ifBlank { field.default },
+                    color = Muted,
+                    fontSize = 12.sp,
+                )
             }
         }
     }

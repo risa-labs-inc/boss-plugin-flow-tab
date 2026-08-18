@@ -98,6 +98,68 @@ class AgentNodeTest {
     }
 
     @Test
+    fun `model is informational while temperature is parsed as a real request setting`() {
+        lateinit var settings: AgentSettings
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { parsed ->
+                settings = parsed
+                FakeProvider.scripted(AssistantTurn(text = "done"))
+            },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            // Old saved flows keep this raw key, but it must not become a request override.
+            put(AgentNode.MODEL_KEY, "legacy-model-that-must-not-run")
+            put(AgentNode.TEMPERATURE_KEY, "0.25")
+            put(AgentNode.TIMEOUT_KEY, "12345")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals(0.25f, settings.temperature)
+        assertEquals(12_345L, settings.budget.timeoutMs)
+        val modelField = AgentNode.CONFIG_FIELDS.single { it.key == AgentNode.MODEL_KEY }
+        assertEquals(FieldType.INFO, modelField.type)
+        assertTrue(modelField.placeholder.contains("Settings"))
+        assertEquals("legacy-model-that-must-not-run", cfg[AgentNode.MODEL_KEY]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `temperature must be finite and non-negative`() {
+        val providerCalls = AtomicInteger()
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = {
+                providerCalls.incrementAndGet()
+                FakeProvider.scripted(AssistantTurn(text = "must not run"))
+            },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+
+        fun stateFor(id: String, value: String): NodeRun {
+            val cfg = buildJsonObject {
+                put(AgentNode.INPUT_KEY, "go")
+                put(AgentNode.TEMPERATURE_KEY, value)
+            }
+            return runFlow(reg, listOf(PlanNode(id, AgentNode.KIND, "Agent", cfg)), emptyList()).getValue(id)
+        }
+
+        val nonFinite = stateFor("nan", "NaN")
+        val negative = stateFor("negative", "-0.1")
+
+        assertEquals(RunStatus.ERROR, nonFinite.status)
+        assertEquals("Agent temperature (temperature) must be a finite number", nonFinite.error)
+        assertEquals(RunStatus.ERROR, negative.status)
+        assertEquals("Agent temperature (temperature) must be zero or greater", negative.error)
+        assertEquals(0, providerCalls.get())
+    }
+
+    @Test
     fun `agent timeout fails the node instead of emitting a successful result`() {
         val provider = FakeProvider { step, _, _, _ ->
             if (step == 0) {
