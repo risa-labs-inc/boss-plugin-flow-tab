@@ -128,8 +128,7 @@ fun nodeSummary(node: FlowNode): String {
     fun configured(k: String): Boolean = when (val value = node.config[k]) {
         null, JsonNull -> false
         is JsonPrimitive -> value.content.isNotBlank()
-        is JsonObject -> true
-        else -> false
+        else -> true
     }
     fun withTarget(action: String, target: String, fallback: String): String =
         if (target.isBlank()) fallback else "$action ${target.trim()}"

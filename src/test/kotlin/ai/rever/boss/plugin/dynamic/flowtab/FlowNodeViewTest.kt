@@ -164,7 +164,7 @@ class FlowNodeViewTest {
             ),
         )
         assertEquals(
-            "Runs an AI agent with approved tools",
+            "Runs an AI agent and returns structured data",
             nodeSummary(agent(buildJsonObject { put(AgentNode.OUTPUT_SCHEMA_KEY, buildJsonArray {}) })),
         )
     }

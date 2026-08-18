@@ -30,7 +30,10 @@ class AgentStructuredOutputTest {
         assertNull(schema.validate(obj("""{"selector":"#main","scores":[1,2]}""")))
         assertEquals("$.selector is required", schema.validate(obj("""{"scores":[1]}""")))
         assertEquals("$.scores[1] must be integer", schema.validate(obj("""{"selector":"#main","scores":[1,2.5]}""")))
-        assertEquals("$.extra is not allowed", schema.validate(obj("""{"selector":"#main","scores":[1],"extra":true}""")))
+        assertEquals(
+            "$ contains an additional property that is not allowed",
+            schema.validate(obj("""{"selector":"#main","scores":[1],"extra":true}""")),
+        )
     }
 
     @Test
@@ -83,6 +86,25 @@ class AgentStructuredOutputTest {
             }.message!!,
             "unsupported keyword '${'$'}ref'",
         )
+        assertContains(
+            assertFailsWith<ExecError> {
+                AgentStructuredOutput.parse(
+                    """{"type":"object","dependencies":{"mode":["detail"]}}""",
+                )
+            }.message!!,
+            "unsupported keyword 'dependencies'",
+        )
+    }
+
+    @Test
+    fun `rejects schemas deeper than the local validator can safely traverse`() {
+        var nested = """{"type":"string"}"""
+        repeat(65) { nested = """{"type":"array","items":$nested}""" }
+        val schema = """{"type":"object","properties":{"value":$nested}}"""
+
+        val error = assertFailsWith<ExecError> { AgentStructuredOutput.parse(schema) }
+
+        assertContains(error.message.orEmpty(), "maximum supported depth of 64")
     }
 
     @Test
@@ -92,6 +114,10 @@ class AgentStructuredOutputTest {
         )
 
         assertEquals(obj("""{"answer":true}"""), AgentStructuredOutput.parseSubmission("""{"answer":true}""", schema).getOrThrow())
+        assertEquals(
+            "the submission must be valid JSON",
+            AgentStructuredOutput.parseSubmission("{secret-invalid-json", schema).exceptionOrNull()?.message,
+        )
         assertEquals("the submission must be a JSON object", AgentStructuredOutput.parseSubmission("[]", schema).exceptionOrNull()?.message)
         assertEquals("$.answer must be boolean", AgentStructuredOutput.parseSubmission("""{"answer":"yes"}""", schema).exceptionOrNull()?.message)
         assertEquals("$.answer must be boolean", AgentStructuredOutput.parseSubmission("""{"answer":"true"}""", schema).exceptionOrNull()?.message)

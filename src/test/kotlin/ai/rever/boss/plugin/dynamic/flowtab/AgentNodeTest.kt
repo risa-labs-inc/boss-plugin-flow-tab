@@ -169,27 +169,35 @@ class AgentNodeTest {
         assertEquals(RunStatus.SUCCESS, state.status)
         assertEquals("2", state.output.single().json.getValue("count").jsonPrimitive.content)
         assertTrue(sawValidationFeedback)
-        assertTrue(state.logs.contains("agent structured output submission: rejected"))
+        assertTrue(state.logs.any { it == "agent structured output submission: rejected ($.count must be integer)" })
         assertTrue(state.logs.contains("agent structured output submission: accepted"))
         assertFalse(state.logs.joinToString("\n").contains("secret-invalid-value"))
     }
 
     @Test
-    fun `structured submission mixed with another tool is rejected without side effects`() {
+    fun `mixed submission is rejected while an allowlisted tool runs without spending a correction`() {
         val source = RecordingSource(listOf("write"))
-        var sawBothErrors = false
+        var sawMixedOutcomes = false
         val provider = FakeProvider { step, _, messages, _ ->
-            if (step == 0) {
-                AssistantTurn(
+            when (step) {
+                0 -> AssistantTurn(
                     toolCalls = listOf(
                         ToolCall("out", AgentStructuredOutput.TOOL_NAME, """{"ok":true}"""),
-                        ToolCall("write", "write", """{"secret":"must-not-run"}"""),
+                        ToolCall("write", "write", """{"value":"run-once"}"""),
                     ),
                 )
-            } else {
-                val feedback = (messages.last() as ToolResultsMsg).outcomes
-                sawBothErrors = feedback.size == 2 && feedback.all { it.isError }
-                AssistantTurn(
+                1 -> {
+                    val feedback = (messages.last() as ToolResultsMsg).outcomes
+                    sawMixedOutcomes = feedback.size == 2 && feedback.single { it.id == "out" }.isError &&
+                        !feedback.single { it.id == "write" }.isError
+                    AssistantTurn(
+                        toolCalls = listOf(ToolCall("invalid-1", AgentStructuredOutput.TOOL_NAME, """{"ok":"yes"}""")),
+                    )
+                }
+                2 -> AssistantTurn(
+                    toolCalls = listOf(ToolCall("invalid-2", AgentStructuredOutput.TOOL_NAME, """{"ok":"still"}""")),
+                )
+                else -> AssistantTurn(
                     toolCalls = listOf(ToolCall("corrected", AgentStructuredOutput.TOOL_NAME, """{"ok":true}""")),
                 )
             }
@@ -205,9 +213,51 @@ class AgentNodeTest {
         val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
 
         assertEquals(RunStatus.SUCCESS, state.status)
-        assertTrue(sawBothErrors)
+        assertTrue(sawMixedOutcomes)
+        assertTrue(source.invoked.contains("write"))
+        assertFalse(state.logs.joinToString("\n").contains("run-once"))
+    }
+
+    @Test
+    fun `reserved output tool conflicts only when the real tool is allowlisted`() {
+        val providerCalls = AtomicInteger()
+        val source = RecordingSource(listOf(AgentStructuredOutput.TOOL_NAME))
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls.incrementAndGet()
+            AssistantTurn(
+                toolCalls = listOf(ToolCall("out", AgentStructuredOutput.TOOL_NAME, """{"ok":true}""")),
+            )
+        }
+        val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
+        val schema = """{"type":"object","properties":{"ok":{"type":"boolean"}}}"""
+
+        fun run(allowReserved: Boolean): NodeRun {
+            val config = buildJsonObject {
+                put(AgentNode.OUTPUT_SCHEMA_KEY, schema)
+                if (allowReserved) {
+                    put(
+                        AgentNode.ALLOWLIST_KEY,
+                        buildJsonArray { add(JsonPrimitive(AgentStructuredOutput.TOOL_NAME)) },
+                    )
+                }
+            }
+            val registry = builtinNodeRegistry().also { it.register(spec) }
+            return runFlow(
+                registry,
+                listOf(PlanNode("a", AgentNode.KIND, "Agent", config)),
+                emptyList(),
+            ).getValue("a")
+        }
+
+        val conflict = run(allowReserved = true)
+        assertEquals(RunStatus.ERROR, conflict.status)
+        assertContains(conflict.error.orEmpty(), "conflicts with an allowlisted tool")
+        assertEquals(0, providerCalls.get())
+
+        val notAllowlisted = run(allowReserved = false)
+        assertEquals(RunStatus.SUCCESS, notAllowlisted.status)
+        assertEquals(1, providerCalls.get())
         assertTrue(source.invoked.isEmpty())
-        assertFalse(state.logs.joinToString("\n").contains("must-not-run"))
     }
 
     @Test

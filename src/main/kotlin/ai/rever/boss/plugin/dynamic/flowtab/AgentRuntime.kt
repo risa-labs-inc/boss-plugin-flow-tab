@@ -300,6 +300,33 @@ class AgentRuntime(
         var lastText = ""
         var structuredFailures = 0
 
+        suspend fun executeTool(call: ToolCall): ToolOutcome {
+            toolCalls++
+            progress.set(Progress(lastText, steps, toolCalls, usage))
+            val prefix = "agent tool $toolCalls '${safeToolName(call.name)}'"
+            if (call.name !in allowedNames) {
+                log("$prefix: blocked (not in allowlist)")
+                return ToolOutcome(
+                    call.id,
+                    call.name,
+                    "tool '${call.name}' is not in this agent's allowlist",
+                    isError = true,
+                )
+            }
+            log("$prefix: started")
+            val toolRemaining = budget.timeoutMs - (System.currentTimeMillis() - started)
+            val result = if (toolRemaining <= 0) {
+                ToolResult("agent wall-clock budget exceeded", isError = true)
+            } else {
+                runCatching {
+                    withTimeoutOrNull(toolRemaining) { source.invoke(call.name, call.argsJson) }
+                        ?: ToolResult("tool '${call.name}' timed out", isError = true)
+                }.getOrElse { ToolResult(it.message ?: it.toString(), isError = true) }
+            }
+            log("$prefix: ${if (result.isError) "failed" else "succeeded"}")
+            return ToolOutcome(call.id, call.name, result.text, result.isError)
+        }
+
         while (true) {
             if (usage.total >= budget.maxTokens) {
                 return done(lastText, StopReason.TOKEN_BUDGET, steps, toolCalls, usage)
@@ -324,11 +351,13 @@ class AgentRuntime(
             if (outputSchema != null) {
                 val submissions = turn.toolCalls.filter { it.name == AgentStructuredOutput.TOOL_NAME }
                 if (submissions.isNotEmpty()) {
-                    val rejectedAsMixed = turn.toolCalls.size != 1 || submissions.size != 1
+                    val submissionIsAlone = turn.toolCalls.size == 1
                     val outcomes = turn.toolCalls.map { call ->
-                        toolCalls++
-                        progress.set(Progress(lastText, steps, toolCalls, usage))
-                        if (call.name == AgentStructuredOutput.TOOL_NAME && !rejectedAsMixed) {
+                        if (call.name != AgentStructuredOutput.TOOL_NAME) {
+                            executeTool(call)
+                        } else if (submissionIsAlone) {
+                            toolCalls++
+                            progress.set(Progress(lastText, steps, toolCalls, usage))
                             val parsed = AgentStructuredOutput.parseSubmission(call.argsJson, outputSchema)
                             val value = parsed.getOrNull()
                             if (value != null) {
@@ -345,14 +374,17 @@ class AgentRuntime(
                                     structuredOutput = value,
                                 )
                             }
-                            log("agent structured output submission: rejected")
+                            val reason = parsed.exceptionOrNull()?.message ?: "the structured output is invalid"
+                            log("agent structured output submission: rejected (${reason.take(MAX_LOG_VALIDATION_REASON_CHARS)})")
                             ToolOutcome(
                                 call.id,
                                 call.name,
-                                parsed.exceptionOrNull()?.message ?: "the structured output is invalid",
+                                reason,
                                 isError = true,
                             )
                         } else {
+                            toolCalls++
+                            progress.set(Progress(lastText, steps, toolCalls, usage))
                             val prefix = "agent tool $toolCalls '${safeToolName(call.name)}'"
                             log("$prefix: blocked (structured output must be submitted exactly once, alone)")
                             ToolOutcome(
@@ -363,9 +395,11 @@ class AgentRuntime(
                             )
                         }
                     }
-                    structuredFailures++
-                    if (structuredFailures >= MAX_STRUCTURED_OUTPUT_FAILURES) {
-                        throw ExecError(STRUCTURED_OUTPUT_FAILURE_MESSAGE)
+                    if (submissionIsAlone) {
+                        structuredFailures++
+                        if (structuredFailures >= MAX_STRUCTURED_OUTPUT_FAILURES) {
+                            throw ExecError(STRUCTURED_OUTPUT_FAILURE_MESSAGE)
+                        }
                     }
                     messages.add(ToolResultsMsg(outcomes))
                     continue
@@ -388,26 +422,7 @@ class AgentRuntime(
                 return done(lastText, StopReason.COMPLETED, steps, toolCalls, usage)
             }
 
-            val outcomes = turn.toolCalls.map { c ->
-                toolCalls++
-                progress.set(Progress(lastText, steps, toolCalls, usage))
-                val prefix = "agent tool $toolCalls '${safeToolName(c.name)}'"
-                if (c.name !in allowedNames) {
-                    log("$prefix: blocked (not in allowlist)")
-                    ToolOutcome(c.id, c.name, "tool '${c.name}' is not in this agent's allowlist", isError = true)
-                } else {
-                    log("$prefix: started")
-                    // A hung tool call is bounded by the remaining budget too (S3).
-                    val toolRemaining = budget.timeoutMs - (System.currentTimeMillis() - started)
-                    val r = if (toolRemaining <= 0) ToolResult("agent wall-clock budget exceeded", isError = true)
-                    else runCatching {
-                        withTimeoutOrNull(toolRemaining) { source.invoke(c.name, c.argsJson) }
-                            ?: ToolResult("tool '${c.name}' timed out", isError = true)
-                    }.getOrElse { ToolResult(it.message ?: it.toString(), isError = true) }
-                    log("$prefix: ${if (r.isError) "failed" else "succeeded"}")
-                    ToolOutcome(c.id, c.name, r.text, r.isError)
-                }
-            }
+            val outcomes = turn.toolCalls.map { executeTool(it) }
             messages.add(ToolResultsMsg(outcomes))
 
         }
@@ -447,9 +462,11 @@ class AgentRuntime(
         const val ADMISSION_TIMEOUT_MS = 1_000L
         const val MIN_HARD_TIMEOUT_GRACE_MS = 500L
         const val MAX_LOG_TOOL_NAME_CHARS = 80
+        const val MAX_LOG_VALIDATION_REASON_CHARS = 240
         const val MAX_STRUCTURED_OUTPUT_FAILURES = 3
-        const val STRUCTURED_OUTPUT_FAILURE_MESSAGE =
-            "Agent did not produce valid structured output after 3 attempts (initial attempt plus 2 corrections)"
+        val STRUCTURED_OUTPUT_FAILURE_MESSAGE =
+            "Agent did not produce valid structured output after $MAX_STRUCTURED_OUTPUT_FAILURES attempts " +
+                "(initial attempt plus ${MAX_STRUCTURED_OUTPUT_FAILURES - 1} corrections)"
 
         // Dispatchers.IO's elastic limited view confines permanently wedged Flow Agent
         // calls without consuming every permit used by unrelated host IO. Once saturated,

@@ -23,8 +23,13 @@ class AgentOutputSchema internal constructor(
     val json: JsonObject,
 ) {
     val source: String = json.toString()
+    private val compiledPatterns = AgentStructuredOutput.compilePatterns(json)
 
-    fun validate(value: JsonObject): String? = AgentStructuredOutput.validate(json, value)
+    fun validate(value: JsonObject): String? = AgentStructuredOutput.validate(json, value, compiledPatterns = compiledPatterns)
+
+    override fun equals(other: Any?): Boolean = other is AgentOutputSchema && json == other.json
+
+    override fun hashCode(): Int = json.hashCode()
 }
 
 /** Provider-agnostic structured-output protocol and its bounded JSON Schema validator. */
@@ -64,35 +69,55 @@ internal object AgentStructuredOutput {
     )
 
     fun parseSubmission(raw: String, schema: AgentOutputSchema): Result<JsonObject> = runCatching {
-        val parsed = JSON.parseToJsonElement(raw) as? JsonObject
+        val element = runCatching { JSON.parseToJsonElement(raw) }.getOrElse {
+            throw IllegalArgumentException("the submission must be valid JSON")
+        }
+        val parsed = element as? JsonObject
             ?: throw IllegalArgumentException("the submission must be a JSON object")
         schema.validate(parsed)?.let { throw IllegalArgumentException(it) }
         parsed
     }
 
-    fun validate(schema: JsonElement, value: JsonElement, path: String = "\$"): String? {
+    fun validate(
+        schema: JsonElement,
+        value: JsonElement,
+        path: String = "\$",
+        depth: Int = 0,
+        compiledPatterns: Map<JsonObject, Regex> = emptyMap(),
+    ): String? {
+        if (depth > MAX_SCHEMA_DEPTH) return "$path exceeds the maximum supported schema depth"
         if (schema is JsonPrimitive && schema.strictBooleanOrNull() != null) {
             return if (schema.strictBooleanOrNull() == true) null else "$path is rejected by the schema"
         }
         val obj = schema as? JsonObject ?: return "$path has an invalid schema"
 
         (obj["allOf"] as? JsonArray)?.forEach { branch ->
-            validate(branch, value, path)?.let { return it }
+            validate(branch, value, path, depth + 1, compiledPatterns)?.let { return it }
         }
         (obj["anyOf"] as? JsonArray)?.let { branches ->
-            if (branches.none { validate(it, value, path) == null }) return "$path does not match any allowed schema"
+            if (branches.none { validate(it, value, path, depth + 1, compiledPatterns) == null }) {
+                return "$path does not match any allowed schema"
+            }
         }
         (obj["oneOf"] as? JsonArray)?.let { branches ->
-            if (branches.count { validate(it, value, path) == null } != 1) {
+            if (branches.count { validate(it, value, path, depth + 1, compiledPatterns) == null } != 1) {
                 return "$path must match exactly one allowed schema"
             }
         }
         obj["not"]?.let { forbidden ->
-            if (validate(forbidden, value, path) == null) return "$path matches a forbidden schema"
+            if (validate(forbidden, value, path, depth + 1, compiledPatterns) == null) {
+                return "$path matches a forbidden schema"
+            }
         }
         obj["if"]?.let { condition ->
-            val branch = if (validate(condition, value, path) == null) obj["then"] else obj["else"]
-            branch?.let { validate(it, value, path)?.let { error -> return error } }
+            val branch = if (validate(condition, value, path, depth + 1, compiledPatterns) == null) {
+                obj["then"]
+            } else {
+                obj["else"]
+            }
+            branch?.let {
+                validate(it, value, path, depth + 1, compiledPatterns)?.let { error -> return error }
+            }
         }
 
         obj["const"]?.let { expected ->
@@ -110,17 +135,23 @@ internal object AgentStructuredOutput {
         }
 
         when (value) {
-            is JsonObject -> validateObject(obj, value, path)?.let { return it }
-            is JsonArray -> validateArray(obj, value, path)?.let { return it }
+            is JsonObject -> validateObject(obj, value, path, depth, compiledPatterns)?.let { return it }
+            is JsonArray -> validateArray(obj, value, path, depth, compiledPatterns)?.let { return it }
             is JsonPrimitive -> when {
-                value.isString -> validateString(obj, value.content, path)?.let { return it }
+                value.isString -> validateString(obj, value.content, path, compiledPatterns)?.let { return it }
                 value !== JsonNull && value.booleanOrNull == null ->
                     validateNumber(obj, value, path)?.let { return it }
             }
         }
         return null
     }
-    private fun validateObject(schema: JsonObject, value: JsonObject, path: String): String? {
+    private fun validateObject(
+        schema: JsonObject,
+        value: JsonObject,
+        path: String,
+        depth: Int,
+        compiledPatterns: Map<JsonObject, Regex>,
+    ): String? {
         val required = schema["required"] as? JsonArray
         required?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull }?.forEach { key ->
             if (key !in value) return "${propertyPath(path, key)} is required"
@@ -129,17 +160,19 @@ internal object AgentStructuredOutput {
         val properties = schema["properties"] as? JsonObject ?: JsonObject(emptyMap())
         for ((key, propertySchema) in properties) {
             value[key]?.let { child ->
-                validate(propertySchema, child, propertyPath(path, key))?.let { return it }
+                validate(propertySchema, child, propertyPath(path, key), depth + 1, compiledPatterns)?.let { return it }
             }
         }
 
         val extras = value.keys - properties.keys
         when (val additional = schema["additionalProperties"]) {
             is JsonPrimitive -> if (additional.strictBooleanOrNull() == false && extras.isNotEmpty()) {
-                return "${propertyPath(path, extras.first())} is not allowed"
+                return "$path contains an additional property that is not allowed"
             }
             is JsonObject -> extras.forEach { key ->
-                validate(additional, value.getValue(key), propertyPath(path, key))?.let { return it }
+                validate(additional, value.getValue(key), propertyPath(path, key), depth + 1, compiledPatterns)?.let {
+                    return it
+                }
             }
             else -> Unit
         }
@@ -149,10 +182,16 @@ internal object AgentStructuredOutput {
         return null
     }
 
-    private fun validateArray(schema: JsonObject, value: JsonArray, path: String): String? {
+    private fun validateArray(
+        schema: JsonObject,
+        value: JsonArray,
+        path: String,
+        depth: Int,
+        compiledPatterns: Map<JsonObject, Regex>,
+    ): String? {
         schema["items"]?.let { itemSchema ->
             value.forEachIndexed { index, element ->
-                validate(itemSchema, element, "$path[$index]")?.let { return it }
+                validate(itemSchema, element, "$path[$index]", depth + 1, compiledPatterns)?.let { return it }
             }
         }
         schema.nonNegativeInt("minItems")?.let { if (value.size < it) return "$path must have at least $it items" }
@@ -163,12 +202,18 @@ internal object AgentStructuredOutput {
         return null
     }
 
-    private fun validateString(schema: JsonObject, value: String, path: String): String? {
+    private fun validateString(
+        schema: JsonObject,
+        value: String,
+        path: String,
+        compiledPatterns: Map<JsonObject, Regex>,
+    ): String? {
         val length = value.codePointCount(0, value.length)
         schema.nonNegativeInt("minLength")?.let { if (length < it) return "$path must contain at least $it characters" }
         schema.nonNegativeInt("maxLength")?.let { if (length > it) return "$path must contain at most $it characters" }
         schema.string("pattern")?.let { pattern ->
-            if (!Regex(pattern).containsMatchIn(value)) return "$path must match pattern ${display(JsonPrimitive(pattern))}"
+            val regex = compiledPatterns[schema] ?: Regex(pattern)
+            if (!regex.containsMatchIn(value)) return "$path must match pattern ${display(JsonPrimitive(pattern))}"
         }
         return null
     }
@@ -188,7 +233,12 @@ internal object AgentStructuredOutput {
         return null
     }
 
-    private fun validateSchema(schema: JsonElement, path: String) {
+    private fun validateSchema(schema: JsonElement, path: String, depth: Int = 0) {
+        if (depth > MAX_SCHEMA_DEPTH) {
+            throw ExecError(
+                "Agent output schema at $path exceeds the maximum supported depth of $MAX_SCHEMA_DEPTH",
+            )
+        }
         if (schema is JsonPrimitive && schema.strictBooleanOrNull() != null) return
         val obj = schema as? JsonObject ?: throw ExecError("Agent output schema at $path must be an object or boolean")
         val unsupported = UNSUPPORTED_KEYWORDS.firstOrNull { it in obj }
@@ -206,22 +256,22 @@ internal object AgentStructuredOutput {
         obj["properties"]?.let { properties ->
             val map = properties as? JsonObject
                 ?: throw ExecError("Agent output schema at $path has non-object 'properties'")
-            map.forEach { (key, child) -> validateSchema(child, propertyPath(path, key)) }
+            map.forEach { (key, child) -> validateSchema(child, propertyPath(path, key), depth + 1) }
         }
-        obj["additionalProperties"]?.let { validateSchema(it, "$path.additionalProperties") }
-        obj["items"]?.let { validateSchema(it, "$path.items") }
+        obj["additionalProperties"]?.let { validateSchema(it, "$path.additionalProperties", depth + 1) }
+        obj["items"]?.let { validateSchema(it, "$path.items", depth + 1) }
         for (keyword in listOf("allOf", "anyOf", "oneOf")) {
             obj[keyword]?.let { branches ->
                 val array = branches as? JsonArray
                     ?: throw ExecError("Agent output schema at $path has non-array '$keyword'")
                 if (array.isEmpty()) throw ExecError("Agent output schema at $path has empty '$keyword'")
-                array.forEachIndexed { index, child -> validateSchema(child, "$path.$keyword[$index]") }
+                array.forEachIndexed { index, child -> validateSchema(child, "$path.$keyword[$index]", depth + 1) }
             }
         }
-        obj["not"]?.let { validateSchema(it, "$path.not") }
-        obj["if"]?.let { validateSchema(it, "$path.if") }
-        obj["then"]?.let { validateSchema(it, "$path.then") }
-        obj["else"]?.let { validateSchema(it, "$path.else") }
+        obj["not"]?.let { validateSchema(it, "$path.not", depth + 1) }
+        obj["if"]?.let { validateSchema(it, "$path.if", depth + 1) }
+        obj["then"]?.let { validateSchema(it, "$path.then", depth + 1) }
+        obj["else"]?.let { validateSchema(it, "$path.else", depth + 1) }
         obj["enum"]?.let {
             if (it !is JsonArray || it.isEmpty()) throw ExecError("Agent output schema at $path has invalid 'enum'")
         }
@@ -290,6 +340,21 @@ internal object AgentStructuredOutput {
     private fun JsonPrimitive.strictBooleanOrNull(): Boolean? =
         takeUnless(JsonPrimitive::isString)?.booleanOrNull
 
+    fun compilePatterns(schema: JsonObject): Map<JsonObject, Regex> = buildMap {
+        fun collect(element: JsonElement) {
+            val obj = element as? JsonObject ?: return
+            obj.string("pattern")?.let { put(obj, Regex(it)) }
+            (obj["properties"] as? JsonObject)?.values?.forEach(::collect)
+            obj["additionalProperties"]?.let(::collect)
+            obj["items"]?.let(::collect)
+            listOf("allOf", "anyOf", "oneOf").forEach { keyword ->
+                (obj[keyword] as? JsonArray)?.forEach(::collect)
+            }
+            listOf("not", "if", "then", "else").forEach { keyword -> obj[keyword]?.let(::collect) }
+        }
+        collect(schema)
+    }
+
     private fun hasDuplicate(values: JsonArray): Boolean =
         values.indices.any { left ->
             ((left + 1) until values.size).any { right -> jsonEqual(values[left], values[right]) }
@@ -325,9 +390,10 @@ internal object AgentStructuredOutput {
         "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf",
     )
     private val UNSUPPORTED_KEYWORDS = setOf(
-        "\$ref", "\$dynamicRef", "patternProperties", "dependentSchemas", "dependentRequired",
+        "\$ref", "\$dynamicRef", "patternProperties", "dependencies", "dependentSchemas", "dependentRequired",
         "propertyNames", "prefixItems", "contains", "minContains", "maxContains", "unevaluatedItems",
         "unevaluatedProperties",
     )
     private const val MAX_DISPLAY_CHARS = 160
+    private const val MAX_SCHEMA_DEPTH = 64
 }
