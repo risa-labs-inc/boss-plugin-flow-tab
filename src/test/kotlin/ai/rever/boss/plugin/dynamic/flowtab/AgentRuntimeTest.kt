@@ -182,7 +182,8 @@ class AgentRuntimeTest {
 
         assertTrue(failure is AgentConfigurationError)
         assertEquals(
-            "Agent tool allowlist contains 2 unavailable entries: 'docker ps', 'missing\\nspoofed'",
+            "Agent tool allowlist contains 2 unavailable entries: 'docker ps', 'missing\\nspoofed' " +
+                "(misspelled, not registered, or its tool source is unavailable)",
             failure.message,
         )
         assertEquals(0, providerCalls.get())

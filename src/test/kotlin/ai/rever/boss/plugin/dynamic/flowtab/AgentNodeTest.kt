@@ -176,7 +176,11 @@ class AgentNodeTest {
         val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
 
         assertEquals(RunStatus.ERROR, state.status)
-        assertEquals("Agent tool allowlist contains 1 unavailable entry: 'missing'", state.error)
+        assertEquals(
+            "Agent tool allowlist contains 1 unavailable entry: 'missing' " +
+                "(misspelled, not registered, or its tool source is unavailable)",
+            state.error,
+        )
         assertEquals(0, providerCalls.get())
         assertEquals("agent configuration failed", state.logs.last())
     }
@@ -362,11 +366,9 @@ class AgentNodeTest {
     }
 
     @Test
-    fun `reserved output tool is rejected as redundant when no real tool shadows it`() {
-        val providerCalls = AtomicInteger()
+    fun `redundant reserved output tool entry remains backward compatible`() {
         val provider = FakeProvider { _, _, _, _ ->
-            providerCalls.incrementAndGet()
-            AssistantTurn(text = "must not run")
+            AssistantTurn(toolCalls = listOf(ToolCall("out", AgentStructuredOutput.TOOL_NAME, """{"ok":true}""")))
         }
         val spec = agentNodeSpec(
             prompts = null,
@@ -385,14 +387,36 @@ class AgentNodeTest {
 
         val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
 
-        assertEquals(RunStatus.ERROR, state.status)
-        assertEquals(
-            "Agent output tool 'flow_submit_output' is added automatically when outputSchema is set; " +
-                "remove it from toolAllowlist",
-            state.error,
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertTrue(state.output.single().json.getValue("ok").jsonPrimitive.boolean)
+        assertTrue(state.logs.contains("agent tools resolved: 0; structured output enabled"))
+    }
+
+    @Test
+    fun `raw JSON array with a scoped kind id resolves end to end`() {
+        var advertised = emptyList<String>()
+        val provider = FakeProvider { _, _, _, tools ->
+            advertised = tools.map { it.ref.kindId }
+            AssistantTurn(text = "done")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(listOf("lookup")) },
         )
-        assertEquals(0, providerCalls.get())
-        assertEquals("agent configuration failed", state.logs.last())
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(
+                AgentNode.ALLOWLIST_KEY,
+                buildJsonArray { add(JsonPrimitive("tool:boss:lookup")) },
+            )
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals(listOf("tool:boss:lookup"), advertised)
     }
 
     @Test

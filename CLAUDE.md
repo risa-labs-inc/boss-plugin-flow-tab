@@ -100,7 +100,9 @@ because its external source is unavailable, the node fails before its first mode
 than letting the model answer without expected evidence. The startup log lists the resolved tool
 count and bounded names. An omitted allowlist, a blank value, or `[]` intentionally advertises no
 ordinary tools and remains valid for tool-free agents; structured output may still add its reserved
-submission tool.
+submission tool. Explicitly listing that synthetic tool by name or `tool:flow:flow_submit_output` is
+accepted as a backward-compatible no-op; a real allowlisted tool that shadows the reserved name is
+still a configuration conflict.
 
 Agent structured output is optional and backward-compatible. A non-blank `outputSchema` must have
 root `"type": "object"`; Flow advertises a reserved `flow_submit_output` tool whose input schema

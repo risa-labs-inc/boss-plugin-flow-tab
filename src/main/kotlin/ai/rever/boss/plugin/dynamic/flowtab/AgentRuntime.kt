@@ -277,6 +277,7 @@ class AgentRuntime(
     ): AgentResult {
         val started = System.currentTimeMillis()
         val available = source.list()
+        var effectiveAllowlist = allowlist
         if (outputSchema != null) {
             val reservedDescriptor = AgentStructuredOutput.descriptor(outputSchema)
             val allowlistedRealReserved = available.any { descriptor ->
@@ -288,18 +289,15 @@ class AgentRuntime(
                     "Agent output tool '${AgentStructuredOutput.TOOL_NAME}' conflicts with an allowlisted tool of the same name",
                 )
             }
-            if (AgentStructuredOutput.TOOL_NAME in allowlist || reservedDescriptor.ref.kindId in allowlist) {
-                throw AgentConfigurationError(
-                    "Agent output tool '${AgentStructuredOutput.TOOL_NAME}' is added automatically when outputSchema is set; " +
-                        "remove it from ${AgentNode.ALLOWLIST_KEY}",
-                )
-            }
+            // Older flows sometimes listed the synthetic submission tool explicitly.
+            // It is added below exactly once, so those redundant entries remain a no-op.
+            effectiveAllowlist = allowlist - AgentStructuredOutput.TOOL_NAME - reservedDescriptor.ref.kindId
         }
         val resolved = available.filter { descriptor ->
-            descriptor.ref.name in allowlist || descriptor.ref.kindId in allowlist
+            descriptor.ref.name in effectiveAllowlist || descriptor.ref.kindId in effectiveAllowlist
         }
         val matched = resolved.flatMapTo(HashSet()) { listOf(it.ref.name, it.ref.kindId) }
-        val unmatched = allowlist.filterNot { entry ->
+        val unmatched = effectiveAllowlist.filterNot { entry ->
             entry in matched
         }
         log(resolvedToolsLog(resolved, outputSchema != null))
@@ -307,7 +305,8 @@ class AgentRuntime(
             throw AgentConfigurationError(
                 "Agent tool allowlist contains ${unmatched.size} unavailable " +
                     "${if (unmatched.size == 1) "entry" else "entries"}: " +
-                    formatConfiguredEntries(unmatched.sorted()),
+                    formatConfiguredEntries(unmatched) +
+                    " (misspelled, not registered, or its tool source is unavailable)",
             )
         }
         val allowed = buildList {
