@@ -1,13 +1,16 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 
 class ExpressionEvalTest {
 
@@ -33,9 +36,13 @@ class ExpressionEvalTest {
         val json = buildJsonObject {
             put("user", buildJsonObject { put("name", "Z") })
             put("items", buildJsonArray { add("a"); add("b") })
+            put("slides", buildJsonArray {
+                add(buildJsonObject { put("title", "First") })
+            })
         }
         assertEquals("Z", ExpressionEval.interpolate("{{ \$json.user.name }}", json, emptyMap()))
         assertEquals("b", ExpressionEval.interpolate("{{ \$json.items[1] }}", json, emptyMap()))
+        assertEquals("First", ExpressionEval.interpolate("{{ \$json.slides.0.title }}", json, emptyMap()))
     }
 
     @Test
@@ -45,9 +52,44 @@ class ExpressionEvalTest {
     }
 
     @Test
-    fun `missing path renders empty, plain text passes through`() {
-        assertEquals("", ExpressionEval.interpolate("{{ \$json.nope }}", empty, emptyMap()))
+    fun `missing and unsupported paths fail with the expression named`() {
+        val missing = assertFailsWith<TemplateResolutionException> {
+            ExpressionEval.interpolate("{{ \$json.nope }}", empty, emptyMap())
+        }
+        val unsupported = assertFailsWith<TemplateResolutionException> {
+            ExpressionEval.interpolate(
+                "{{ \$json.issueTitle.length }}",
+                buildJsonObject { put("issueTitle", "Bug") },
+                emptyMap(),
+            )
+        }
+
+        assertEquals("Unresolved template expression '{{ \$json.nope }}'", missing.message)
+        assertEquals("Unresolved template expression '{{ \$json.issueTitle.length }}'", unsupported.message)
         assertEquals("just text", ExpressionEval.interpolate("just text", empty, emptyMap()))
+    }
+
+    @Test
+    fun `explicit json null is resolved rather than treated as a missing path`() {
+        val json = buildJsonObject { put("optional", JsonNull) }
+
+        assertEquals("", ExpressionEval.interpolate("{{ \$json.optional }}", json, emptyMap()))
+        assertEquals(
+            JsonNull,
+            ExpressionEval.interpolateJson(JsonPrimitive("{{ \$json.optional }}"), json, emptyMap()),
+        )
+    }
+
+    @Test
+    fun `malformed path syntax fails instead of being partially evaluated`() {
+        val json = buildJsonObject { put("name", "Ada") }
+
+        assertFailsWith<TemplateResolutionException> {
+            ExpressionEval.interpolate("{{ \$json.name() }}", json, emptyMap())
+        }
+        assertFailsWith<TemplateResolutionException> {
+            ExpressionEval.interpolate("{{ \$json[name] }}", json, emptyMap())
+        }
     }
 
     @Test
