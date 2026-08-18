@@ -49,11 +49,16 @@ show the model the same observation as both data and a fresh instruction, which 
 prompt-injection shape the runtime's separate message type exists to avoid. A test asserts the
 outcome text appears in `toolOutcomes` and nowhere in `messages`.
 
-**The model stays the node's** `Model` config field, but it is now advisory: the gateway uses
-whatever model the active provider has selected. Taking a node config the flow author may never
-have opened and using it to override a user's chosen model would be the worse behaviour, and the
-field is kept because saved flows carry a value for it. `AgentNode.DEFAULT_MODEL` holds the
-default that used to live on `AnthropicProvider`.
+Model selection belongs to Settings → AI Providers because `AiGatewayAPI` exposes the active model,
+not a per-request override. The Parameters tab therefore renders a non-editable explanation rather
+than the old editable `claude-sonnet-5` value that never affected execution. The legacy `model` key
+remains untouched in raw saved JSON for compatibility but is not parsed or sent. Optional Agent
+temperature is a real request parameter: blank defers to whatever the active provider sends (AI
+Gateway v1.1.2+ omits it when the provider setting is also absent), while an explicit value from 0 to
+2 is forwarded. The node timeout is capped at 12 minutes so its 5% hard-stop grace remains
+comfortably below the 15-minute flow controller watchdog, then forwarded to relax the gateway's
+shorter per-turn default; `AgentRuntime` still enforces the decreasing whole-run time remaining and
+fires first.
 
 `maxTokens` is still overridden per request (4096, not the provider's chat-completion default of
 2000) because a bounded tool-use loop needs the headroom. A run is bounded by `AgentBudget`.

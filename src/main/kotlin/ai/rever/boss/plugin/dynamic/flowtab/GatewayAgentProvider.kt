@@ -25,14 +25,15 @@ import ai.rever.boss.plugin.api.AiTurn
  * still work exactly as before. This class only translates between the runtime's transcript
  * types and the gateway's.
  *
- * The **model stays the node's** ([AgentSettings.model], a visible per-node config field).
- * The gateway uses whatever model the active provider has selected, so a node that names one
- * explicitly is documented as advisory rather than silently overriding a user's choice - see
- * [modelNote].
+ * Model selection stays with Settings → AI Providers. Flow's legacy `model` config key is
+ * preserved in saved JSON but is not sent: the gateway API intentionally exposes only the
+ * active model. Optional request parameters that the API does support are passed explicitly.
  */
 internal class GatewayAgentProvider(
     private val gateway: () -> AiGatewayAPI?,
     private val maxTokens: Int = DEFAULT_MAX_TOKENS,
+    private val temperature: Float? = null,
+    private val requestTimeoutMs: Long? = null,
     /**
      * Explains why AI is unavailable and offers the fix. Fire-and-forget: the node still
      * fails, because a DAG step cannot wait on a dialog and a run that silently paused
@@ -88,17 +89,23 @@ internal class GatewayAgentProvider(
             pendingTurn = null
         }
 
+        val baseRequest =
+            AiRequest(
+                system = system,
+                // Tool rounds travel structurally in `rounds`, not as transcript
+                // text, so they are dropped here rather than sent twice.
+                messages = messages.mapNotNull(::toAiMessage),
+                // Null defers to the active provider setting. Gateway v1.1.2+ omits
+                // temperature when that setting is also absent.
+                temperature = temperature,
+                maxTokens = maxTokens,
+            )
+        val request = requestTimeoutMs?.let { baseRequest.copy(timeoutMs = it) } ?: baseRequest
+
         val turn =
             api
                 .step(
-                    request =
-                        AiRequest(
-                            system = system,
-                            // Tool rounds travel structurally in `rounds`, not as transcript
-                            // text, so they are dropped here rather than sent twice.
-                            messages = messages.mapNotNull(::toAiMessage),
-                            maxTokens = maxTokens,
-                        ),
+                    request = request,
                     tools =
                         tools.map { descriptor ->
                             AiToolSpec(
@@ -147,6 +154,5 @@ internal class GatewayAgentProvider(
          * per request rather than per provider.
          */
         const val DEFAULT_MAX_TOKENS = 4096
-
     }
 }

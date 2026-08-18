@@ -10,8 +10,8 @@ import kotlinx.serialization.json.put
 /**
  * Config keys + constants for the `agent` node. Per red-team F6, an agent's entire
  * configuration lives inside `node.config` (no sidecar map): the prompt (inline or a
- * [PromptRegistry] id), the tool allowlist, the model, and the run budget. `__`-free
- * keys so they render as ordinary inspector fields.
+ * [PromptRegistry] id), the tool allowlist, optional sampling temperature, and the
+ * run budget. `__`-free keys so they render as ordinary inspector fields.
  */
 object AgentNode {
     const val KIND = "agent"
@@ -21,6 +21,7 @@ object AgentNode {
     const val INPUT_KEY = "input"
     const val ALLOWLIST_KEY = "toolAllowlist"
     const val MODEL_KEY = "model"
+    const val TEMPERATURE_KEY = "temperature"
     const val MAX_STEPS_KEY = "maxSteps"
     const val TIMEOUT_KEY = "timeoutMs"
     const val MAX_TOKENS_KEY = "maxTokens"
@@ -28,14 +29,10 @@ object AgentNode {
     const val ACCENT = 0xFF6D4AFF
 
     /**
-     * Default for the node's model field.
-     *
-     * Kept as a visible field because saved flows carry a value for it, but the agent runs
-     * on whatever model the active provider has selected in Settings, AI Providers - the
-     * gateway resolves that per call. Overriding a user's chosen model from a node config
-     * they may never have opened would be the worse behaviour.
+     * Keeps one Agent node, including its 5% hard-stop grace, comfortably below
+     * the whole-flow watchdog so timeout state still has time to be published.
      */
-    const val DEFAULT_MODEL = "claude-sonnet-5"
+    const val MAX_TIMEOUT_MS = FlowController.DEFAULT_RUN_TIMEOUT_MS - 3 * 60 * 1_000L
 
     val CONFIG_FIELDS: List<ConfigField> = listOf(
         ConfigField(PROMPT_ID_KEY, "Prompt id (optional)", FieldType.TEXT, placeholder = "a saved prompt's id"),
@@ -44,18 +41,24 @@ object AgentNode {
         ConfigField(ALLOWLIST_KEY, "Tool allowlist", FieldType.JSON, placeholder = """["tool_a","tool_b"]"""),
         ConfigField(
             MODEL_KEY,
-            "Model (from Settings, AI Providers)",
-            FieldType.TEXT,
-            default = DEFAULT_MODEL,
-            placeholder = "Set by the active AI provider; kept for existing flows",
+            "Model",
+            FieldType.INFO,
+            note = "Uses the active model selected in Settings → AI Providers. " +
+                "Any legacy model value in JSON is retained for compatibility and ignored.",
+        ),
+        ConfigField(
+            TEMPERATURE_KEY,
+            "Temperature (optional; blank = provider setting)",
+            FieldType.NUMBER,
+            placeholder = "0–2 (range varies by provider); e.g. 0.2 or {{ \$json.temp }}",
         ),
         ConfigField(MAX_STEPS_KEY, "Max steps", FieldType.NUMBER, default = "8"),
         ConfigField(
             TIMEOUT_KEY,
-            "Timeout (ms)",
+            "Timeout (ms, max 720000)",
             FieldType.NUMBER,
             default = "120000",
-            placeholder = "blank = 120000; must be greater than 0",
+            placeholder = "blank = 120000",
         ),
         ConfigField(
             MAX_TOKENS_KEY,
@@ -68,14 +71,14 @@ object AgentNode {
 
 /**
  * Parsed agent configuration for one run: the resolved [input], the tool [allowlist],
- * the [model], the [budget], and the prompt source ([promptId] or inline [system]).
+ * optional [temperature], the [budget], and the prompt source ([promptId] or inline [system]).
  */
 data class AgentSettings(
     val promptId: String?,
     val system: String,
     val input: String,
     val allowlist: Set<String>,
-    val model: String,
+    val temperature: Float?,
     val budget: AgentBudget,
 )
 
@@ -138,13 +141,14 @@ class AgentNodeExecutor(
         val input = inlineInput.ifBlank { inputs.firstOrNull()?.json?.toString() ?: "" }
         val maxSteps = cfg.positiveInt(AgentNode.MAX_STEPS_KEY, 8, "Agent max steps")
         val timeoutMs = cfg.positiveLong(AgentNode.TIMEOUT_KEY, 120_000, "Agent timeout")
+            .coerceAtMost(AgentNode.MAX_TIMEOUT_MS)
         val maxTokens = cfg.positiveInt(AgentNode.MAX_TOKENS_KEY, Int.MAX_VALUE, "Agent max tokens")
         return AgentSettings(
             promptId = cfg.str(AgentNode.PROMPT_ID_KEY).ifBlank { null },
             system = cfg.str(AgentNode.SYSTEM_KEY),
             input = input,
             allowlist = parseAllowlist(cfg),
-            model = cfg.str(AgentNode.MODEL_KEY).ifBlank { AgentNode.DEFAULT_MODEL },
+            temperature = cfg.optionalFiniteFloat(AgentNode.TEMPERATURE_KEY, "Agent temperature"),
             budget = AgentBudget(
                 maxSteps = maxSteps,
                 timeoutMs = timeoutMs,
@@ -166,6 +170,17 @@ class AgentNodeExecutor(
         val value = positiveLong(key, default.toLong(), label)
         if (value > Int.MAX_VALUE) throw ExecError("$label ($key) is too large")
         return value.toInt()
+    }
+
+    private fun ConfigReader.optionalFiniteFloat(key: String, label: String): Float? {
+        val raw = str(key).trim()
+        if (raw.isEmpty()) return null
+        val value = raw.toFloatOrNull()
+            ?: throw ExecError("$label ($key) must be a finite number")
+        if (!value.isFinite()) throw ExecError("$label ($key) must be a finite number")
+        if (value < 0f) throw ExecError("$label ($key) must be zero or greater")
+        if (value > 2f) throw ExecError("$label ($key) must be 2 or less")
+        return value
     }
 
     /** Allowlist as a JSON array of names, or a comma/newline-separated string. */
@@ -224,7 +239,7 @@ fun defaultAgentNodeSpec(
         // gateway nor the active provider exposes a change signal, so a provider changed in
         // Settings has to be picked up by the next run rather than needing the tab reopened.
         // A per-run instance also keeps each run's replayed tool turn to itself.
-        providerFor = {
+        providerFor = { settings ->
             GatewayAgentProvider(
                 // Wrapped, like every other getPluginAPI call in this plugin: if a host
                 // without the gateway throws rather than returning null, the carefully
@@ -236,6 +251,11 @@ fun defaultAgentNodeSpec(
                     ai.rever.boss.plugin.api.AiAvailability.promptToFix(context, feature)
                     Unit
                 },
+                temperature = settings.temperature,
+                // AgentRuntime applies the decreasing remaining whole-run budget to each
+                // turn. Forwarding the watchdog-derived cap relaxes the gateway's shorter
+                // default; the runtime remains the authoritative timeout and fires first.
+                requestTimeoutMs = settings.budget.timeoutMs,
             )
         },
         toolSourceFor = { ctx -> defaultAgentToolSource(context, external, ctx) },

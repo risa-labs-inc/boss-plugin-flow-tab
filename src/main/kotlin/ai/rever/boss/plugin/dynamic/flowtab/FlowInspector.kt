@@ -152,6 +152,8 @@ private fun ParametersTab(node: FlowNode) {
     }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         for (field in fields) {
+            val info = field.note.trim()
+            if (field.type == FieldType.INFO && info.isEmpty()) continue
             FieldLabel(field.label)
             when (field.type) {
                 FieldType.TEXT -> TextInput(configValue(node, field), placeholder = field.placeholder, singleLine = true) {
@@ -181,6 +183,9 @@ private fun ParametersTab(node: FlowNode) {
                     val on = configValue(node, field).equals("true", true)
                     SelectChip(if (on) "On" else "Off", on) { setConfig(node, field.key, (!on).toString()) }
                 }
+                // Explanatory text only. Deliberately ignore node.config so a legacy
+                // stored value cannot masquerade as a live editable setting.
+                FieldType.INFO -> Text(info, color = Muted, fontSize = 12.sp)
             }
         }
     }

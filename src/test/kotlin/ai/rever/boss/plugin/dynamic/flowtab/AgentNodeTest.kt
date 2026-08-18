@@ -8,6 +8,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -95,6 +96,120 @@ class AgentNodeTest {
         )
         assertEquals(RunStatus.SUCCESS, states["a"]!!.status)
         assertTrue(source.invoked.isEmpty()) // 'danger' was gated, 'safe' never called
+    }
+
+    @Test
+    fun `model is informational while temperature is parsed as a real request setting`() {
+        lateinit var settings: AgentSettings
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { parsed ->
+                settings = parsed
+                FakeProvider.scripted(AssistantTurn(text = "done"))
+            },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            // Old saved flows keep this raw key, but it must not become a request override.
+            put(AgentNode.MODEL_KEY, "legacy-model-that-must-not-run")
+            put(AgentNode.TEMPERATURE_KEY, "0.25")
+            put(AgentNode.TIMEOUT_KEY, "12345")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals(0.25f, settings.temperature)
+        assertEquals(12_345L, settings.budget.timeoutMs)
+        val modelField = AgentNode.CONFIG_FIELDS.single { it.key == AgentNode.MODEL_KEY }
+        assertEquals(FieldType.INFO, modelField.type)
+        assertTrue(modelField.note.contains("Settings"))
+        assertTrue(modelField.note.contains("ignored"))
+        assertTrue(modelField.default.isEmpty())
+        assertTrue(modelField.placeholder.isEmpty())
+
+        val snapshot = GraphSnapshot(
+            nodes = listOf(NodeModel("a", AgentNode.KIND, "Agent", 0f, 0f, cfg)),
+            schemaVersion = SUPPORTED_SCHEMA_VERSION,
+        )
+        val encoded = Json.encodeToString(GraphSnapshot.serializer(), snapshot)
+        val restored = Json.decodeFromString(GraphSnapshot.serializer(), encoded)
+        assertEquals(
+            "legacy-model-that-must-not-run",
+            restored.nodes.single().config[AgentNode.MODEL_KEY]?.jsonPrimitive?.content,
+        )
+    }
+
+    @Test
+    fun `absent blank and JSON number temperatures follow the config path`() {
+        val seen = mutableListOf<Float?>()
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { settings ->
+                seen += settings.temperature
+                FakeProvider.scripted(AssistantTurn(text = "done"))
+            },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val configs = listOf(
+            buildJsonObject { put(AgentNode.INPUT_KEY, "absent") },
+            buildJsonObject {
+                put(AgentNode.INPUT_KEY, "blank")
+                put(AgentNode.TEMPERATURE_KEY, "   ")
+            },
+            buildJsonObject {
+                put(AgentNode.INPUT_KEY, "number")
+                put(AgentNode.TEMPERATURE_KEY, 0.25)
+            },
+        )
+
+        configs.forEachIndexed { index, config ->
+            val state = runFlow(
+                reg,
+                listOf(PlanNode("a$index", AgentNode.KIND, "Agent", config)),
+                emptyList(),
+            ).getValue("a$index")
+            assertEquals(RunStatus.SUCCESS, state.status)
+        }
+
+        assertEquals(listOf(null, null, 0.25f), seen)
+    }
+
+    @Test
+    fun `temperature must be finite and non-negative`() {
+        val providerCalls = AtomicInteger()
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = {
+                providerCalls.incrementAndGet()
+                FakeProvider.scripted(AssistantTurn(text = "must not run"))
+            },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+
+        fun stateFor(id: String, value: String): NodeRun {
+            val cfg = buildJsonObject {
+                put(AgentNode.INPUT_KEY, "go")
+                put(AgentNode.TEMPERATURE_KEY, value)
+            }
+            return runFlow(reg, listOf(PlanNode(id, AgentNode.KIND, "Agent", cfg)), emptyList()).getValue(id)
+        }
+
+        val nonFinite = stateFor("nan", "NaN")
+        val negative = stateFor("negative", "-0.1")
+        val tooHigh = stateFor("high", "20")
+
+        assertEquals(RunStatus.ERROR, nonFinite.status)
+        assertEquals("Agent temperature (temperature) must be a finite number", nonFinite.error)
+        assertEquals(RunStatus.ERROR, negative.status)
+        assertEquals("Agent temperature (temperature) must be zero or greater", negative.error)
+        assertEquals(RunStatus.ERROR, tooHigh.status)
+        assertEquals("Agent temperature (temperature) must be 2 or less", tooHigh.error)
+        assertEquals(0, providerCalls.get())
     }
 
     @Test
@@ -238,6 +353,31 @@ class AgentNodeTest {
         )
         assertEquals(RunStatus.ERROR, stepsState?.status)
         assertEquals("Agent max steps (maxSteps) must be greater than 0", stepsState?.error)
+    }
+
+    @Test
+    fun `agent timeout is capped below the flow watchdog`() {
+        lateinit var settings: AgentSettings
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { parsed ->
+                settings = parsed
+                FakeProvider.scripted(AssistantTurn(text = "done"))
+            },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.TIMEOUT_KEY, "1800000")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals(AgentNode.MAX_TIMEOUT_MS, settings.budget.timeoutMs)
+        val hardStopMs = settings.budget.timeoutMs + maxOf(500L, settings.budget.timeoutMs / 20)
+        assertTrue(hardStopMs <= FlowController.DEFAULT_RUN_TIMEOUT_MS - 60_000L)
     }
 
     @Test

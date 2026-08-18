@@ -18,18 +18,24 @@ enum class RunMode {
  *
  * [JSON] is a multiline raw-JSON editor for nested objects/arrays that don't fit a
  * flat scalar field (tool inputs with structured schemas — see P1). [NUMBER] is a
- * single-line numeric field. TEXT/TEXTAREA/SELECT/BOOL are unchanged.
+ * single-line numeric field. [INFO] renders [ConfigField.note] as non-editable
+ * explanatory text and never reads or writes node config. TEXT/TEXTAREA/SELECT/BOOL
+ * are unchanged.
  */
-enum class FieldType { TEXT, TEXTAREA, SELECT, BOOL, JSON, NUMBER }
+enum class FieldType { TEXT, TEXTAREA, SELECT, BOOL, JSON, NUMBER, INFO }
 
-/** Declarative config-field schema — rendered by the inspector, read by executors. */
+/**
+ * Declarative config-field schema — rendered by the inspector, read by executors.
+ * [note] is body copy for [FieldType.INFO] only; editable field types use [placeholder].
+ */
 data class ConfigField(
     val key: String,
     val label: String,
     val type: FieldType = FieldType.TEXT,
     val options: List<String> = emptyList(),
     val placeholder: String = "",
-    val default: String = ""
+    val default: String = "",
+    val note: String = "",
 )
 
 /**

@@ -41,9 +41,13 @@ class TemplatesTest {
 
     @Test
     fun `catalog exposes the scrape and agent starters`() {
-        val ids = TemplateCatalog().ids().toSet()
+        val catalog = TemplateCatalog()
+        val ids = catalog.ids().toSet()
         assertTrue("scrape" in ids, "expected a scrape starter; got $ids")
         assertTrue("agent" in ids, "expected an agent starter; got $ids")
+        val agentConfig = catalog.all().first { it.id == "agent" }.snapshot.nodes
+            .single { it.type == AgentNode.KIND }.config
+        assertFalse(agentConfig.containsKey(AgentNode.MODEL_KEY))
     }
 
     // ---- export: inline prompts + strip secrets -----------------------------
