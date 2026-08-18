@@ -1,7 +1,14 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * One tool the model asked to run this turn. [id] correlates the call with its result
@@ -96,6 +103,35 @@ class AgentRuntime(
         input: String,
         allowlist: Set<String>,
         log: (String) -> Unit = {},
+    ): AgentResult {
+        // Provider and tool integrations are host/plugin boundaries and may block without
+        // cooperating with coroutine cancellation. Keep their loop in an independently
+        // owned scope so the caller can publish TIMEOUT at the configured wall-clock
+        // deadline instead of waiting for a late host call to return. Cancellation remains
+        // best-effort; a late result has no path back to the already-returned AgentResult.
+        val executionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val acceptingLogs = AtomicBoolean(true)
+        val execution = executionScope.async {
+            runLoop(system, input, allowlist) { message ->
+                if (acceptingLogs.get()) log(message)
+            }
+        }
+        execution.invokeOnCompletion { executionScope.cancel() }
+        return try {
+            withTimeoutOrNull(budget.timeoutMs.coerceAtLeast(0)) { execution.await() }
+                ?: done("", StopReason.TIMEOUT, steps = 0, toolCalls = 0, usage = TokenUsage())
+        } finally {
+            acceptingLogs.set(false)
+            execution.cancel(CancellationException("Agent execution ended"))
+            executionScope.cancel()
+        }
+    }
+
+    private suspend fun runLoop(
+        system: String,
+        input: String,
+        allowlist: Set<String>,
+        log: (String) -> Unit,
     ): AgentResult {
         val started = System.currentTimeMillis()
         val allowed = source.list().filter { it.ref.name in allowlist }

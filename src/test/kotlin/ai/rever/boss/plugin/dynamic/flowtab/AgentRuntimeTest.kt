@@ -122,6 +122,28 @@ class AgentRuntimeTest {
         assertTrue(elapsed < 3_000, "hung step must be cut near the budget, not after the full hang (was ${elapsed}ms)")
     }
 
+    @Test
+    fun `a non-cooperative provider cannot hold the caller past the wall-clock budget`() = runBlocking {
+        val source = RecordingSource(listOf(desc("late")))
+        val logs = mutableListOf<String>()
+        val provider = FakeProvider { _, _, _, _ ->
+            Thread.sleep(1_500)
+            AssistantTurn(toolCalls = listOf(call("late")))
+        }
+        val started = System.currentTimeMillis()
+
+        val result = AgentRuntime(provider, source, AgentBudget(timeoutMs = 100))
+            .run(system = "s", input = "go", allowlist = setOf("late"), log = logs::add)
+        val elapsed = System.currentTimeMillis() - started
+
+        assertEquals(StopReason.TIMEOUT, result.stopReason)
+        assertTrue(elapsed < 1_000, "non-cooperative step held the caller for ${elapsed}ms")
+        val logsAtTimeout = logs.toList()
+        delay(1_600)
+        assertEquals(logsAtTimeout, logs, "late completion must not mutate published timeout logs")
+        assertTrue(source.invoked.isEmpty(), "late provider completion must not invoke a tool after timeout")
+    }
+
     // ---- tool output is data, not instructions ------------------------------
 
     @Test

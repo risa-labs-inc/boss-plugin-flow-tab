@@ -97,6 +97,9 @@ class AgentNodeExecutor(
         val result = AgentRuntime(provider, source, settings.budget)
             .run(system = system, input = settings.input, allowlist = settings.allowlist, log = log)
         log("agent stopped: ${result.stopReason} (${result.steps} step(s), ${result.toolCalls} tool call(s))")
+        if (result.stopReason == StopReason.TIMEOUT) {
+            throw ExecError("Agent timed out after ${settings.budget.timeoutMs}ms")
+        }
         return NodeOutput.single(listOf(
             Item(buildJsonObject {
                 put("text", result.finalText)
@@ -125,7 +128,7 @@ class AgentNodeExecutor(
             model = cfg.str(AgentNode.MODEL_KEY).ifBlank { AgentNode.DEFAULT_MODEL },
             budget = AgentBudget(
                 maxSteps = cfg.int(AgentNode.MAX_STEPS_KEY, 8),
-                timeoutMs = cfg.str(AgentNode.TIMEOUT_KEY).trim().toLongOrNull() ?: 120_000,
+                timeoutMs = (cfg.str(AgentNode.TIMEOUT_KEY).trim().toLongOrNull() ?: 120_000).coerceAtLeast(0),
                 maxTokens = cfg.int(AgentNode.MAX_TOKENS_KEY, Int.MAX_VALUE),
             ),
         )

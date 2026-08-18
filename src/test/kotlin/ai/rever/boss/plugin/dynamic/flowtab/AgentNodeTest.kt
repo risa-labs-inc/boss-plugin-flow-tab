@@ -6,6 +6,7 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.TabRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
@@ -91,6 +92,31 @@ class AgentNodeTest {
         )
         assertEquals(RunStatus.SUCCESS, states["a"]!!.status)
         assertTrue(source.invoked.isEmpty()) // 'danger' was gated, 'safe' never called
+    }
+
+    @Test
+    fun `agent timeout fails the node instead of emitting a successful result`() {
+        val provider = FakeProvider { _, _, _, _ ->
+            delay(10_000)
+            AssistantTurn(text = "too late")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.TIMEOUT_KEY, "100")
+        }
+
+        val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
+
+        assertEquals(RunStatus.ERROR, states["a"]?.status)
+        assertEquals("Agent timed out after 100ms", states["a"]?.error)
+        assertTrue(states["a"]?.logs.orEmpty().any { it.startsWith("agent stopped: TIMEOUT") })
+        assertTrue(states["a"]?.output.orEmpty().isEmpty())
     }
 
     @Test
