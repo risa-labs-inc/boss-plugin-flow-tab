@@ -64,13 +64,18 @@ There are two intentionally separate token controls. The Agent node's optional `
 is the cumulative whole-run budget: it sums provider-reported input plus output usage across every
 model turn. Because each request replays the conversation and completed tool rounds, earlier
 transcript, tool calls, and tool results count again as input on later turns. Tool-call arguments
-count as output when the model generates them and as input when that round is replayed. Enforcement
-is best-effort: a provider that omits usage contributes nothing to the counter, so `maxTokens` cannot
-be a hard bound for that provider. Blank remains unbounded. In contrast, `GatewayAgentProvider`
-always asks the gateway for at most `GatewayAgentProvider.DEFAULT_MAX_TOKENS` (currently 4096) output
-tokens on each individual model request (rather than the provider's chat-completion default of 2000)
-because a tool-use turn needs the headroom. This documents the existing semantics; it does not change
-either default or split the `AgentBudget` API.
+count as output when the model generates them and as input when that round is replayed. `maxTokens`
+is a pre-request soft threshold: after a completed turn brings accumulated usage to or above the
+configured value, the runtime stops before the next model request. It does not interrupt the crossing
+request, so actual usage can exceed the value by one full turn. Enforcement is also best-effort: a
+provider that omits usage contributes nothing to the counter, so `maxTokens` cannot be a hard bound
+for that provider. Blank remains unbounded. Budgets in the hundreds commonly stop a tool-using Agent
+before its final answer; several thousand is a more realistic starting point, then tune from observed
+usage. In contrast, `GatewayAgentProvider` always asks the gateway for at most
+`GatewayAgentProvider.DEFAULT_MAX_TOKENS` (currently 4096) output tokens on each individual model
+request (rather than the provider's chat-completion default of 2000) because a tool-use turn needs
+the headroom. This documents the existing semantics; it does not change either default or split the
+`AgentBudget` API.
 
 `timeoutMs` is a hard node deadline, not merely a check between agent steps. `AgentRuntime` owns
 its loop on a 64-call, concurrency-limited elastic IO view so a non-cooperative provider or tool

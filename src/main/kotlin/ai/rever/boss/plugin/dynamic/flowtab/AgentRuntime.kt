@@ -74,8 +74,11 @@ fun interface AgentProvider {
 /**
  * Bounds on a single agent run. [maxTokens] is cumulative provider-reported input plus
  * output usage across all model turns, including content replayed between requests,
- * unlike a provider's per-request output cap. It is best-effort when usage is absent.
- * All three bounds are enforced; whichever trips first wins.
+ * unlike a provider's per-request output cap. It is a soft threshold checked before each
+ * request: the request that crosses it finishes, and the run stops before another request,
+ * so actual usage can exceed [maxTokens] by one full turn. It is best-effort when usage
+ * is absent. Step and token thresholds are evaluated between requests; timeout also bounds
+ * an in-flight provider or tool call.
  */
 data class AgentBudget(
     val maxSteps: Int = 8,
@@ -83,7 +86,7 @@ data class AgentBudget(
     val maxTokens: Int = Int.MAX_VALUE,
 )
 
-/** Why the loop stopped. [COMPLETED] = the model returned a final text with no tool calls. */
+/** Why the loop stopped. [COMPLETED] means final text or a valid structured result was produced. */
 enum class StopReason { COMPLETED, MAX_STEPS, TIMEOUT, TOKEN_BUDGET }
 
 /** The outcome of an agent run: its final [finalText], why it stopped, and run counters. */
@@ -176,7 +179,14 @@ class AgentRuntime(
     ): AgentResult {
         val timeoutMs = budget.timeoutMs.coerceAtLeast(0)
         if (timeoutMs == 0L) {
-            return done("", StopReason.TIMEOUT, steps = 0, toolCalls = 0, usage = TokenUsage()).also {
+            return done(
+                text = "",
+                reason = StopReason.TIMEOUT,
+                steps = 0,
+                toolCalls = 0,
+                usage = TokenUsage(),
+                usageReported = false,
+            ).also {
                 log(stopLog(it))
             }
         }
@@ -346,9 +356,21 @@ class AgentRuntime(
         var lastText = ""
         var structuredFailures = 0
 
+        fun publishProgress() {
+            progress.set(
+                Progress(
+                    lastText = lastText,
+                    steps = steps,
+                    toolCalls = toolCalls,
+                    usage = usage,
+                    usageReported = usageReported,
+                ),
+            )
+        }
+
         suspend fun executeTool(call: ToolCall): ToolOutcome {
             toolCalls++
-            progress.set(Progress(lastText, steps, toolCalls, usage, usageReported))
+            publishProgress()
             val prefix = "agent tool $toolCalls '${safeToolName(call.name)}'"
             if (call.name !in allowedNames) {
                 log("$prefix: blocked (not in allowlist)")
@@ -398,7 +420,7 @@ class AgentRuntime(
                 usageReported = true
             }
             turn.text?.let { lastText = it }
-            progress.set(Progress(lastText, steps, toolCalls, usage, usageReported))
+            publishProgress()
             messages.add(AssistantMsg(turn.text, turn.toolCalls))
 
             if (outputSchema != null) {
@@ -410,7 +432,7 @@ class AgentRuntime(
                             executeTool(call)
                         } else if (submissionIsAlone) {
                             toolCalls++
-                            progress.set(Progress(lastText, steps, toolCalls, usage, usageReported))
+                            publishProgress()
                             val parsed = AgentStructuredOutput.parseSubmission(call.argsJson, outputSchema)
                             val value = parsed.getOrNull()
                             if (value != null) {
@@ -438,7 +460,7 @@ class AgentRuntime(
                             )
                         } else {
                             toolCalls++
-                            progress.set(Progress(lastText, steps, toolCalls, usage, usageReported))
+                            publishProgress()
                             val prefix = "agent tool $toolCalls '${safeToolName(call.name)}'"
                             log("$prefix: blocked (structured output must be submitted exactly once, alone)")
                             ToolOutcome(
@@ -488,7 +510,7 @@ class AgentRuntime(
         steps: Int,
         toolCalls: Int,
         usage: TokenUsage,
-        usageReported: Boolean = false,
+        usageReported: Boolean,
         structuredOutput: JsonObject? = null,
     ) = AgentResult(text, reason, steps, toolCalls, usage, usageReported, structuredOutput)
 

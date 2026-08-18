@@ -486,7 +486,7 @@ class AgentNodeTest {
         )
         assertTrue(sawCorrection)
         assertTrue(state.output.isEmpty())
-        assertTrue(state.logs.contains("agent non-structured final text withheld (28 chars)"))
+        assertTrue(state.logs.contains("agent partial text withheld (28 chars)"))
         assertFalse(state.logs.joinToString("\n").contains("secret prose instead of json"))
     }
 
@@ -648,7 +648,8 @@ class AgentNodeTest {
         assertEquals(RunStatus.ERROR, timeoutState.status)
         assertEquals(
             "Agent stopped: TIMEOUT after 0 completed step(s), 0 attempted tool call(s); " +
-                "timeout was 100ms; no valid structured output was produced",
+                "configured timeoutMs was 100ms; provider-reported usage was unavailable; " +
+                "no valid structured output was produced",
             timeoutState.error,
         )
         assertTrue(timeoutState.output.isEmpty())
@@ -730,12 +731,11 @@ class AgentNodeTest {
 
         val helpField = AgentNode.CONFIG_FIELDS.single { it.key == AgentNode.MAX_TOKENS_INFO_KEY }
         assertEquals(FieldType.INFO, helpField.type)
-        assertTrue(helpField.note.contains("every model turn"))
-        assertTrue(helpField.note.contains("tool-call arguments count as output"))
-        assertTrue(helpField.note.contains("as input when replayed"))
+        assertTrue(helpField.note.contains("Soft whole-run threshold checked between model requests"))
+        assertTrue(helpField.note.contains("may exceed the value by one full turn"))
         assertTrue(helpField.note.contains("only when the provider reports usage"))
+        assertTrue(helpField.note.contains("values in the hundreds commonly stop before the final answer"))
         assertTrue(helpField.note.contains("${GatewayAgentProvider.DEFAULT_MAX_TOKENS}-token output cap"))
-        assertTrue(helpField.note.contains("each individual model request"))
     }
 
     @Test
@@ -815,6 +815,7 @@ class AgentNodeTest {
                 AssistantTurn(
                     text = "working answer",
                     toolCalls = listOf(ToolCall("1", "step", "{}")),
+                    usage = TokenUsage(input = 2, output = 1),
                 )
             } else {
                 delay(10_000)
@@ -839,7 +840,9 @@ class AgentNodeTest {
 
         assertEquals(RunStatus.ERROR, states["a"]?.status)
         assertEquals(
-            "Agent stopped: TIMEOUT after 1 completed step(s), 1 attempted tool call(s); timeout was 100ms",
+            "Agent stopped: TIMEOUT after 1 completed step(s), 1 attempted tool call(s); " +
+                "configured timeoutMs was 100ms; provider-reported usage was 3 token(s) (input 2 + output 1); " +
+                "no final response was completed",
             states["a"]?.error,
         )
         assertTrue(states["a"]?.logs.orEmpty().any { it.startsWith("agent stopped: TIMEOUT") })
@@ -1047,6 +1050,30 @@ class AgentNodeTest {
         assertTrue(state.output.isEmpty())
         assertTrue(state.logs.contains("agent partial text withheld (${partial.length} chars)"))
         assertFalse(state.logs.joinToString("\n").contains(partial))
+    }
+
+    @Test
+    fun `limit without partial text emits no withheld-text log`() {
+        val source = RecordingSource(listOf("spin"))
+        val provider = FakeProvider { _, _, _, _ ->
+            AssistantTurn(toolCalls = listOf(ToolCall("1", "spin", "{}")))
+        }
+        val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.MAX_STEPS_KEY, "1")
+            put(AgentNode.ALLOWLIST_KEY, buildJsonArray { add(JsonPrimitive("spin")) })
+        }
+
+        val state = runFlow(
+            reg,
+            listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)),
+            emptyList(),
+        ).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertTrue(state.output.isEmpty())
+        assertFalse(state.logs.any { "text withheld" in it })
     }
 
     @Test

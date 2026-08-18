@@ -247,19 +247,19 @@ class AgentRuntimeTest {
     }
 
     @Test
-    fun `token budget accumulates input and output usage across every model turn`() = runBlocking {
+    fun `token threshold sums reported usage and stops before the next request`() = runBlocking {
         val providerCalls = AtomicInteger()
         val source = RecordingSource(listOf(desc("spin")))
         val provider = FakeProvider { step, _, _, _ ->
             providerCalls.incrementAndGet()
             if (step == 0) {
                 AssistantTurn(
-                    toolCalls = listOf(call("spin", """{"toolArgumentTraffic":"first"}""")),
+                    toolCalls = listOf(call("spin")),
                     usage = TokenUsage(input = 30, output = 20),
                 )
             } else {
                 AssistantTurn(
-                    toolCalls = listOf(call("spin", """{"toolArgumentTraffic":"second"}""")),
+                    toolCalls = listOf(call("spin")),
                     usage = TokenUsage(input = 40, output = 30),
                 )
             }
