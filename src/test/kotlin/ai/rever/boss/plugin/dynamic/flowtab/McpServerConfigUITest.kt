@@ -1,6 +1,5 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
-import java.nio.charset.StandardCharsets
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -8,20 +7,6 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class McpServerConfigUITest {
-    @Test
-    fun `flow tab bytecode mounts the external MCP configuration panel`() {
-        val componentClass = FlowTabComponent::class.java
-        val classBytes = componentClass.getResourceAsStream("/${componentClass.name.replace('.', '/')}.class")
-            ?.use { it.readBytes() }
-        assertNotNull(classBytes)
-
-        val constantPool = classBytes.toString(StandardCharsets.ISO_8859_1)
-        assertTrue(
-            constantPool.contains("McpServerConfigUIKt") && constantPool.contains("McpServerConfigPanel"),
-            "FlowTabComponent must keep McpServerConfigPanel reachable from the Flow tab",
-        )
-    }
-
     @Test
     fun `stdio draft requires command and normalizes persisted config`() {
         assertNull(

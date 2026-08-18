@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -139,9 +140,6 @@ class FlowTabComponent(
     // One registry instance per tab, threaded to both the canvas state (palette +
     // geometry) and the executor (dispatch) so they agree on every kind-id.
     private val registry = builtinNodeRegistry()
-    /** Kept for the component lifetime so a settings edit can unregister external
-     * tool nodes that disappeared as well as register newly available ones. */
-    private val externalMcpNodeSync = externalMcp?.let { ToolNodeSync(it, registry) }
     private val state = FlowGraphState(registry)
     private val executor = FlowExecutor(context, registry)
     // Prompt store + a headless controller sharing this tab's registry, so `agent` and
@@ -181,9 +179,11 @@ class FlowTabComponent(
         // degrades cleanly to built-ins only. The collector is tied to [coroutineScope]
         // and cancelled on destroy.
         runCatching { syncBossTools(context, registry, coroutineScope) }
-        // Surface external MCP tools (P7) as palette nodes too — flag-gated inside refresh,
-        // so nothing connects until the user enables external MCP and adds a server.
-        refreshExternalMcpTools()
+        // Surface external MCP tools (P7) as palette nodes too. Each open tab has one
+        // latest-wins collector, while the plugin-wide manager owns connection I/O.
+        externalMcp?.let { manager ->
+            runCatching { syncExternalMcpTools(manager, registry, coroutineScope) }
+        }
         // Register the agent + lanager kinds so they appear in the palette and dispatch.
         runCatching {
             registry.register(defaultAgentNodeSpec(context, prompts, externalMcp))
@@ -198,29 +198,6 @@ class FlowTabComponent(
                 }
             }
         )
-    }
-
-    /** Reconcile the shared manager, then mirror its current tools into this tab's
-     * registry. The synchronizer is stable so disabled/removed servers disappear
-     * from the palette instead of leaving stale node kinds behind. */
-    private fun refreshExternalMcpTools() {
-        val manager = externalMcp ?: return
-        val sync = externalMcpNodeSync ?: return
-        coroutineScope.launch {
-            runCatching {
-                manager.refresh()
-                sync.apply(manager.list())
-            }
-        }
-    }
-
-    /** The settings panel has already reconciled connections before invoking its
-     * callback, so only mirror the settled manager state and avoid a second connect
-     * attempt when a configured server is unavailable. */
-    private fun mirrorExternalMcpTools() {
-        val manager = externalMcp ?: return
-        val sync = externalMcpNodeSync ?: return
-        coroutineScope.launch { runCatching { sync.apply(manager.list()) } }
     }
 
     @Composable
@@ -770,12 +747,16 @@ class FlowTabComponent(
                     text = {
                         McpServerConfigPanel(
                             manager = mcpManager,
-                            onChanged = ::mirrorExternalMcpTools,
+                            modifier = Modifier.heightIn(max = 480.dp),
                         )
                     },
                     confirmButton = {
-                        TextButton(onClick = { showMcpConfig = false }) { Text("Close") }
+                        TextButton(onClick = { showMcpConfig = false }) {
+                            Text("Close", color = FlowTheme.TextPrimary)
+                        }
                     },
+                    backgroundColor = FlowTheme.Surface,
+                    contentColor = FlowTheme.TextPrimary,
                 )
             }
 

@@ -20,6 +20,7 @@ import androidx.compose.material.SwitchDefaults
 import androidx.compose.material.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -37,6 +38,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.foundation.clickable
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.launch
 
 /**
@@ -44,8 +46,8 @@ import kotlinx.coroutines.launch
  * feature flag (OFF by default) and the per-server [McpServerConfig] list held by
  * [manager]; every mutation persists through the manager (config JSON at
  * [ExternalMcpManager.CONFIG_KEY], flag in [SettingsStore]) and then calls
- * [ExternalMcpManager.refresh] to reconcile live connections. [onChanged] lets the
- * owning Flow tab immediately mirror the manager's current tools into its palette.
+ * [ExternalMcpManager.refresh] to reconcile live connections. Every Flow tab observes
+ * the manager's change tick independently, so this panel does not own palette updates.
  *
  * Secrets are never entered/stored here as values — a server references a secret by its
  * logical *name* ([McpServerConfig.secretRef]), resolved from the host vault at connect
@@ -55,11 +57,13 @@ import kotlinx.coroutines.launch
 fun McpServerConfigPanel(
     manager: ExternalMcpManager,
     modifier: Modifier = Modifier,
-    onChanged: () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     var enabled by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var operationError by remember { mutableStateOf<String?>(null) }
     val servers = remember { mutableStateListOf<McpServerConfig>() }
+    val statuses by manager.serverStatuses.collectAsState()
 
     // New-server form fields.
     var name by remember { mutableStateOf("") }
@@ -75,7 +79,31 @@ fun McpServerConfigPanel(
         servers.addAll(manager.listConfigs())
     }
 
-    LaunchedEffect(Unit) { reload() }
+    LaunchedEffect(manager) {
+        manager.changeTick.collect { reload() }
+    }
+
+    fun mutate(change: suspend () -> Unit) {
+        if (busy) return
+        busy = true
+        operationError = null
+        scope.launch {
+            try {
+                change()
+                manager.refresh()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                operationError = failure.message ?: "External MCP settings could not be updated"
+            } finally {
+                try {
+                    reload()
+                } finally {
+                    busy = false
+                }
+            }
+        }
+    }
 
     Column(
         modifier
@@ -86,14 +114,19 @@ fun McpServerConfigPanel(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Text("External MCP servers", color = FlowTheme.TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        if (busy) {
+            Text("Updating connections…", color = FlowTheme.TextMuted, fontSize = 11.sp)
+        }
+        operationError?.let { message ->
+            Text(message.take(ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH), color = FlowTheme.Error, fontSize = 11.sp)
+        }
 
         // Master feature flag.
         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             Switch(
                 checked = enabled,
-                onCheckedChange = { on ->
-                    scope.launch { manager.setSettingsEnabled(on); manager.refresh(); reload(); onChanged() }
-                },
+                onCheckedChange = { on -> mutate { manager.setSettingsEnabled(on) } },
+                enabled = !busy,
                 colors = SwitchDefaults.colors(checkedThumbColor = FlowTheme.Primary),
             )
             Spacer(Modifier.width(8.dp))
@@ -115,12 +148,10 @@ fun McpServerConfigPanel(
         servers.forEach { cfg ->
             ServerRow(
                 cfg = cfg,
-                onToggle = { on ->
-                    scope.launch { manager.upsertConfig(cfg.copy(enabled = on)); manager.refresh(); reload(); onChanged() }
-                },
-                onRemove = {
-                    scope.launch { manager.removeConfig(cfg.name); manager.refresh(); reload(); onChanged() }
-                },
+                status = statuses[cfg.name],
+                enabled = !busy,
+                onToggle = { on -> mutate { manager.upsertConfig(cfg.copy(enabled = on)) } },
+                onRemove = { mutate { manager.removeConfig(cfg.name) } },
             )
         }
 
@@ -138,10 +169,18 @@ fun McpServerConfigPanel(
         }
         Field("Secret name (optional)", secretRef) { secretRef = it }
         val draft = McpServerDraft(name, kind, command, args, url, secretRef)
-        Pill("Add server", enabledLook = draft.toConfigOrNull() != null) {
-            val cfg = draft.toConfigOrNull() ?: return@Pill
-            scope.launch {
-                manager.upsertConfig(cfg); manager.refresh(); reload(); onChanged()
+        val newConfig = draft.toConfigOrNull()
+        val duplicateName = newConfig != null && servers.any { it.name == newConfig.name }
+        if (duplicateName) {
+            Text("A server named '${newConfig.name}' already exists.", color = FlowTheme.Error, fontSize = 11.sp)
+        }
+        Pill("Add server", enabledLook = newConfig != null && !duplicateName && !busy) {
+            val cfg = newConfig ?: return@Pill
+            mutate {
+                if (!manager.addConfig(cfg)) {
+                    operationError = "A server named '${cfg.name}' already exists."
+                    return@mutate
+                }
                 name = ""; command = ""; args = ""; url = ""; secretRef = ""
             }
         }
@@ -149,7 +188,13 @@ fun McpServerConfigPanel(
 }
 
 @Composable
-private fun ServerRow(cfg: McpServerConfig, onToggle: (Boolean) -> Unit, onRemove: () -> Unit) {
+private fun ServerRow(
+    cfg: McpServerConfig,
+    status: ExternalMcpServerStatus?,
+    enabled: Boolean,
+    onToggle: (Boolean) -> Unit,
+    onRemove: () -> Unit,
+) {
     Row(
         Modifier.fillMaxWidth()
             .clip(RoundedCornerShape(FlowTheme.rMd))
@@ -162,15 +207,29 @@ private fun ServerRow(cfg: McpServerConfig, onToggle: (Boolean) -> Unit, onRemov
             Text(cfg.name, color = FlowTheme.TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium)
             val detail = if (cfg.kind == McpTransportKind.STDIO) "stdio · ${cfg.command}" else "sse · ${cfg.url}"
             Text(detail, color = FlowTheme.TextFaint, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            val state = status?.state ?: ExternalMcpServerState.DISCONNECTED
+            val stateText = when (state) {
+                ExternalMcpServerState.DISCONNECTED -> status?.detail ?: "Disconnected"
+                ExternalMcpServerState.CONNECTING -> "Connecting…"
+                ExternalMcpServerState.CONNECTED -> "Connected"
+                ExternalMcpServerState.ERROR -> status?.detail ?: "Connection failed"
+            }
+            val stateColor = when (state) {
+                ExternalMcpServerState.CONNECTED -> FlowTheme.Success
+                ExternalMcpServerState.ERROR -> FlowTheme.Error
+                else -> FlowTheme.TextMuted
+            }
+            Text(stateText, color = stateColor, fontSize = 11.sp, maxLines = 2)
         }
         Switch(
             checked = cfg.enabled, onCheckedChange = onToggle,
+            enabled = enabled,
             colors = SwitchDefaults.colors(checkedThumbColor = FlowTheme.Success),
         )
         Spacer(Modifier.width(8.dp))
         Text(
-            "Remove", color = FlowTheme.Error, fontSize = 12.sp,
-            modifier = Modifier.pointerHoverIcon(PointerIcon.Hand).clickable { onRemove() },
+            "Remove", color = if (enabled) FlowTheme.Error else FlowTheme.TextFaint, fontSize = 12.sp,
+            modifier = Modifier.pointerHoverIcon(PointerIcon.Hand).clickable(enabled = enabled) { onRemove() },
         )
     }
 }

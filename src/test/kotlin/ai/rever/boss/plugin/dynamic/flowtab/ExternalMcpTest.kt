@@ -1,10 +1,23 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.runCurrent
+import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
@@ -22,13 +35,14 @@ import kotlin.test.assertTrue
  * resolution (never from config), config persistence, lifecycle reaping, and the
  * login-shell PATH command construction.
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class ExternalMcpTest {
 
     // ---- test doubles -------------------------------------------------------
 
     /** In-memory transport: scripts tools/results, records connect/close + secret. */
     private class FakeTransport(
-        val tools: List<RemoteTool>,
+        var tools: List<RemoteTool>,
         val secret: String? = null,
         val failConnect: Boolean = false,
         val onCall: (String, String) -> RemoteToolResult = { n, _ -> RemoteToolResult("ok:$n", false) },
@@ -53,8 +67,15 @@ class ExternalMcpTest {
     private fun manager(
         storage: TestStorage = TestStorage(),
         secrets: SecretResolver = SecretResolver.constant(null),
+        ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
         factory: McpTransportFactory,
-    ) = ExternalMcpManager(storage, secrets, SettingsStore(storage), factory)
+    ) = ExternalMcpManager(
+        storage = storage,
+        secrets = secrets,
+        settings = SettingsStore(storage),
+        transportFactory = factory,
+        ioDispatcher = ioDispatcher,
+    )
 
     // ---- ExternalMcpToolSource ----------------------------------------------
 
@@ -188,6 +209,18 @@ class ExternalMcpTest {
         assertEquals(listOf("b"), m.listConfigs().map { it.name })
     }
 
+    @Test
+    fun `addConfig rejects a duplicate name without replacing the existing server`() = runBlocking {
+        val storage = TestStorage()
+        val m = manager(storage) { _, _ -> FakeTransport(emptyList()) }
+        val original = McpServerConfig("same", McpTransportKind.STDIO, command = "original")
+        val duplicate = McpServerConfig("same", McpTransportKind.HTTP_SSE, url = "https://replacement.test")
+
+        assertTrue(m.addConfig(original))
+        assertFalse(m.addConfig(duplicate))
+        assertEquals(original, m.listConfigs().single())
+    }
+
     // ---- lifecycle / reaping ------------------------------------------------
 
     @Test
@@ -233,6 +266,171 @@ class ExternalMcpTest {
         m.upsertConfig(McpServerConfig("good", McpTransportKind.STDIO, command = "x", enabled = true))
         m.refresh()
         assertEquals(listOf("good/t"), m.list().map { it.ref.name })
+    }
+
+    @Test
+    fun `connection failure publishes a bounded per-server error and a change tick`() = runBlocking {
+        val storage = TestStorage()
+        val longFailure = "connect boom " + "x".repeat(ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH * 2)
+        val m = manager(storage) { _, _ ->
+            object : McpTransport {
+                override suspend fun connect() = error(longFailure)
+                override suspend fun listTools(): List<RemoteTool> = emptyList()
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", true)
+                override suspend fun close() = Unit
+            }
+        }
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        m.upsertConfig(McpServerConfig("bad", McpTransportKind.STDIO, command = "x", enabled = true))
+        val before = m.changeTick.value
+
+        m.refresh()
+
+        val status = m.serverStatuses.value.getValue("bad")
+        assertEquals(ExternalMcpServerState.ERROR, status.state)
+        assertTrue(status.detail!!.startsWith("Connection failed: connect boom"))
+        assertTrue(status.detail.length <= ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH)
+        assertEquals(before + 1, m.changeTick.value)
+    }
+
+    @Test
+    fun `refresh runs connect and close on its IO dispatcher`() {
+        val io = Executors.newSingleThreadExecutor { task -> Thread(task, "external-mcp-test-io") }
+            .asCoroutineDispatcher()
+        try {
+            runBlocking {
+                val storage = TestStorage()
+                var connectThread = ""
+                var closeThread = ""
+                val m = manager(storage, ioDispatcher = io) { _, _ ->
+                    object : McpTransport {
+                        override suspend fun connect() { connectThread = Thread.currentThread().name }
+                        override suspend fun listTools(): List<RemoteTool> = emptyList()
+                        override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                        override suspend fun close() { closeThread = Thread.currentThread().name }
+                    }
+                }
+                SettingsStore(storage).setExternalMcpEnabled(true)
+                m.upsertConfig(McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = true))
+                m.refresh()
+                m.upsertConfig(McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = false))
+                m.refresh()
+
+                assertTrue(connectThread.startsWith("external-mcp-test-io"))
+                assertTrue(closeThread.startsWith("external-mcp-test-io"))
+            }
+        } finally {
+            io.close()
+        }
+    }
+
+    @Test
+    fun `cancelling connect closes the opened transport non-cancellably and preserves the cause`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        val connectStarted = CompletableDeferred<Unit>()
+        var closeCalled = false
+        var cleanupWasActive = false
+        val transport = object : McpTransport {
+            override suspend fun connect() {
+                connectStarted.complete(Unit)
+                awaitCancellation()
+            }
+            override suspend fun listTools(): List<RemoteTool> = emptyList()
+            override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+            override suspend fun close() {
+                closeCalled = true
+                cleanupWasActive = currentCoroutineContext().isActive
+            }
+        }
+        val m = manager(storage, ioDispatcher = dispatcher) { _, _ -> transport }
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        m.upsertConfig(McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = true))
+        var completionCause: Throwable? = null
+        val job = launch { m.refresh() }.also { launched ->
+            launched.invokeOnCompletion { completionCause = it }
+        }
+        connectStarted.await()
+        val cancellation = kotlinx.coroutines.CancellationException("stop connecting")
+
+        job.cancel(cancellation)
+        job.join()
+
+        assertTrue(closeCalled)
+        assertTrue(cleanupWasActive)
+        assertEquals(cancellation, completionCause)
+    }
+
+    @Test
+    fun `every tool synchronizer follows the manager change tick`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        val transport = FakeTransport(listOf(remote("first")))
+        val m = manager(storage, ioDispatcher = dispatcher) { _, _ -> transport }
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        m.upsertConfig(McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = true))
+        val firstRegistry = NodeRegistry()
+        val secondRegistry = NodeRegistry()
+        syncExternalMcpTools(m, firstRegistry, backgroundScope)
+        syncExternalMcpTools(m, secondRegistry, backgroundScope)
+        runCurrent()
+
+        assertNotNull(firstRegistry["tool:ext:s/first"])
+        assertNotNull(secondRegistry["tool:ext:s/first"])
+
+        transport.tools = listOf(remote("second"))
+        m.refresh()
+        runCurrent()
+
+        assertNull(firstRegistry["tool:ext:s/first"])
+        assertNull(secondRegistry["tool:ext:s/first"])
+        assertNotNull(firstRegistry["tool:ext:s/second"])
+        assertNotNull(secondRegistry["tool:ext:s/second"])
+    }
+
+    @Test
+    fun `tool synchronization cancels stale discovery before applying the latest result`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        var tools = listOf(remote("initial"))
+        var blockNext: CompletableDeferred<Unit>? = null
+        var blockedStarted = CompletableDeferred<Unit>()
+        val transport = object : McpTransport {
+            override suspend fun connect() = Unit
+            override suspend fun listTools(): List<RemoteTool> {
+                val snapshot = tools
+                blockNext?.let { gate ->
+                    blockNext = null
+                    blockedStarted.complete(Unit)
+                    gate.await()
+                }
+                return snapshot
+            }
+            override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+            override suspend fun close() = Unit
+        }
+        val m = manager(storage, ioDispatcher = dispatcher) { _, _ -> transport }
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        m.upsertConfig(McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = true))
+        val registry = NodeRegistry()
+        syncExternalMcpTools(m, registry, backgroundScope)
+        runCurrent()
+        assertNotNull(registry["tool:ext:s/initial"])
+
+        tools = listOf(remote("stale"))
+        blockNext = CompletableDeferred()
+        blockedStarted = CompletableDeferred()
+        m.refresh()
+        runCurrent()
+        blockedStarted.await()
+
+        tools = listOf(remote("latest"))
+        m.refresh()
+        runCurrent()
+
+        assertNull(registry["tool:ext:s/initial"])
+        assertNull(registry["tool:ext:s/stale"])
+        assertNotNull(registry["tool:ext:s/latest"])
     }
 
     // ---- settings store -----------------------------------------------------
