@@ -63,6 +63,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonPrimitive
 import kotlin.math.roundToInt
 
@@ -123,6 +124,11 @@ fun nodeNumberLabel(displayNumber: Int): String = "#${displayNumber.coerceAtLeas
  */
 fun nodeSummary(node: FlowNode): String {
     fun c(k: String) = (node.config[k] as? JsonPrimitive)?.content ?: ""
+    fun configured(k: String): Boolean = when (val value = node.config[k]) {
+        null, JsonNull -> false
+        is JsonPrimitive -> value.content.isNotBlank()
+        else -> true
+    }
     fun withTarget(action: String, target: String, fallback: String): String =
         if (target.isBlank()) fallback else "$action ${target.trim()}"
 
@@ -152,10 +158,10 @@ fun nodeSummary(node: FlowNode): String {
         "CODE" -> "Transforms each input item"
         "IF" -> withTarget("Branches when", c("condition"), "Routes items by a condition")
         "MERGE" -> "Combines both input branches"
-        AgentNode.KIND -> if (c(AgentNode.OUTPUT_SCHEMA_KEY).isBlank()) {
-            "Runs an AI agent with approved tools"
-        } else {
+        AgentNode.KIND -> if (configured(AgentNode.OUTPUT_SCHEMA_KEY)) {
             "Runs an AI agent and returns structured data"
+        } else {
+            "Runs an AI agent with approved tools"
         }
         LanagerNode.KIND -> withTarget("Runs sub-flow", c(LanagerNode.FLOW_ID_KEY), "Runs another flow")
         else -> node.spec.description.ifBlank { "Runs ${node.spec.label}" }
