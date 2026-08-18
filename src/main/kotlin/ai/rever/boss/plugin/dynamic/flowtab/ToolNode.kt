@@ -144,6 +144,7 @@ fun toolNodeSpec(desc: ToolDescriptor, source: ToolSource): NodeSpec = NodeSpec(
 class ToolNodeSync(
     private val source: ToolSource,
     private val registry: NodeRegistry,
+    private val registerSpec: (NodeSpec) -> Unit = registry::register,
     private val buildSpec: (ToolDescriptor) -> NodeSpec = { toolNodeSpec(it, source) },
 ) {
     private var current: Set<String> = emptySet()
@@ -154,8 +155,10 @@ class ToolNodeSync(
         val specs = descriptors.map(buildSpec)
         val next = specs.map { it.id }.toSet()
         (current - next).forEach { registry.unregister(it) }
-        specs.forEach(registry::register)
+        // Record the desired set before registration. If a custom/host registry throws
+        // part-way through, the next emission can still remove every partially added id.
         current = next
+        specs.forEach(registerSpec)
     }
 }
 
@@ -183,17 +186,25 @@ internal suspend fun collectBossToolUpdates(
         println("[flow-tab] failed to synchronize host tools: ${toolSyncFailureMessage(failure)}")
     },
 ) {
+    var previousDescriptorFailures: Set<String> = emptySet()
     updates.collect { tools ->
+        val descriptorFailures = linkedMapOf<String, Exception>()
         val descriptors = tools.mapNotNull { tool ->
             try {
                 convert(tool)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
-                reportFailure(failure)
+                val key = "${failure::class.qualifiedName}:${toolSyncFailureMessage(failure)}"
+                descriptorFailures.putIfAbsent(key, failure)
                 null
             }
         }
+        descriptorFailures
+            .filterKeys { it !in previousDescriptorFailures }
+            .values
+            .forEach(reportFailure)
+        previousDescriptorFailures = descriptorFailures.keys
         try {
             apply(descriptors)
         } catch (cancelled: CancellationException) {
@@ -208,6 +219,8 @@ internal const val MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH = 200
 
 internal fun toolSyncFailureMessage(failure: Exception): String =
     (failure.message ?: "unknown error")
+        .map { char ->
+            if (char.isISOControl() || char == '\u2028' || char == '\u2029') ' ' else char
+        }
+        .joinToString("")
         .take(MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH)
-        .replace('\n', ' ')
-        .replace('\r', ' ')

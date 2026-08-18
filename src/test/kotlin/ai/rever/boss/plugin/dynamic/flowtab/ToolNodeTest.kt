@@ -16,6 +16,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -241,6 +242,36 @@ class ToolNodeTest {
     }
 
     @Test
+    fun `sync tracks desired ids before a registration failure`() {
+        val fake = FakeRegistry(emptyList()) { _, _ -> McpToolResult("", false) }
+        val source = BossRegistryToolSource(fake)
+        val registry = builtinNodeRegistry()
+        var rejectBad = false
+        val sync = ToolNodeSync(
+            source = source,
+            registry = registry,
+            registerSpec = { spec ->
+                if (rejectBad && spec.id == "tool:boss:bad") error("registry rejected spec")
+                registry.register(spec)
+            },
+        )
+        fun descriptor(name: String) = ToolDescriptor(ToolRef(ToolScope.BOSS, name), name, "", "{}")
+
+        sync.apply(listOf(descriptor("before")))
+        rejectBad = true
+        assertFailsWith<IllegalStateException> {
+            sync.apply(listOf(descriptor("partial"), descriptor("bad")))
+        }
+        assertNotNull(registry["tool:boss:partial"], "the failure must occur after a partial registration")
+
+        rejectBad = false
+        sync.apply(listOf(descriptor("after")))
+        assertNull(registry["tool:boss:partial"], "the next diff must remove a partially registered id")
+        assertNull(registry["tool:boss:bad"])
+        assertNotNull(registry["tool:boss:after"])
+    }
+
+    @Test
     fun `syncBossTools degrades to null when the host has no registry`() {
         val job = syncBossTools(minimalContext(null), builtinNodeRegistry(), CoroutineScope(Dispatchers.Default))
         assertNull(job)
@@ -275,6 +306,37 @@ class ToolNodeTest {
     }
 
     @Test
+    fun `boss tool collector reports a stable malformed descriptor once until recovery`() = runBlocking {
+        val updates = MutableSharedFlow<List<RegisteredMcpTool>>()
+        val failures = mutableListOf<Exception>()
+        val applied = Channel<Unit>(Channel.UNLIMITED)
+        val job = launch(start = CoroutineStart.UNDISPATCHED) {
+            collectBossToolUpdates(
+                updates = updates,
+                apply = { applied.trySend(Unit).getOrThrow() },
+                convert = { error("stable malformed descriptor") },
+                reportFailure = failures::add,
+            )
+        }
+
+        try {
+            updates.emit(listOf(tool("broken", "{}")))
+            withTimeout(2_000) { applied.receive() }
+            updates.emit(listOf(tool("broken", "{}")))
+            withTimeout(2_000) { applied.receive() }
+            assertEquals(1, failures.size, "an unchanged malformed descriptor must not spam every emission")
+
+            updates.emit(emptyList())
+            withTimeout(2_000) { applied.receive() }
+            updates.emit(listOf(tool("broken", "{}")))
+            withTimeout(2_000) { applied.receive() }
+            assertEquals(2, failures.size, "the diagnostic must return if the failure recurs after recovery")
+        } finally {
+            job.cancelAndJoin()
+        }
+    }
+
+    @Test
     fun `boss tool descriptor conversion preserves cancellation`() = runBlocking {
         val updates = MutableSharedFlow<List<RegisteredMcpTool>>()
         val failures = mutableListOf<Exception>()
@@ -298,10 +360,12 @@ class ToolNodeTest {
 
     @Test
     fun `tool sync failure messages are single line and bounded`() {
-        val message = toolSyncFailureMessage(IllegalStateException("x".repeat(250) + "\nsecret"))
+        val bounded = toolSyncFailureMessage(IllegalStateException("x".repeat(250) + "\nsecret"))
+        val sanitized = toolSyncFailureMessage(IllegalStateException("a\nb\rc\u0000d\u0085e\u2028f\u2029g"))
 
-        assertEquals(MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH, message.length)
-        assertFalse('\n' in message)
-        assertFalse("secret" in message)
+        assertEquals(MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH, bounded.length)
+        assertFalse("secret" in bounded)
+        assertEquals("a b c d e f g", sanitized)
+        assertTrue(sanitized.none(Char::isISOControl))
     }
 }

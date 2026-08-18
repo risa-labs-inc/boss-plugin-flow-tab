@@ -39,6 +39,8 @@ class FlowTabDynamicPlugin : DynamicPlugin {
     override fun register(context: PluginContext) {
         // Some hosts may re-register after replacing pluginScope without first calling
         // dispose(). Reap the old controller-owned collector before losing its reference.
+        // This does not claim full re-registration teardown: the previous external MCP
+        // manager and already-open tabs have a separate shared lifetime handled elsewhere.
         headlessController?.dispose()
         headlessController = null
         pluginContext = context
