@@ -28,6 +28,7 @@ object AgentNode {
     const val MAX_STEPS_KEY = "maxSteps"
     const val TIMEOUT_KEY = "timeoutMs"
     const val MAX_TOKENS_KEY = "maxTokens"
+    const val MAX_TOKENS_INFO_KEY = "maxTokensInfo"
     const val OUTPUT_SCHEMA_KEY = "outputSchema"
 
     const val ACCENT = 0xFF6D4AFF
@@ -84,9 +85,17 @@ object AgentNode {
         ),
         ConfigField(
             MAX_TOKENS_KEY,
-            "Max tokens",
+            "Max tokens (whole run)",
             FieldType.NUMBER,
-            placeholder = "unbounded if blank; otherwise must be greater than 0",
+            placeholder = "blank = unbounded cumulative input + output usage",
+        ),
+        ConfigField(
+            MAX_TOKENS_INFO_KEY,
+            "Token budget notes",
+            FieldType.INFO,
+            note = "Cumulative provider-reported input + output usage across every model turn in the run, " +
+                "including tool-call argument traffic. Separate from the gateway's fixed 4096-token output cap " +
+                "on each individual model request.",
         ),
     )
 }
@@ -162,6 +171,15 @@ class AgentNodeExecutor(
                 )
             }
             return NodeOutput.single(listOf(Item(structured)))
+        }
+        if (result.stopReason == StopReason.TOKEN_BUDGET || result.stopReason == StopReason.MAX_STEPS) {
+            if (result.finalText.isNotBlank()) {
+                log("agent partial text withheld (${result.finalText.length} chars)")
+            }
+            throw ExecError(
+                "Agent stopped: ${result.stopReason} after ${result.steps} completed step(s), " +
+                    "${result.toolCalls} attempted tool call(s); no final response was completed",
+            )
         }
         return NodeOutput.single(listOf(
             Item(buildJsonObject {

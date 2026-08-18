@@ -230,6 +230,35 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `token budget accumulates input and output usage across every model turn`() = runBlocking {
+        val providerCalls = AtomicInteger()
+        val source = RecordingSource(listOf(desc("spin")))
+        val provider = FakeProvider { step, _, _, _ ->
+            providerCalls.incrementAndGet()
+            if (step == 0) {
+                AssistantTurn(
+                    toolCalls = listOf(call("spin", """{"toolArgumentTraffic":"first"}""")),
+                    usage = TokenUsage(input = 30, output = 20),
+                )
+            } else {
+                AssistantTurn(
+                    toolCalls = listOf(call("spin", """{"toolArgumentTraffic":"second"}""")),
+                    usage = TokenUsage(input = 40, output = 30),
+                )
+            }
+        }
+
+        val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 10, maxTokens = 120))
+            .run(system = "s", input = "go", allowlist = setOf("spin"))
+
+        assertEquals(StopReason.TOKEN_BUDGET, result.stopReason)
+        assertEquals(TokenUsage(input = 70, output = 50), result.usage)
+        assertEquals(120, result.usage.total)
+        assertEquals(2, result.steps)
+        assertEquals(2, providerCalls.get(), "the cumulative limit must prevent a third model request")
+    }
+
+    @Test
     fun `token budget wins when the same turn also exhausts max steps`() = runBlocking {
         val source = RecordingSource(listOf(desc("spin")))
         val provider = FakeProvider { _, _, _, _ ->

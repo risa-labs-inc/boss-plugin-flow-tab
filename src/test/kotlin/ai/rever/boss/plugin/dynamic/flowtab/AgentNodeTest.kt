@@ -716,6 +716,21 @@ class AgentNodeTest {
     }
 
     @Test
+    fun `max tokens metadata distinguishes whole-run usage from the per-request output cap`() {
+        val budgetField = AgentNode.CONFIG_FIELDS.single { it.key == AgentNode.MAX_TOKENS_KEY }
+        assertEquals("Max tokens (whole run)", budgetField.label)
+        assertTrue(budgetField.placeholder.contains("cumulative input + output"))
+        assertTrue(budgetField.default.isEmpty(), "the documented semantics must not change the existing default")
+
+        val helpField = AgentNode.CONFIG_FIELDS.single { it.key == AgentNode.MAX_TOKENS_INFO_KEY }
+        assertEquals(FieldType.INFO, helpField.type)
+        assertTrue(helpField.note.contains("every model turn"))
+        assertTrue(helpField.note.contains("tool-call argument traffic"))
+        assertTrue(helpField.note.contains("4096-token output cap"))
+        assertTrue(helpField.note.contains("each individual model request"))
+    }
+
+    @Test
     fun `absent blank and JSON number temperatures follow the config path`() {
         val seen = mutableListOf<Float?>()
         val spec = agentNodeSpec(
@@ -955,10 +970,11 @@ class AgentNodeTest {
     }
 
     @Test
-    fun `max steps remains a successful bounded result`() {
+    fun `max steps without final completion fails closed and withholds partial prose`() {
         val source = RecordingSource(listOf("spin"))
+        val partial = "still working through tools"
         val provider = FakeProvider { _, _, _, _ ->
-            AssistantTurn(toolCalls = listOf(ToolCall("1", "spin", "{}")))
+            AssistantTurn(text = partial, toolCalls = listOf(ToolCall("1", "spin", "{}")))
         }
         val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
         val reg = builtinNodeRegistry().also { it.register(spec) }
@@ -972,15 +988,25 @@ class AgentNodeTest {
 
         val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
 
-        assertEquals(RunStatus.SUCCESS, states["a"]?.status)
-        assertEquals("MAX_STEPS", states["a"]?.output?.single()?.json?.get("stopReason")?.jsonPrimitive?.content)
+        val state = states.getValue("a")
+        assertEquals(RunStatus.ERROR, state.status)
+        assertEquals(
+            "Agent stopped: MAX_STEPS after 1 completed step(s), 1 attempted tool call(s); " +
+                "no final response was completed",
+            state.error,
+        )
+        assertTrue(state.output.isEmpty())
+        assertTrue(state.logs.contains("agent partial text withheld (${partial.length} chars)"))
+        assertFalse(state.logs.joinToString("\n").contains(partial))
     }
 
     @Test
-    fun `token budget remains a successful bounded result`() {
+    fun `token budget without final completion fails closed and withholds partial prose`() {
         val source = RecordingSource(listOf("spin"))
+        val partial = "selector search is still running"
         val provider = FakeProvider { _, _, _, _ ->
             AssistantTurn(
+                text = partial,
                 toolCalls = listOf(ToolCall("1", "spin", "{}")),
                 usage = TokenUsage(input = 5, output = 5),
             )
@@ -997,8 +1023,16 @@ class AgentNodeTest {
 
         val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
 
-        assertEquals(RunStatus.SUCCESS, states["a"]?.status)
-        assertEquals("TOKEN_BUDGET", states["a"]?.output?.single()?.json?.get("stopReason")?.jsonPrimitive?.content)
+        val state = states.getValue("a")
+        assertEquals(RunStatus.ERROR, state.status)
+        assertEquals(
+            "Agent stopped: TOKEN_BUDGET after 1 completed step(s), 1 attempted tool call(s); " +
+                "no final response was completed",
+            state.error,
+        )
+        assertTrue(state.output.isEmpty())
+        assertTrue(state.logs.contains("agent partial text withheld (${partial.length} chars)"))
+        assertFalse(state.logs.joinToString("\n").contains(partial))
     }
 
     @Test

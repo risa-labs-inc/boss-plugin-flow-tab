@@ -25,7 +25,11 @@ data class ToolCall(val id: String, val name: String, val argsJson: String)
 /** The outcome of one [ToolCall], fed back to the model as DATA (never as instructions). */
 data class ToolOutcome(val id: String, val name: String, val content: String, val isError: Boolean)
 
-/** Token accounting a provider may report per turn; summed to enforce the budget. */
+/**
+ * Token accounting a provider may report per turn. Both dimensions are summed across
+ * every model turn to enforce the whole-run budget; provider-counted tool-call argument
+ * traffic is part of [output].
+ */
 @Serializable
 data class TokenUsage(val input: Int = 0, val output: Int = 0) {
     val total: Int get() = input + output
@@ -64,7 +68,11 @@ fun interface AgentProvider {
     suspend fun step(system: String, messages: List<AgentMessage>, tools: List<ToolDescriptor>): AssistantTurn
 }
 
-/** Bounds on a single agent run. All three are enforced; whichever trips first wins. */
+/**
+ * Bounds on a single agent run. [maxTokens] is cumulative provider-reported input plus
+ * output usage across all model turns, unlike a provider's per-request output cap.
+ * All three bounds are enforced; whichever trips first wins.
+ */
 data class AgentBudget(
     val maxSteps: Int = 8,
     val timeoutMs: Long = 120_000,
@@ -116,7 +124,8 @@ class AgentConfigurationError(message: String) : ExecError(message)
  *    interprets returned text as new instructions.
  *  - **Bounded:** the loop stops cleanly at [AgentBudget.maxSteps], [AgentBudget.timeoutMs],
  *    or [AgentBudget.maxTokens], reporting the [StopReason] rather than running away.
- *    [AgentNodeExecutor] escalates [StopReason.TIMEOUT] to a node error.
+ *    [AgentNodeExecutor] escalates every non-completed stop reason to a node error so
+ *    partial model prose never becomes successful downstream data.
  */
 class AgentRuntime(
     private val provider: AgentProvider,
