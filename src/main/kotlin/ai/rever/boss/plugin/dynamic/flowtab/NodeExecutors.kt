@@ -28,7 +28,7 @@ import java.net.http.HttpResponse
 import java.time.Duration
 
 /** Thrown by an executor to fail its node with a clear message. */
-class ExecError(message: String) : Exception(message)
+open class ExecError(message: String, cause: Throwable? = null) : Exception(message, cause)
 
 private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 

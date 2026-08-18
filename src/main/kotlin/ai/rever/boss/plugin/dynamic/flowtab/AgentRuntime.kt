@@ -8,6 +8,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
 import java.util.concurrent.atomic.AtomicReference
@@ -81,6 +83,21 @@ data class AgentResult(
 )
 
 /**
+ * A provider/runtime failure with the last safely published progress counters.
+ * The message adds only counters to the existing boundary error; the runtime never
+ * appends prompts, model output, tool arguments, or tool-result content.
+ */
+class AgentRunFailure(
+    val steps: Int,
+    val toolCalls: Int,
+    cause: Throwable,
+) : ExecError(
+    "Agent stopped: FAILED after $steps completed step(s), $toolCalls attempted tool call(s): " +
+        (cause.message?.takeIf { it.isNotBlank() } ?: cause::class.simpleName ?: "unknown error"),
+    cause,
+)
+
+/**
  * A bounded, provider-agnostic tool-loop. Given a [provider] and a [source] of tools,
  * it drives: system prompt + transcript → model → execute the model's tool calls via
  * [source] → feed results back → repeat until the model answers with no tool calls or a
@@ -138,7 +155,9 @@ class AgentRuntime(
     ): AgentResult {
         val timeoutMs = budget.timeoutMs.coerceAtLeast(0)
         if (timeoutMs == 0L) {
-            return done("", StopReason.TIMEOUT, steps = 0, toolCalls = 0, usage = TokenUsage())
+            return done("", StopReason.TIMEOUT, steps = 0, toolCalls = 0, usage = TokenUsage()).also {
+                log(stopLog(it))
+            }
         }
         // Provider and tool integrations are host/plugin boundaries and may block without
         // cooperating with coroutine cancellation. Keep their loop in an independently
@@ -150,6 +169,19 @@ class AgentRuntime(
         val successfulCompletion = AtomicReference<AgentResult?>(null)
         val failure = AtomicReference<Throwable?>(null)
         val logGate = LogGate(log)
+        fun terminalLog(message: String) {
+            // Closing waits for any in-flight worker write. The direct write afterward
+            // is therefore guaranteed to be the final line even when the worker ignores
+            // cancellation and finishes a host call after this run returns.
+            logGate.close()
+            log(message)
+        }
+        fun wrappedFailure(cause: Throwable): AgentRunFailure {
+            val snapshot = progress.get()
+            return if (cause is AgentRunFailure) cause else {
+                AgentRunFailure(snapshot.steps, snapshot.toolCalls, cause)
+            }
+        }
         val loopStarted = CompletableDeferred<Unit>()
         val execution = executionScope.async {
             loopStarted.complete(Unit)
@@ -176,35 +208,56 @@ class AgentRuntime(
             throw cancelled
         }
         if (!admitted) {
-            logGate.close()
+            val cause = ExecError("Agent execution capacity is busy; retry after other Agent runs finish")
+            terminalLog("agent admission failed: ${cause.message}")
             executionScope.cancel(CancellationException("Agent execution lane unavailable"))
-            throw ExecError("Agent execution capacity is busy; retry after other Agent runs finish")
+            throw cause
         }
 
         val graceMs = maxOf(MIN_HARD_TIMEOUT_GRACE_MS, timeoutMs / 20)
         val hardTimeoutMs = timeoutMs.saturatingPlus(graceMs)
-        val result = try {
+        try {
             // Let the loop's cooperative timeout publish its complete result first. The
             // grace is only an escape hatch for a host call that ignores cancellation.
-            withTimeoutOrNull(hardTimeoutMs) { execution.await() }
+            val result = withTimeoutOrNull(hardTimeoutMs) { execution.await() }
+            val completed = result
+                ?: successfulCompletion.get()
+                ?: failure.get()?.let { throw it }
+                ?: progress.get().let { snapshot ->
+                    done(
+                        snapshot.lastText,
+                        StopReason.TIMEOUT,
+                        snapshot.steps,
+                        snapshot.toolCalls,
+                        snapshot.usage,
+                    )
+                }
+            terminalLog(stopLog(completed))
+            return completed
+        } catch (cancelled: CancellationException) {
+            if (!currentCoroutineContext().isActive) throw cancelled
+            // Some host/provider APIs use CancellationException as their own failure
+            // signal while the calling flow is still active. Preserve real caller
+            // cancellation, but diagnose a boundary-local cancellation like any other
+            // provider failure.
+            val wrapped = wrappedFailure(cancelled)
+            terminalLog(failureLog(wrapped))
+            throw wrapped
+        } catch (cause: Exception) {
+            val wrapped = wrappedFailure(cause)
+            terminalLog(failureLog(wrapped))
+            throw wrapped
+        } catch (cause: LinkageError) {
+            // Optional plugin/API skew reaches Kotlin as NoClassDefFoundError,
+            // NoSuchMethodError, or AbstractMethodError rather than Exception. Diagnose
+            // those expected boundary failures without swallowing VM-fatal Errors.
+            val wrapped = wrappedFailure(cause)
+            terminalLog(failureLog(wrapped))
+            throw wrapped
         } finally {
             logGate.close()
             executionScope.cancel(CancellationException("Agent execution ended"))
         }
-        if (result != null) return result
-        successfulCompletion.get()?.let { return it }
-
-        // Preserve a provider failure that completed at the deadline instead of replacing
-        // it with a misleading timeout. A still-running non-cooperative call has no failure.
-        failure.get()?.let { throw it }
-        val snapshot = progress.get()
-        return done(
-            snapshot.lastText,
-            StopReason.TIMEOUT,
-            snapshot.steps,
-            snapshot.toolCalls,
-            snapshot.usage,
-        )
     }
 
     private suspend fun runLoop(
@@ -233,6 +286,7 @@ class AgentRuntime(
             // must be interrupted at the wall-clock budget (red-team S3).
             val stepRemaining = budget.timeoutMs - (System.currentTimeMillis() - started)
             if (stepRemaining <= 0) return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
+            log("agent step ${steps + 1}: requesting model")
             val turn = withTimeoutOrNull(stepRemaining) { provider.step(system, messages.toList(), allowed) }
                 ?: return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
             steps++
@@ -248,11 +302,12 @@ class AgentRuntime(
             val outcomes = turn.toolCalls.map { c ->
                 toolCalls++
                 progress.set(Progress(lastText, steps, toolCalls, usage))
+                val prefix = "agent tool $toolCalls '${safeToolName(c.name)}'"
                 if (c.name !in allowedNames) {
-                    log("blocked tool '${c.name}' (not in allowlist)")
+                    log("$prefix: blocked (not in allowlist)")
                     ToolOutcome(c.id, c.name, "tool '${c.name}' is not in this agent's allowlist", isError = true)
                 } else {
-                    log("→ ${c.name} ${c.argsJson}")
+                    log("$prefix: started")
                     // A hung tool call is bounded by the remaining budget too (S3).
                     val toolRemaining = budget.timeoutMs - (System.currentTimeMillis() - started)
                     val r = if (toolRemaining <= 0) ToolResult("agent wall-clock budget exceeded", isError = true)
@@ -260,6 +315,7 @@ class AgentRuntime(
                         withTimeoutOrNull(toolRemaining) { source.invoke(c.name, c.argsJson) }
                             ?: ToolResult("tool '${c.name}' timed out", isError = true)
                     }.getOrElse { ToolResult(it.message ?: it.toString(), isError = true) }
+                    log("$prefix: ${if (r.isError) "failed" else "succeeded"}")
                     ToolOutcome(c.id, c.name, r.text, r.isError)
                 }
             }
@@ -273,6 +329,23 @@ class AgentRuntime(
     private fun done(text: String, reason: StopReason, steps: Int, toolCalls: Int, usage: TokenUsage) =
         AgentResult(text, reason, steps, toolCalls, usage)
 
+    private fun stopLog(result: AgentResult): String =
+        "agent stopped: ${result.stopReason} " +
+            "(${result.steps} completed step(s), ${result.toolCalls} attempted tool call(s))"
+
+    private fun failureLog(failure: AgentRunFailure): String =
+        "agent stopped: FAILED " +
+            "(${failure.steps} completed step(s), ${failure.toolCalls} attempted tool call(s))"
+
+    /** Model-supplied names must remain one bounded, trustworthy log-line token. */
+    private fun safeToolName(name: String): String =
+        name.take(MAX_LOG_TOOL_NAME_CHARS)
+            .map { char ->
+                if (char.isLetterOrDigit() || char in "._:/-") char else '_'
+            }
+            .joinToString("")
+            .ifBlank { "<unnamed>" }
+
     private fun Long.saturatingPlus(other: Long): Long =
         if (this > Long.MAX_VALUE - other) Long.MAX_VALUE else this + other
 
@@ -280,6 +353,7 @@ class AgentRuntime(
         const val AGENT_EXECUTION_PARALLELISM = 64
         const val ADMISSION_TIMEOUT_MS = 1_000L
         const val MIN_HARD_TIMEOUT_GRACE_MS = 500L
+        const val MAX_LOG_TOOL_NAME_CHARS = 80
 
         // Dispatchers.IO's elastic limited view confines permanently wedged Flow Agent
         // calls without consuming every permit used by unrelated host IO. Once saturated,

@@ -76,6 +76,17 @@ it must be a red node failure rather than a successful output carrying `stopReas
 partial answer. User-configured step, timeout, and token budgets must be positive whole numbers;
 zero does not mean unlimited.
 
+Agent diagnostics are incremental and sanitized. The runtime logs each model step before the
+provider call, each tool's name plus started/succeeded/failed status, and a terminal stop line.
+Provider failures therefore retain the number of completed steps and attempted tool calls even
+when the loop throws. Raw prompts, model text, tool arguments, and tool-result content are never
+written to these progress logs; model-controlled tool names are single-line, length-bounded tokens,
+and a timeout reports only the withheld partial text's character count. The node error keeps the
+provider's existing error message with the same `FAILED` counters, so provider-controlled boundary
+details remain visible there even though they are not copied into progress logs. Admission failure
+remains its own plain capacity error because no Agent run started. Runtime-owned terminal logging is
+intentional—the executor cannot reliably log after a thrown provider boundary.
+
 The agent's browser tool lane is bound to the run's `defaultSessionId`. In that lane,
 `session_id` is optional and omission means the same browser session native Open/Navigate/Click/
 Type/Extract nodes use. An explicit id still wins for multi-session agents. `browser_open` without
@@ -191,7 +202,9 @@ adding another headless run entrypoint; otherwise each invocation leaks a Fluck 
 `flow_result` returns status, errors, and bounded logs by default, with node outputs omitted so
 large HTML/SVG values cannot exhaust the MCP response path. A caller may pass `nodeId` together
 with `includeOutput: true` to fetch that node's recursively bounded output; explicit response flags
-report whether output was omitted or included and whether any content was truncated.
+report whether output was omitted or included and whether any content was truncated. Oversized log
+lists retain both their beginning and tail around an omission marker so a terminal Agent stop or
+failure line is not discarded.
 The launcher/controller and an open tab are independent full-snapshot writers for the same graph
 key. Controller/MCP mutations and open-tab autosave therefore serialize through
 `FlowPersistenceCoordinator`. Controller writes publish revisioned snapshots that an open canvas

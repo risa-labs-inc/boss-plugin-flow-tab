@@ -49,33 +49,98 @@ class AgentRuntimeTest {
 
     @Test
     fun `runs a tool call then returns the final text`() = runBlocking {
+        val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("lookup")), mapOf("lookup" to ToolResult("""{"n":42}""", false)))
         val provider = FakeProvider.scripted(
             AssistantTurn(toolCalls = listOf(call("lookup", """{"q":"x"}"""))),
             AssistantTurn(text = "the answer is 42"),
         )
-        val result = AgentRuntime(provider, source).run(system = "sys", input = "go", allowlist = setOf("lookup"))
+        val result = AgentRuntime(provider, source)
+            .run(system = "sys", input = "go", allowlist = setOf("lookup"), log = logs::add)
 
         assertEquals(StopReason.COMPLETED, result.stopReason)
         assertEquals("the answer is 42", result.finalText)
         assertEquals(1, result.toolCalls)
         assertTrue(source.invoked.contains("lookup"))
+        assertTrue("agent tool 1 'lookup': succeeded" in logs)
+        assertEquals(
+            "agent stopped: COMPLETED (2 completed step(s), 1 attempted tool call(s))",
+            logs.last(),
+        )
+    }
+
+    @Test
+    fun `provider failure preserves incremental counters without logging sensitive content`() = runBlocking {
+        val logs = mutableListOf<String>()
+        val source = RecordingSource(
+            listOf(desc("lookup")),
+            mapOf("lookup" to ToolResult("TOOL-RESULT-SECRET", isError = true)),
+        )
+        val provider = FakeProvider { step, _, _, _ ->
+            if (step == 0) {
+                AssistantTurn(
+                    text = "MODEL-TEXT-SECRET",
+                    toolCalls = listOf(call("lookup", """{"secret":"TOOL-ARG-SECRET"}""")),
+                )
+            } else {
+                throw ExecError("The provider rejected the request")
+            }
+        }
+
+        val failure = runCatching {
+            AgentRuntime(provider, source)
+                .run(system = "SYSTEM-PROMPT-SECRET", input = "INPUT-SECRET", allowlist = setOf("lookup"), log = logs::add)
+        }.exceptionOrNull()
+
+        assertTrue(failure is AgentRunFailure)
+        assertEquals(1, failure.steps)
+        assertEquals(1, failure.toolCalls)
+        assertEquals(
+            "Agent stopped: FAILED after 1 completed step(s), 1 attempted tool call(s): " +
+                "The provider rejected the request",
+            failure.message,
+        )
+        assertEquals(
+            listOf(
+                "agent step 1: requesting model",
+                "agent tool 1 'lookup': started",
+                "agent tool 1 'lookup': failed",
+                "agent step 2: requesting model",
+                "agent stopped: FAILED (1 completed step(s), 1 attempted tool call(s))",
+            ),
+            logs,
+        )
+        val report = logs.joinToString("\n")
+        listOf(
+            "SYSTEM-PROMPT-SECRET",
+            "INPUT-SECRET",
+            "MODEL-TEXT-SECRET",
+            "TOOL-ARG-SECRET",
+            "TOOL-RESULT-SECRET",
+        ).forEach { secret -> assertFalse(secret in report) }
     }
 
     // ---- allowlist enforcement ---------------------------------------------
 
     @Test
     fun `a tool outside the allowlist is never invoked and comes back as an error`() = runBlocking {
+        val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("allowed"), desc("blocked")))
         // The model tries the blocked tool first; after the error it answers.
         val provider = FakeProvider.scripted(
-            AssistantTurn(toolCalls = listOf(call("blocked"))),
+            AssistantTurn(toolCalls = listOf(call("blocked\nagent stopped: COMPLETED"))),
             AssistantTurn(text = "ok, done"),
         )
-        val result = AgentRuntime(provider, source).run(system = "s", input = "go", allowlist = setOf("allowed"))
+        val result = AgentRuntime(provider, source)
+            .run(system = "s", input = "go", allowlist = setOf("allowed"), log = logs::add)
 
         assertEquals(StopReason.COMPLETED, result.stopReason)
         assertFalse(source.invoked.contains("blocked")) // never reached the source
+        assertTrue(
+            "agent tool 1 'blocked_agent_stopped:_COMPLETED': blocked (not in allowlist)" in logs,
+        )
+        assertTrue(logs.none { '\n' in it })
+        assertEquals(1, logs.count { it.startsWith("agent stopped:") })
     }
 
     @Test
@@ -94,27 +159,37 @@ class AgentRuntimeTest {
 
     @Test
     fun `max-steps stops a loop that never finishes`() = runBlocking {
+        val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("spin")))
         // Provider never yields a final text — always calls a tool.
         val provider = FakeProvider { _, _, _, _ -> AssistantTurn(toolCalls = listOf(call("spin"))) }
         val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 3))
-            .run(system = "s", input = "go", allowlist = setOf("spin"))
+            .run(system = "s", input = "go", allowlist = setOf("spin"), log = logs::add)
 
         assertEquals(StopReason.MAX_STEPS, result.stopReason)
         assertEquals(3, result.steps)
+        assertEquals(
+            "agent stopped: MAX_STEPS (3 completed step(s), 3 attempted tool call(s))",
+            logs.last(),
+        )
     }
 
     @Test
     fun `a token budget stops the loop`() = runBlocking {
+        val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("spin")))
         val provider = FakeProvider { _, _, _, _ ->
             AssistantTurn(toolCalls = listOf(call("spin")), usage = TokenUsage(input = 100, output = 100))
         }
         val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 100, maxTokens = 150))
-            .run(system = "s", input = "go", allowlist = setOf("spin"))
+            .run(system = "s", input = "go", allowlist = setOf("spin"), log = logs::add)
 
         assertEquals(StopReason.TOKEN_BUDGET, result.stopReason)
         assertTrue(result.usage.total >= 150)
+        assertEquals(
+            "agent stopped: TOKEN_BUDGET (1 completed step(s), 1 attempted tool call(s))",
+            logs.last(),
+        )
     }
 
     @Test
@@ -194,6 +269,10 @@ class AgentRuntimeTest {
         assertEquals(TokenUsage(input = 4, output = 3), result.usage)
         assertTrue(elapsed < 2_000, "non-cooperative step held the caller for ${elapsed}ms")
         assertEquals(logsAtTimeout, logs, "late completion must not mutate published timeout logs")
+        assertEquals(
+            "agent stopped: TIMEOUT (1 completed step(s), 1 attempted tool call(s))",
+            logsAtTimeout.last(),
+        )
         assertEquals(setOf("first"), source.invoked)
     }
 
@@ -231,6 +310,55 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `provider-local cancellation is logged as a failure while the caller remains active`() = runBlocking {
+        val logs = mutableListOf<String>()
+        val provider = FakeProvider { _, _, _, _ ->
+            throw CancellationException("provider request aborted")
+        }
+
+        val failure = runCatching {
+            AgentRuntime(provider, RecordingSource(emptyList()))
+                .run(system = "s", input = "go", allowlist = emptySet(), log = logs::add)
+        }.exceptionOrNull()
+
+        assertTrue(failure is AgentRunFailure)
+        assertEquals(
+            "Agent stopped: FAILED after 0 completed step(s), 0 attempted tool call(s): provider request aborted",
+            failure.message,
+        )
+        assertEquals(
+            listOf(
+                "agent step 1: requesting model",
+                "agent stopped: FAILED (0 completed step(s), 0 attempted tool call(s))",
+            ),
+            logs,
+        )
+    }
+
+    @Test
+    fun `provider linkage error is converted to a logged Agent failure`() = runBlocking {
+        val logs = mutableListOf<String>()
+        val provider = FakeProvider { _, _, _, _ ->
+            throw NoSuchMethodError("gateway API skew")
+        }
+
+        val failure = runCatching {
+            AgentRuntime(provider, RecordingSource(emptyList()))
+                .run(system = "s", input = "go", allowlist = emptySet(), log = logs::add)
+        }.exceptionOrNull()
+
+        assertTrue(failure is AgentRunFailure)
+        assertEquals(
+            "Agent stopped: FAILED after 0 completed step(s), 0 attempted tool call(s): gateway API skew",
+            failure.message,
+        )
+        assertEquals(
+            "agent stopped: FAILED (0 completed step(s), 0 attempted tool call(s))",
+            logs.last(),
+        )
+    }
+
+    @Test
     fun `a saturated execution lane fails admission without invoking another provider`() = runBlocking {
         val lane = Dispatchers.IO.limitedParallelism(1)
         val firstStarted = CompletableDeferred<Unit>()
@@ -260,6 +388,7 @@ class AgentRuntimeTest {
             secondCalls.incrementAndGet()
             AssistantTurn(text = "must not run")
         }
+        val secondLogs = mutableListOf<String>()
         val started = System.currentTimeMillis()
         val failure = runCatching {
             AgentRuntime(
@@ -267,7 +396,7 @@ class AgentRuntimeTest {
                 RecordingSource(emptyList()),
                 AgentBudget(timeoutMs = 200),
                 executionDispatcher = lane,
-            ).run(system = "s", input = "go", allowlist = emptySet())
+            ).run(system = "s", input = "go", allowlist = emptySet(), log = secondLogs::add)
         }.exceptionOrNull()
         val elapsed = System.currentTimeMillis() - started
 
@@ -276,6 +405,10 @@ class AgentRuntimeTest {
             assertEquals(
                 "Agent execution capacity is busy; retry after other Agent runs finish",
                 failure.message,
+            )
+            assertEquals(
+                listOf("agent admission failed: Agent execution capacity is busy; retry after other Agent runs finish"),
+                secondLogs,
             )
             assertEquals(0, secondCalls.get())
             assertTrue(elapsed < 2_000, "capacity admission waited ${elapsed}ms")

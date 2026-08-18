@@ -107,12 +107,14 @@ class AgentNodeExecutor(
         val source = toolSourceFor(ctx)
         val result = AgentRuntime(provider, source, settings.budget)
             .run(system = system, input = settings.input, allowlist = settings.allowlist, log = log)
-        log("agent stopped: ${result.stopReason} (${result.steps} step(s), ${result.toolCalls} tool call(s))")
         if (result.stopReason == StopReason.TIMEOUT) {
-            result.finalText.takeIf { it.isNotBlank() }?.let { partial ->
-                log("agent partial text: ${partial.replace('\n', ' ').take(500)}")
+            if (result.finalText.isNotBlank()) {
+                log("agent partial text withheld (${result.finalText.length} chars)")
             }
-            throw ExecError("Agent timed out after ${settings.budget.timeoutMs}ms")
+            throw ExecError(
+                "Agent stopped: TIMEOUT after ${result.steps} completed step(s), " +
+                    "${result.toolCalls} attempted tool call(s); timeout was ${settings.budget.timeoutMs}ms",
+            )
         }
         return NodeOutput.single(listOf(
             Item(buildJsonObject {
