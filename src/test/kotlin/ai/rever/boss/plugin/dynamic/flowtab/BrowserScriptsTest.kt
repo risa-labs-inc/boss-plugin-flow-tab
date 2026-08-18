@@ -43,4 +43,17 @@ class BrowserScriptsTest {
         assertContains(script, "getAttribute('data\\nvalue\\u2028suffix')")
         assertFalse(script.any { it == '\n' || it == '\u2028' })
     }
+
+    @Test
+    fun `single extract reports the shared no-match sentinel`() {
+        val script = BrowserScripts.extractScript(
+            selectorType = "css",
+            selector = ".missing",
+            mode = "text",
+            attr = "",
+            multiple = false,
+        )
+
+        assertContains(script, EXTRACT_NO_MATCH_ERROR)
+    }
 }

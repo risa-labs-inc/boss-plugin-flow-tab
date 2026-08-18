@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -636,6 +637,106 @@ class FlowExecutorTest {
         assertEquals(RunStatus.SKIPPED, states["set"]?.status)
         assertTrue(states["set"]!!.output.isEmpty())
         assertTrue(states["set"]!!.logs.any { it.contains("skipped", ignoreCase = true) })
+    }
+
+    @Test
+    fun `optional extract emits null so If can route a missing element to fallback`() {
+        val handle = FakeHandle(responder = { script ->
+            if (script.contains("JSON.stringify")) {
+                """{"ok":false,"error":"$EXTRACT_NO_MATCH_ERROR"}"""
+            } else {
+                true
+            }
+        })
+        val nodes = listOf(
+            n("open", NodeType.OPEN_BROWSER),
+            n("ex", NodeType.EXTRACT, "selector" to ".primary", "field" to "section", "optional" to "true"),
+            n("if", NodeType.IF, "condition" to "{{ \$json.section }}"),
+            n("primary", NodeType.SET, "assignments" to """{"branch":"primary"}"""),
+            n("fallback", NodeType.SET, "assignments" to """{"branch":"fallback"}"""),
+        )
+        val edges = listOf(
+            e("open", "ex"),
+            e("ex", "if"),
+            e("if", "primary", fp = 0),
+            e("if", "fallback", fp = 1),
+        )
+
+        val states = runGraph(nodes, edges, FakeService(handle))
+
+        assertEquals(RunStatus.SUCCESS, states["ex"]?.status)
+        assertEquals(JsonNull, states["ex"]!!.output.single().json["section"])
+        assertEquals(RunStatus.SKIPPED, states["primary"]?.status)
+        assertEquals(RunStatus.SUCCESS, states["fallback"]?.status)
+        assertEquals("fallback", states["fallback"]!!.output.single().json.str("branch"))
+    }
+
+    @Test
+    fun `non-optional extract preserves a missing-element failure`() {
+        val handle = FakeHandle(responder = { script ->
+            if (script.contains("JSON.stringify")) {
+                """{"ok":false,"error":"$EXTRACT_NO_MATCH_ERROR"}"""
+            } else {
+                true
+            }
+        })
+        val states = runGraph(
+            listOf(
+                n("open", NodeType.OPEN_BROWSER),
+                n("ex", NodeType.EXTRACT, "selector" to ".required"),
+            ),
+            listOf(e("open", "ex")),
+            FakeService(handle),
+        )
+
+        assertEquals(RunStatus.ERROR, states["ex"]?.status)
+        assertEquals("Extract failed: $EXTRACT_NO_MATCH_ERROR", states["ex"]?.error)
+    }
+
+    @Test
+    fun `optional multiple extract converts an empty match list into one null item`() {
+        val handle = FakeHandle(responder = { script ->
+            if (script.contains("JSON.stringify")) """{"ok":true,"value":[]}""" else true
+        })
+        val nodes = listOf(
+            n("open", NodeType.OPEN_BROWSER),
+            n(
+                "ex",
+                NodeType.EXTRACT,
+                "selector" to ".result",
+                "field" to "value",
+                "multiple" to "true",
+                "optional" to "true",
+            ),
+            n("set", NodeType.SET, "assignments" to """{"continued":true}"""),
+        )
+
+        val states = runGraph(nodes, listOf(e("open", "ex"), e("ex", "set")), FakeService(handle))
+
+        assertEquals(JsonNull, states["ex"]!!.output.single().json["value"])
+        assertEquals(RunStatus.SUCCESS, states["set"]?.status)
+    }
+
+    @Test
+    fun `optional extract does not hide selector script errors`() {
+        val handle = FakeHandle(responder = { script ->
+            if (script.contains("JSON.stringify")) {
+                """{"ok":false,"error":"SyntaxError: invalid selector"}"""
+            } else {
+                true
+            }
+        })
+        val states = runGraph(
+            listOf(
+                n("open", NodeType.OPEN_BROWSER),
+                n("ex", NodeType.EXTRACT, "selector" to "[", "optional" to "true"),
+            ),
+            listOf(e("open", "ex")),
+            FakeService(handle),
+        )
+
+        assertEquals(RunStatus.ERROR, states["ex"]?.status)
+        assertTrue(states["ex"]?.error.orEmpty().contains("SyntaxError"))
     }
 
     @Test

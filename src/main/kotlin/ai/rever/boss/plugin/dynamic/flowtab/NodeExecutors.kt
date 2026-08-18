@@ -296,6 +296,8 @@ object NodeCatalog {
             val sel = cfg.str("selector")
             val type = cfg.str("selectorType", "css")
             val multiple = cfg.bool("multiple")
+            val optional = cfg.bool("optional")
+            val field = cfg.str("field", "value").ifEmpty { "value" }
             val session = ctx.requireSession()
             // Best-effort wait so extraction doesn't race a still-loading page;
             // for `multiple` an empty result is still valid, so we proceed regardless.
@@ -311,12 +313,23 @@ object NodeCatalog {
             val str = raw as? String ?: throw ExecError("Extract returned non-string: $raw")
             val obj = EXEC_JSON.parseToJsonElement(str).jsonObject
             if (obj["ok"]?.jsonPrimitive?.booleanOrNull != true) {
-                throw ExecError("Extract failed: ${obj["error"]?.jsonPrimitive?.content ?: "unknown"}")
+                val error = obj["error"]?.jsonPrimitive?.content ?: "unknown"
+                if (optional && error == EXTRACT_NO_MATCH_ERROR) {
+                    log("Extract: no match for '$sel' (optional)")
+                    return@NodeExecutor NodeOutput.single(
+                        listOf(Item(buildJsonObject { put(field, JsonNull) })),
+                    )
+                }
+                throw ExecError("Extract failed: $error")
             }
-            val field = cfg.str("field", "value").ifEmpty { "value" }
             val value = obj["value"] ?: JsonNull
             val items = if (multiple && value is JsonArray) {
-                value.map { Item(buildJsonObject { put(field, it) }) }
+                if (optional && value.isEmpty()) {
+                    log("Extract: no match for '$sel' (optional)")
+                    listOf(Item(buildJsonObject { put(field, JsonNull) }))
+                } else {
+                    value.map { Item(buildJsonObject { put(field, it) }) }
+                }
             } else {
                 listOf(Item(buildJsonObject { put(field, value) }))
             }

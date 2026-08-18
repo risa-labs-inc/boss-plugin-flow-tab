@@ -185,6 +185,7 @@ fun nodeMetaChips(node: FlowNode): List<String> {
             add(c("selectorType").ifBlank { "css" })
             add(c("mode").ifBlank { "text" })
             if (c("multiple").equals("true", true)) add("all matches")
+            if (c("optional").equals("true", true)) add("optional")
         }
         else -> emptyList()
     }

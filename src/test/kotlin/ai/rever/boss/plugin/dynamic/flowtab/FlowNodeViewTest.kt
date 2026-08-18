@@ -68,6 +68,19 @@ class FlowNodeViewTest {
     }
 
     @Test
+    fun `extract metadata makes optional fallback behavior visible`() {
+        val optional = node(
+            NodeType.EXTRACT,
+            "selectorType" to "xpath",
+            "mode" to "attr",
+            "multiple" to "true",
+            "optional" to "true",
+        )
+
+        assertEquals(listOf("xpath", "attr", "all matches", "optional"), nodeMetaChips(optional))
+    }
+
+    @Test
     fun `inject summary and metadata make wait behavior visible`() {
         val immediate = node(NodeType.INJECT, "script" to "window.scrollTo(0, 0)")
         val waiting = node(
