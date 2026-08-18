@@ -53,6 +53,15 @@ class FlowNodeViewTest {
     }
 
     @Test
+    fun `action metadata surfaces only a customized element wait`() {
+        val normal = node(NodeType.CLICK, "selector" to "button")
+        val slow = node(NodeType.CLICK, "selector" to "button", "waitMs" to "60000")
+
+        assertEquals(listOf("css"), nodeMetaChips(normal))
+        assertEquals(listOf("css", "60000ms wait"), nodeMetaChips(slow))
+    }
+
+    @Test
     fun `metadata identifies dynamic and secret value sources without rendering values`() {
         val dynamic = node(NodeType.TYPE, "selectorType" to "xpath", "text" to "{{ \$json.name }}")
         val secret = node(NodeType.TYPE, "text" to "{{ \$secret.account_password }}")

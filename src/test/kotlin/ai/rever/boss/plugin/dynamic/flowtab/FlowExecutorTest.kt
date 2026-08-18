@@ -13,8 +13,11 @@ import ai.rever.boss.plugin.browser.ContextMenuCallback
 import androidx.compose.runtime.Composable
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -341,11 +344,16 @@ class FlowExecutorTest {
 
     @Test
     fun `await login prompts once and resumes when the signed-in marker appears`() {
+        val notifications = FakeNotifications()
         var markerPolls = 0
         val handle = FakeHandle(responder = { script ->
-            if (script.contains("return !!")) ++markerPolls >= 3 else true
+            if (script.contains("return !!")) {
+                markerPolls++
+                notifications.shown.isNotEmpty()
+            } else {
+                true
+            }
         })
-        val notifications = FakeNotifications()
         val states = runGraph(
             listOf(
                 n("open", NodeType.OPEN_BROWSER),
@@ -353,7 +361,7 @@ class FlowExecutorTest {
                     "login",
                     NodeType.AWAIT_LOGIN,
                     "selector" to ".account-menu",
-                    "waitMs" to "1000",
+                    "waitMs" to "3000",
                     "message" to "Please finish SSO",
                 ),
             ),
@@ -363,7 +371,7 @@ class FlowExecutorTest {
         )
 
         assertEquals(RunStatus.SUCCESS, states["login"]?.status)
-        assertEquals(3, markerPolls)
+        assertTrue(markerPolls > 1)
         assertEquals(
             listOf(
                 FakeNotifications.Shown(
@@ -383,19 +391,23 @@ class FlowExecutorTest {
     }
 
     @Test
-    fun `await login skips the prompt when the session is already signed in`() {
+    fun `await login grace period avoids prompting while an authenticated page renders`() {
         val notifications = FakeNotifications()
+        var markerPolls = 0
         val states = runGraph(
             listOf(
                 n("open", NodeType.OPEN_BROWSER),
                 n("login", NodeType.AWAIT_LOGIN, "selector" to ".account-menu"),
             ),
             listOf(e("open", "login")),
-            service = FakeService(FakeHandle(responder = { true })),
+            service = FakeService(FakeHandle(responder = { script ->
+                if (script.contains("return !!")) ++markerPolls >= 3 else true
+            })),
             notifications = notifications,
         )
 
         assertEquals(RunStatus.SUCCESS, states["login"]?.status)
+        assertEquals(3, markerPolls)
         assertTrue(notifications.shown.isEmpty())
         assertEquals(listOf("Sign-in already detected"), states["login"]?.logs)
     }
@@ -410,7 +422,7 @@ class FlowExecutorTest {
                     "login",
                     NodeType.AWAIT_LOGIN,
                     "selector" to ".account-menu",
-                    "waitMs" to "0",
+                    "waitMs" to "1001",
                 ),
             ),
             listOf(e("open", "login")),
@@ -420,10 +432,43 @@ class FlowExecutorTest {
 
         assertEquals(RunStatus.ERROR, states["login"]?.status)
         assertEquals(
-            "Await Login: sign-in marker '.account-menu' not found within 0ms",
+            "Await Login: sign-in marker '.account-menu' not found within 1001ms",
             states["login"]?.error,
         )
         assertEquals(listOf("notification-1"), notifications.dismissed)
+    }
+
+    @Test
+    fun `await login dismisses its prompt when the run is cancelled`() = runBlocking {
+        val notifications = FakeNotifications()
+        val states = ConcurrentHashMap<String, NodeRun>()
+        val executor = FlowExecutor(
+            FakeContext(FakeService(FakeHandle(responder = { false })), notifications),
+        )
+        val job = launch(Dispatchers.Default) {
+            executor.run(
+                nodes = listOf(
+                    n("open", NodeType.OPEN_BROWSER),
+                    n("login", NodeType.AWAIT_LOGIN, "selector" to ".account-menu"),
+                ),
+                edges = listOf(e("open", "login")),
+            ) { id, run -> states[id] = run }
+        }
+
+        withTimeout(3_000) {
+            while (notifications.shown.isEmpty()) delay(10)
+        }
+        job.cancelAndJoin()
+
+        assertEquals(listOf("notification-1"), notifications.dismissed)
+    }
+
+    @Test
+    fun `await login requires a signed-in marker`() {
+        val states = runGraph(listOf(n("login", NodeType.AWAIT_LOGIN)), emptyList())
+
+        assertEquals(RunStatus.ERROR, states["login"]?.status)
+        assertEquals("Await Login needs a signed-in marker", states["login"]?.error)
     }
 
     @Test

@@ -105,7 +105,7 @@ enum class NodeType(
         AWAIT_LOGIN -> listOf(
             ConfigField("selectorType", "Signed-in marker type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
             ConfigField("selector", "Signed-in marker", FieldType.TEXT, placeholder = "[data-user-id], .account-menu"),
-            ConfigField("waitMs", "Wait timeout (ms)", FieldType.NUMBER, default = "300000"),
+            ConfigField("waitMs", "Wait timeout (ms)", FieldType.NUMBER, default = LOGIN_WAIT_MS.toString()),
             ConfigField(
                 "message",
                 "Prompt",
@@ -116,13 +116,13 @@ enum class NodeType(
         CLICK -> listOf(
             ConfigField("selectorType", "Selector type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
             ConfigField("selector", "Selector", FieldType.TEXT, placeholder = "button.submit"),
-            ConfigField("waitMs", "Wait for element (ms)", FieldType.NUMBER, default = "20000"),
+            ConfigField("waitMs", "Wait for element (ms)", FieldType.NUMBER, default = ELEMENT_WAIT_MS.toString()),
         )
         TYPE -> listOf(
             ConfigField("selectorType", "Selector type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
             ConfigField("selector", "Selector", FieldType.TEXT, placeholder = "input[name=q]"),
             ConfigField("text", "Text", FieldType.TEXT, placeholder = "{{ \$json.q }} or {{ \$secret.account_password }}"),
-            ConfigField("waitMs", "Wait for element (ms)", FieldType.NUMBER, default = "20000"),
+            ConfigField("waitMs", "Wait for element (ms)", FieldType.NUMBER, default = ELEMENT_WAIT_MS.toString()),
         )
         EXTRACT -> listOf(
             ConfigField("selectorType", "Selector type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
@@ -132,7 +132,7 @@ enum class NodeType(
             ConfigField("field", "Output field", FieldType.TEXT, default = "value"),
             ConfigField("multiple", "All matches", FieldType.BOOL, default = "false"),
             ConfigField("optional", "Optional (emit null when no element matches)", FieldType.BOOL, default = "false"),
-            ConfigField("waitMs", "Wait for element (ms)", FieldType.NUMBER, default = "20000"),
+            ConfigField("waitMs", "Wait for element (ms)", FieldType.NUMBER, default = ELEMENT_WAIT_MS.toString()),
         )
         INJECT -> listOf(
             ConfigField(
@@ -148,7 +148,7 @@ enum class NodeType(
                 FieldType.TEXT,
                 placeholder = "#content-ready",
             ),
-            ConfigField("waitMs", "Wait timeout (ms)", FieldType.NUMBER, default = "20000"),
+            ConfigField("waitMs", "Wait timeout (ms)", FieldType.NUMBER, default = ELEMENT_WAIT_MS.toString()),
             ConfigField(
                 "script",
                 "JavaScript",

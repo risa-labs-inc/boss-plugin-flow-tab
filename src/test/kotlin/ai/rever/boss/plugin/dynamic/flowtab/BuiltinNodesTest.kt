@@ -56,11 +56,11 @@ class BuiltinNodesTest {
         listOf(NodeType.CLICK, NodeType.TYPE, NodeType.EXTRACT).forEach { type ->
             val wait = reg[type.name]!!.configFields.single { it.key == "waitMs" }
             assertEquals(FieldType.NUMBER, wait.type, type.name)
-            assertEquals("20000", wait.default, type.name)
+            assertEquals(ELEMENT_WAIT_MS.toString(), wait.default, type.name)
         }
 
         val login = reg[NodeType.AWAIT_LOGIN.name]!!
-        assertEquals("300000", login.configFields.single { it.key == "waitMs" }.default)
+        assertEquals(LOGIN_WAIT_MS.toString(), login.configFields.single { it.key == "waitMs" }.default)
         assertEquals(
             "Sign in in the browser to continue this flow.",
             login.configFields.single { it.key == "message" }.default,

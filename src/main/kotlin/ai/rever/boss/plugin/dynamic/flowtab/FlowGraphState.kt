@@ -261,15 +261,18 @@ class FlowGraphState(
         preTidyPositions = null
     }
 
-    /** Move a node from direct manipulation and retire any pending tidy undo. */
-    fun moveNodeBy(id: String, delta: Offset): Boolean {
+    /** Move an already-resolved node from direct manipulation in O(1). */
+    fun moveNodeBy(node: FlowNode, delta: Offset): Boolean {
         if (delta == Offset.Zero) return false
-        val node = nodeById(id) ?: return false
         invalidateTidyUndo()
         node.x += delta.x
         node.y += delta.y
         return true
     }
+
+    /** Id-based convenience for non-pointer callers and tests. */
+    fun moveNodeBy(id: String, delta: Offset): Boolean =
+        nodeById(id)?.let { moveNodeBy(it, delta) } ?: false
 
     /** Clear graph authoring state, including any pending tidy undo. */
     fun clearGraph() {
@@ -441,8 +444,7 @@ class FlowGraphState(
             )
             return false
         }
-        nodes.clear()
-        edges.clear()
+        clearGraph()
         metadata = snapshot.metadata
         snapshot.nodes.forEach { nodes.add(FlowNode(it.id, registry.resolve(it.type), it.title, it.x, it.y, it.config)) }
         edges.addAll(snapshot.edges)
@@ -451,9 +453,6 @@ class FlowGraphState(
             .mapNotNull { it.drop(1).toLongOrNull() }
             .maxOrNull() ?: 0L
         idCounter = max(snapshot.nextId, maxExisting + 1)
-        selection = null
-        pendingConnection = null
-        preTidyPositions = null
         return true
     }
 

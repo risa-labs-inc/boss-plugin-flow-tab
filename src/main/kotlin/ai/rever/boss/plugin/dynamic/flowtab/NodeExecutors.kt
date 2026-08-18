@@ -4,6 +4,7 @@ import ai.rever.boss.plugin.api.BrowserIntegration
 import ai.rever.boss.plugin.api.NotificationDuration
 import ai.rever.boss.plugin.api.NotificationType
 import ai.rever.boss.plugin.api.PluginContext
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
@@ -34,7 +35,11 @@ private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 // Element-wait tuning: a browser action polls for its target to appear before
 // acting, so a node firing right after a click/navigation doesn't race the page
 // still loading its content. Generic across every browser node.
-private const val ELEMENT_WAIT_MS = 20_000
+internal const val ELEMENT_WAIT_MS = 20_000
+internal const val LOGIN_WAIT_MS = 300_000
+internal const val MAX_ELEMENT_WAIT_MS = 14 * 60 * 1_000
+internal const val LOGIN_PROMPT_GRACE_MS = 1_000
+internal const val LOGIN_POLL_MS = 1_000
 private const val ELEMENT_POLL_MS = 200
 // Order matters: longest operators must be checked before their one-character prefixes.
 private val CONDITION_OPERATORS = listOf("==", "!=", ">=", "<=", ">", "<")
@@ -202,6 +207,10 @@ class ConfigReader(
     /** [key] parsed as an integer, or [default] if absent/blank/non-numeric (a NUMBER field). */
     fun int(key: String, default: Int = 0): Int = str(key).trim().toIntOrNull() ?: default
 
+    /** Element wait bounded below the controller's 15-minute run watchdog. */
+    fun elementWaitMs(default: Int = ELEMENT_WAIT_MS): Int =
+        int("waitMs", default).coerceIn(0, MAX_ELEMENT_WAIT_MS)
+
     /** [key] parsed as a double, or [default] if absent/blank/non-numeric (a NUMBER field). */
     fun double(key: String, default: Double = 0.0): Double = str(key).trim().toDoubleOrNull() ?: default
 
@@ -278,22 +287,32 @@ object NodeCatalog {
             val selector = cfg.str("selector").trim()
             if (selector.isEmpty()) throw ExecError("Await Login needs a signed-in marker")
             val selectorType = cfg.str("selectorType", "css")
-            val waitMs = cfg.int("waitMs", 300_000).coerceAtLeast(0)
+            val waitMs = cfg.elementWaitMs(LOGIN_WAIT_MS)
             val message = cfg.str(
                 "message",
                 "Sign in in the browser to continue this flow.",
             ).ifBlank { "Sign in in the browser to continue this flow." }
             val session = ctx.requireSession()
 
-            if (session.awaitElement(selectorType, selector, timeoutMs = 0)) {
+            val promptGraceMs = minOf(waitMs, LOGIN_PROMPT_GRACE_MS)
+            if (session.awaitElement(selectorType, selector, timeoutMs = promptGraceMs)) {
                 log("Sign-in already detected")
                 return@NodeExecutor NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
+            }
+            if (waitMs <= promptGraceMs) {
+                throw ExecError("Await Login: sign-in marker '$selector' not found within ${waitMs}ms")
             }
 
             // Focusing is helpful but not required for correctness: host tab state can
             // change between opening and this gate, so a focus failure must not abort
             // an otherwise recoverable sign-in wait.
-            runCatching { ctx.focusSession() }
+            try {
+                ctx.focusSession()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // Best effort: the marker wait remains useful if the host tab moved.
+            }
             log(message)
             val notificationId = ctx.context.notificationProvider?.let { notifications ->
                 runCatching {
@@ -306,7 +325,14 @@ object NodeCatalog {
                 }.getOrNull()
             }
             try {
-                if (!session.awaitElement(selectorType, selector, timeoutMs = waitMs)) {
+                val promptedWaitMs = waitMs - promptGraceMs
+                if (!session.awaitElement(
+                        selectorType,
+                        selector,
+                        timeoutMs = promptedWaitMs,
+                        pollMs = LOGIN_POLL_MS,
+                    )
+                ) {
                     throw ExecError("Await Login: sign-in marker '$selector' not found within ${waitMs}ms")
                 }
                 log("Sign-in detected; continuing flow")
@@ -321,7 +347,7 @@ object NodeCatalog {
         NodeType.CLICK -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
             val type = cfg.str("selectorType", "css")
-            val waitMs = cfg.int("waitMs", ELEMENT_WAIT_MS).coerceAtLeast(0)
+            val waitMs = cfg.elementWaitMs()
             val session = ctx.requireSession()
             if (!session.awaitElement(type, sel, timeoutMs = waitMs)) {
                 throw ExecError("Click: no element matched '$sel' within ${waitMs}ms")
@@ -335,7 +361,7 @@ object NodeCatalog {
         NodeType.TYPE -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
             val type = cfg.str("selectorType", "css")
-            val waitMs = cfg.int("waitMs", ELEMENT_WAIT_MS).coerceAtLeast(0)
+            val waitMs = cfg.elementWaitMs()
             val text = SecretTemplateResolver(ctx.secrets).resolve(cfg.raw("text"), cfg::interpolate)
             val session = ctx.requireSession()
             if (!session.awaitElement(type, sel, timeoutMs = waitMs)) {
@@ -352,7 +378,7 @@ object NodeCatalog {
             val type = cfg.str("selectorType", "css")
             val multiple = cfg.bool("multiple")
             val optional = cfg.bool("optional")
-            val waitMs = cfg.int("waitMs", ELEMENT_WAIT_MS).coerceAtLeast(0)
+            val waitMs = cfg.elementWaitMs()
             val field = cfg.str("field", "value").ifEmpty { "value" }
             val session = ctx.requireSession()
             // Best-effort wait so extraction doesn't race a still-loading page;
@@ -404,7 +430,7 @@ object NodeCatalog {
             val waitFor = cfg.str("waitFor").trim()
             if (waitFor.isNotEmpty()) {
                 val waitType = cfg.str("waitForType", "css")
-                val waitMs = cfg.int("waitMs", ELEMENT_WAIT_MS).coerceAtLeast(0)
+                val waitMs = cfg.elementWaitMs()
                 if (!session.awaitElement(waitType, waitFor, timeoutMs = waitMs)) {
                     throw ExecError("Inject: no element matched '$waitFor' within ${waitMs}ms")
                 }

@@ -9,7 +9,7 @@ self-contained Compose UI with a pan/zoom canvas, draggable nodes, and bezier ed
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.flowtab`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.flowtab.FlowTabDynamicPlugin`
-- **API Version**: 1.0.56 · **minApiVersion**: 1.0.74 · **minBossVersion**: 9.2.63
+- **API Version**: 1.0.75 · **minApiVersion**: 1.0.75 · **minBossVersion**: 9.2.63
   (the MCP tool framework needs 9.2.20; `PluginContext.llmProvider` needs 9.2.63; `AiGatewayAPI`
   is a new type and needs `minApiVersion` only)
 
@@ -204,7 +204,7 @@ only that absence case: the node succeeds with one item whose configured output 
 `null`, including an empty `multiple` result. This preserves a data item so a following If node can
 route to a fallback branch. Selector syntax errors, browser failures, and other script errors still
 fail the node; optional extraction must not hide operational errors. Optional Extract still uses
-the standard element wait before declaring a single match absent, so it does not turn slow-page
+its configured element wait before declaring a single match absent, so it does not turn slow-page
 loading into a false fallback. In attribute mode, a present element without the requested attribute
 also yields `null`; consumers that need a fallback for either case should guard the value with If.
 
@@ -241,11 +241,13 @@ replacement stack on a survivor or jump prematurely to the far-right fallback.
 ### Browser waits and human sign-in
 
 Click, Type, and Extract expose `waitMs` while preserving the historical 20-second default for
-saved flows that omit it. Await Login is the explicit human-in-the-loop gate: it checks a
-configured signed-in marker immediately, then focuses the visible run browser and shows an
-indefinite host notification only when user action is actually needed. The notification is
-dismissed on success, timeout, or cancellation. Await Login defaults to five minutes and passes
-its input items through unchanged once the marker appears.
+saved flows that omit it. Await Login is the explicit human-in-the-loop gate: it gives an
+already-authenticated page a one-second grace period to render its marker before prompting, then
+focuses the visible run browser and shows an indefinite host notification only when user action is
+actually needed. Its prompted phase polls once per second to avoid expensive DOM scans while a
+human signs in. The notification is dismissed on success, timeout, or cancellation. Await Login
+defaults to five minutes, all element waits are capped at 14 minutes (below the controller's
+15-minute watchdog), and it passes input items through unchanged once the marker appears.
 
 ### Inject execution contract
 
