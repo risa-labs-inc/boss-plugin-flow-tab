@@ -153,6 +153,13 @@ against the website or username in the host secret manager, using the same resol
 MCP configuration. Flow stores only the reference in graph JSON; the password is substituted at
 execution time and is never written back or included in HTTP-node logs and error messages.
 
+### Browser script literals
+
+Browser selectors, typed values, and extraction attribute names are embedded in generated
+single-quoted JavaScript literals. `BrowserScripts` escapes quotes, backslashes, every JavaScript
+line terminator, and ASCII control characters before interpolation; keep all new browser-script
+string inputs on that shared escaping path.
+
 ## Version Management
 
 **`build.gradle.kts` is the single source of truth for version.**

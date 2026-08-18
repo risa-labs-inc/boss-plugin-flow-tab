@@ -16,7 +16,30 @@ package ai.rever.boss.plugin.dynamic.flowtab
  */
 object BrowserScripts {
 
-    private fun esc(s: String): String = s.replace("\\", "\\\\").replace("'", "\\'")
+    /** Escapes text embedded in the single-quoted JavaScript literals below. */
+    private fun esc(s: String): String = buildString(s.length) {
+        for (char in s) {
+            when (char) {
+                '\\' -> append("\\\\")
+                '\'' -> append("\\'")
+                '\b' -> append("\\b")
+                '\u000C' -> append("\\f")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                '\u2028' -> append("\\u2028")
+                '\u2029' -> append("\\u2029")
+                else -> {
+                    if (char.code < 0x20) {
+                        append("\\u")
+                        append(char.code.toString(16).padStart(4, '0'))
+                    } else {
+                        append(char)
+                    }
+                }
+            }
+        }
+    }
 
     /** JS expression evaluating to the first matching element (or null). */
     fun elementExpr(selectorType: String, selector: String): String {
