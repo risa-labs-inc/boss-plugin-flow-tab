@@ -80,9 +80,11 @@ class RunContext(
     /** Reports the visible browser tab id this run opened, so the UI can close it
      *  before the next run (each run opens a fresh tab — see startRun). */
     onVisibleTab: (String?) -> Unit = {},
+    /** Close visible sessions at run cleanup when no interactive canvas owns them. */
+    closeVisibleTabsOnClose: Boolean = false,
     /** The N-session store this run draws from. Defaults to a fresh registry so tests
      *  and the ad-hoc executor path work without threading one through. */
-    val sessions: SessionRegistry = SessionRegistry(context, onVisibleTab),
+    val sessions: SessionRegistry = SessionRegistry(context, onVisibleTab, closeVisibleTabsOnClose),
     /** Nesting level of this run: 0 for a top-level run, +1 for each enclosing lanager.
      *  A [LanagerNode] uses it to enforce a cross-flow depth limit (plan §08). */
     val depth: Int = 0,
@@ -121,8 +123,7 @@ class RunContext(
     fun requireSession(): BrowserIntegration =
         session ?: throw ExecError("No browser session — add an 'Open Browser' node upstream")
 
-    /** Releases every session this run opened (headless handles disposed; visible tabs
-     *  left open for inspection and torn down by the host). */
+    /** Releases every session this run opened according to the registry's ownership policy. */
     suspend fun close() {
         sessions.closeAll()
     }

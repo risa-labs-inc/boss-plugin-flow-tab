@@ -1,5 +1,8 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import ai.rever.boss.plugin.api.ActiveTabData
+import ai.rever.boss.plugin.api.ActiveTabsProvider
+import ai.rever.boss.plugin.api.BrowserIntegration
 import ai.rever.boss.plugin.api.McpToolArgs
 import ai.rever.boss.plugin.api.McpToolDefinition
 import ai.rever.boss.plugin.api.McpToolRegistry
@@ -9,15 +12,27 @@ import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.PluginStorageFactory
 import ai.rever.boss.plugin.api.PluginStorageProvider
 import ai.rever.boss.plugin.api.TabRegistry
+import ai.rever.boss.plugin.browser.BrowserConfig
+import ai.rever.boss.plugin.browser.BrowserHandle
+import ai.rever.boss.plugin.browser.BrowserService
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.graphics.vector.ImageVector
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.buildJsonObject
@@ -38,6 +53,7 @@ import kotlin.test.assertTrue
  * against an in-memory store — no live boss server. Also pins F7: a *fixed* set, all
  * `flow_`/`prompt_`-prefixed, none colliding with the host's reserved tool names.
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 class FlowMcpToolProviderTest {
 
     private class FakeStorage : PluginStorageProvider {
@@ -63,13 +79,54 @@ class FlowMcpToolProviderTest {
         override fun observeChanges(): Flow<String> = emptyFlow()
     }
 
+    private class AvailableBrowserService : BrowserService {
+        override fun isAvailable() = true
+        override suspend fun createBrowser(config: BrowserConfig): BrowserHandle =
+            error("visible-session test should not fall back to headless")
+        override suspend fun disposeBrowser(handle: BrowserHandle) = Unit
+        override fun getActiveBrowserCount() = 0
+    }
+
+    private class FakeVisibleTabs : ActiveTabsProvider {
+        override val activeTabs: StateFlow<List<ActiveTabData>> = MutableStateFlow(emptyList())
+        val opened = mutableListOf<String>()
+        val closed = mutableListOf<String>()
+        private val integration = object : BrowserIntegration {
+            override suspend fun executeJavaScript(script: String): Any? = true
+            override fun isBrowserAvailable() = true
+            override suspend fun getCurrentUrl(): String = "about:blank"
+        }
+
+        override suspend fun refreshTabs() = Unit
+        override fun selectTab(tabId: String, panelId: String) = Unit
+        override fun getTabUrl(tabId: String): String? = "about:blank"
+        override fun getFaviconCacheKey(tabId: String): String? = null
+        @Composable override fun loadFavicon(cacheKey: String?): Painter? = null
+        override fun getFallbackIcon(typeId: String): ImageVector? = null
+        override fun getBrowserIntegration(tabId: String): BrowserIntegration? =
+            integration.takeIf { tabId in opened }
+        override fun createBrowserTab(url: String, title: String): String? = null
+        override fun createBrowserTabInRightSplit(url: String, title: String): String =
+            "browser-${opened.size + 1}".also(opened::add)
+        override fun closeTab(tabId: String): Boolean {
+            closed += tabId
+            return true
+        }
+    }
+
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    private fun context(storage: PluginStorageProvider): PluginContext = object : PluginContext {
+    private fun context(
+        storage: PluginStorageProvider,
+        browserService: BrowserService? = null,
+        activeTabs: ActiveTabsProvider? = null,
+    ): PluginContext = object : PluginContext {
         override val panelRegistry = PanelRegistry()
         override val tabRegistry = TabRegistry()
         override val pluginScope = scope
         override val mcpToolRegistry: McpToolRegistry? = null
+        override val browserService: BrowserService? = browserService
+        override val activeTabsProvider: ActiveTabsProvider? = activeTabs
         override val pluginStorageFactory = object : PluginStorageFactory {
             override fun createStorage(pluginId: String): PluginStorageProvider = storage
         }
@@ -78,8 +135,10 @@ class FlowMcpToolProviderTest {
     private fun provider(
         storage: PluginStorageProvider = FakeStorage(),
         registry: NodeRegistry = builtinNodeRegistry(),
+        browserService: BrowserService? = null,
+        activeTabs: ActiveTabsProvider? = null,
     ): FlowMcpToolProvider {
-        val ctx = context(storage)
+        val ctx = context(storage, browserService, activeTabs)
         return FlowMcpToolProvider(FlowController(ctx, { scope }, registry), PromptRegistry(storage))
     }
 
@@ -247,6 +306,57 @@ class FlowMcpToolProviderTest {
         val result = obj(call(p, "flow_result", """{"runId":"$runId"}"""))
         assertTrue(result.getValue("nodes").jsonObject.containsKey(set))
         assertEquals("false", result.getValue("outputIncluded").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `MCP flow_run closes the visible browser tab after terminal cleanup`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val tabs = FakeVisibleTabs()
+            val p = provider(
+                browserService = AvailableBrowserService(),
+                activeTabs = tabs,
+            )
+            val tabId = obj(call(p, "flow_create")).getValue("tabId").jsonPrimitive.content
+            call(p, "flow_add_node", """{"tabId":"$tabId","kind":"OPEN_BROWSER"}""")
+            val runId = obj(call(p, "flow_run", """{"tabId":"$tabId"}"""))
+                .getValue("runId").jsonPrimitive.content
+
+            val state = withTimeout(5_000) {
+                while (true) {
+                    val current = obj(call(p, "flow_status", """{"runId":"$runId"}"""))
+                        .getValue("state").jsonPrimitive.content
+                    if (current != "RUNNING") return@withTimeout current
+                    delay(10)
+                }
+                error("unreachable")
+            }
+
+            assertEquals("SUCCEEDED", state)
+            assertEquals(listOf("browser-1"), tabs.opened)
+            assertEquals(listOf("browser-1"), tabs.closed)
+        } finally {
+            Dispatchers.resetMain()
+        }
+    }
+
+    @Test
+    fun `interactive session ownership still leaves its visible tab open for inspection`() = runBlocking {
+        Dispatchers.setMain(UnconfinedTestDispatcher())
+        try {
+            val tabs = FakeVisibleTabs()
+            val registry = SessionRegistry(
+                context(FakeStorage(), AvailableBrowserService(), tabs),
+            )
+
+            registry.open(headless = false)
+            registry.closeAll()
+
+            assertEquals(listOf("browser-1"), tabs.opened)
+            assertTrue(tabs.closed.isEmpty())
+        } finally {
+            Dispatchers.resetMain()
+        }
     }
 
     @Test

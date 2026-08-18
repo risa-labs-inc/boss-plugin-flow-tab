@@ -25,8 +25,9 @@ import java.util.concurrent.atomic.AtomicInteger
  *    throwaway ([BrowserConfig.ephemeralProfile]) profile, wrapped by
  *    [BrowserHandleIntegration]; disposed on [close].
  *  - **visible** → a real Fluck tab in a right split (created on [Dispatchers.Main]),
- *    wrapped by [LoadAwaitingIntegration]; left open on [close] for inspection (torn
- *    down by the host / the tab UI). Falls back to headless if the host can't open one.
+ *    wrapped by [LoadAwaitingIntegration]. Interactive owners leave it open on [close]
+ *    for inspection; headless owners close it. Falls back to headless if the host
+ *    can't open one.
  *
  * Not tied to a run: [RunContext] draws its default session from here so native nodes
  * keep working unchanged, while [FlowBrowserToolSource] drives arbitrary sessions by id.
@@ -36,6 +37,9 @@ class SessionRegistry(
     /** Reports the visible browser tab id an open produced, so the UI can close it
      *  before the next run (each run opens a fresh tab). */
     private val onVisibleTab: (String?) -> Unit = {},
+    /** Whether [close] owns and closes visible tabs. False for an interactive canvas,
+     * true for MCP/headless runs that have no UI owner to reclaim them. */
+    private val closeVisibleTabsOnClose: Boolean = false,
 ) {
     private class Entry(
         val integration: BrowserIntegration,
@@ -94,8 +98,8 @@ class SessionRegistry(
         return mutexFor(id).withLock { action(entry.integration) }
     }
 
-    /** Close and release session [id] (disposes a headless handle; visible tabs are
-     *  left open and torn down by the host). No-op if it isn't open. */
+    /** Close and release session [id]. Headless handles are disposed; visible tabs
+     *  are closed only when this registry owns their lifecycle. No-op if absent. */
     suspend fun close(id: String) {
         val entry = entries.remove(id) ?: return
         runCatching { entry.closer.invoke() }
@@ -139,8 +143,11 @@ class SessionRegistry(
             val integration = withContext(Dispatchers.Main) { tabs.getBrowserIntegration(tabId) }
             if (integration != null) {
                 onVisibleTab(tabId)
-                // Visible tabs are left open on close; the host/tab UI tears them down.
-                return Entry(LoadAwaitingIntegration(integration)) {}
+                return Entry(LoadAwaitingIntegration(integration)) {
+                    if (closeVisibleTabsOnClose) {
+                        withContext(Dispatchers.Main) { tabs.closeTab(tabId) }
+                    }
+                }
             }
             delay(POLL_INTERVAL_MS.toLong()); waited += POLL_INTERVAL_MS
         }

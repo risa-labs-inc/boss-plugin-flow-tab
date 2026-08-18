@@ -377,7 +377,11 @@ class FlowController(
                 // This flow is now on the call stack: a nested lanager pointing back at it
                 // is a cycle. Depth is threaded so the nesting bound can be enforced.
                 FlowExecutor(context, registry).run(
-                    plan, snap.edges, depth = depth, ancestry = ancestry + tabId,
+                    plan,
+                    snap.edges,
+                    closeVisibleTabsOnClose = true,
+                    depth = depth,
+                    ancestry = ancestry + tabId,
                 ) { id, r ->
                     states[id] = r
                     // flow_result must be a non-blocking snapshot even while the
