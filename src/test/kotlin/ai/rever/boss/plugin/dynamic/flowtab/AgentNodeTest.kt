@@ -117,6 +117,7 @@ class AgentNodeTest {
         assertEquals(RunStatus.ERROR, states["a"]?.status)
         assertEquals("Agent timed out after 100ms", states["a"]?.error)
         assertTrue(states["a"]?.logs.orEmpty().any { it.startsWith("agent stopped: TIMEOUT") })
+        assertTrue(states["a"]?.output.orEmpty().isEmpty())
     }
 
     @Test
@@ -143,6 +144,43 @@ class AgentNodeTest {
         assertEquals(RunStatus.ERROR, states["a"]?.status)
         assertEquals("Agent timeout (timeoutMs) must be greater than 0", states["a"]?.error)
         assertEquals(0, providerCalls.get())
+    }
+
+    @Test
+    fun `malformed timeout and non-positive max steps are configuration errors`() {
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { FakeProvider.scripted(AssistantTurn(text = "should not run")) },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val malformedTimeout = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.TIMEOUT_KEY, "1e3")
+        }
+        val zeroSteps = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.MAX_STEPS_KEY, "0")
+        }
+
+        val timeoutState = runFlow(
+            reg,
+            listOf(PlanNode("timeout", AgentNode.KIND, "Agent", malformedTimeout)),
+            emptyList(),
+        )["timeout"]
+        val stepsState = runFlow(
+            reg,
+            listOf(PlanNode("steps", AgentNode.KIND, "Agent", zeroSteps)),
+            emptyList(),
+        )["steps"]
+
+        assertEquals(RunStatus.ERROR, timeoutState?.status)
+        assertEquals(
+            "Agent timeout (timeoutMs) must be a whole number greater than 0",
+            timeoutState?.error,
+        )
+        assertEquals(RunStatus.ERROR, stepsState?.status)
+        assertEquals("Agent max steps (maxSteps) must be greater than 0", stepsState?.error)
     }
 
     @Test

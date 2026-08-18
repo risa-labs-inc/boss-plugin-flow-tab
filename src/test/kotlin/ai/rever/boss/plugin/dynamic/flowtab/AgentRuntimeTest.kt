@@ -2,13 +2,16 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.yield
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -180,6 +183,7 @@ class AgentRuntimeTest {
         } finally {
             releaseProvider.countDown()
             withTimeout(5_000) { providerFinished.await() }
+            yield()
         }
         val elapsed = System.currentTimeMillis() - started
 
@@ -224,6 +228,63 @@ class AgentRuntimeTest {
         running.cancel()
 
         assertTrue(runCatching { running.await() }.exceptionOrNull() is CancellationException)
+    }
+
+    @Test
+    fun `a saturated execution lane fails admission without invoking another provider`() = runBlocking {
+        val lane = Dispatchers.IO.limitedParallelism(1)
+        val firstStarted = CompletableDeferred<Unit>()
+        val releaseFirst = CountDownLatch(1)
+        val firstFinished = CompletableDeferred<Unit>()
+        val firstProvider = FakeProvider { _, _, _, _ ->
+            firstStarted.complete(Unit)
+            try {
+                releaseFirst.await()
+                AssistantTurn(text = "released")
+            } finally {
+                firstFinished.complete(Unit)
+            }
+        }
+        val first = async {
+            AgentRuntime(
+                firstProvider,
+                RecordingSource(emptyList()),
+                AgentBudget(timeoutMs = 5_000),
+                executionDispatcher = lane,
+            ).run(system = "s", input = "go", allowlist = emptySet())
+        }
+        withTimeout(5_000) { firstStarted.await() }
+
+        val secondCalls = AtomicInteger()
+        val secondProvider = FakeProvider { _, _, _, _ ->
+            secondCalls.incrementAndGet()
+            AssistantTurn(text = "must not run")
+        }
+        val started = System.currentTimeMillis()
+        val failure = runCatching {
+            AgentRuntime(
+                secondProvider,
+                RecordingSource(emptyList()),
+                AgentBudget(timeoutMs = 200),
+                executionDispatcher = lane,
+            ).run(system = "s", input = "go", allowlist = emptySet())
+        }.exceptionOrNull()
+        val elapsed = System.currentTimeMillis() - started
+
+        try {
+            assertTrue(failure is ExecError)
+            assertEquals(
+                "Agent execution capacity is busy; retry after other Agent runs finish",
+                failure.message,
+            )
+            assertEquals(0, secondCalls.get())
+            assertTrue(elapsed < 2_000, "capacity admission waited ${elapsed}ms")
+        } finally {
+            first.cancel()
+            releaseFirst.countDown()
+            withTimeout(5_000) { firstFinished.await() }
+            runCatching { first.await() }
+        }
     }
 
     // ---- tool output is data, not instructions ------------------------------

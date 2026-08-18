@@ -1,6 +1,8 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -98,6 +100,7 @@ class AgentRuntime(
     private val provider: AgentProvider,
     private val source: ToolSource,
     private val budget: AgentBudget = AgentBudget(),
+    private val executionDispatcher: CoroutineDispatcher = agentExecutionDispatcher,
 ) {
     private data class Progress(
         val lastText: String = "",
@@ -137,29 +140,52 @@ class AgentRuntime(
         if (timeoutMs == 0L) {
             return done("", StopReason.TIMEOUT, steps = 0, toolCalls = 0, usage = TokenUsage())
         }
-        val started = System.currentTimeMillis()
-        val hardTimeoutMs = timeoutMs.saturatingPlus(HARD_TIMEOUT_GRACE_MS)
-
         // Provider and tool integrations are host/plugin boundaries and may block without
         // cooperating with coroutine cancellation. Keep their loop in an independently
         // owned scope so the caller can publish TIMEOUT at the configured wall-clock
         // deadline instead of waiting for a late host call to return. Cancellation remains
         // best-effort; a late result has no path back to the already-returned AgentResult.
-        val executionScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val executionScope = CoroutineScope(SupervisorJob() + executionDispatcher)
         val progress = AtomicReference(Progress())
         val successfulCompletion = AtomicReference<AgentResult?>(null)
         val failure = AtomicReference<Throwable?>(null)
         val logGate = LogGate(log)
+        val loopStarted = CompletableDeferred<Unit>()
         val execution = executionScope.async {
-            runLoop(system, input, allowlist, started, progress, logGate::write)
+            loopStarted.complete(Unit)
+            runLoop(system, input, allowlist, progress, logGate::write)
                 .also { successfulCompletion.set(it) }
         }
         execution.invokeOnCompletion { cause ->
             if (cause != null && cause !is CancellationException) failure.compareAndSet(null, cause)
         }
+
+        // A bounded lane prevents non-cooperative host calls from consuming the host's
+        // entire IO pool. Queue time is not agent execution time: wait briefly for a lane,
+        // then fail explicitly as capacity exhaustion instead of reporting a bogus 0-step
+        // provider timeout. Cancellation removes a queued coroutine before it can run.
+        val admissionTimeoutMs = timeoutMs.coerceAtMost(ADMISSION_TIMEOUT_MS)
+        val admitted = try {
+            withTimeoutOrNull(admissionTimeoutMs) {
+                loopStarted.await()
+                true
+            } ?: false
+        } catch (cancelled: CancellationException) {
+            logGate.close()
+            executionScope.cancel(CancellationException("Agent run cancelled before execution"))
+            throw cancelled
+        }
+        if (!admitted) {
+            logGate.close()
+            executionScope.cancel(CancellationException("Agent execution lane unavailable"))
+            throw ExecError("Agent execution capacity is busy; retry after other Agent runs finish")
+        }
+
+        val graceMs = maxOf(MIN_HARD_TIMEOUT_GRACE_MS, timeoutMs / 20)
+        val hardTimeoutMs = timeoutMs.saturatingPlus(graceMs)
         val result = try {
             // Let the loop's cooperative timeout publish its complete result first. The
-            // small grace is only an escape hatch for a host call that ignores cancellation.
+            // grace is only an escape hatch for a host call that ignores cancellation.
             withTimeoutOrNull(hardTimeoutMs) { execution.await() }
         } finally {
             logGate.close()
@@ -185,10 +211,10 @@ class AgentRuntime(
         system: String,
         input: String,
         allowlist: Set<String>,
-        started: Long,
         progress: AtomicReference<Progress>,
         log: (String) -> Unit,
     ): AgentResult {
+        val started = System.currentTimeMillis()
         val allowed = source.list().filter { it.ref.name in allowlist }
         val allowedNames = allowed.map { it.ref.name }.toSet()
 
@@ -251,6 +277,13 @@ class AgentRuntime(
         if (this > Long.MAX_VALUE - other) Long.MAX_VALUE else this + other
 
     private companion object {
-        const val HARD_TIMEOUT_GRACE_MS = 100L
+        const val AGENT_EXECUTION_PARALLELISM = 64
+        const val ADMISSION_TIMEOUT_MS = 1_000L
+        const val MIN_HARD_TIMEOUT_GRACE_MS = 500L
+
+        // Dispatchers.IO's elastic limited view confines permanently wedged Flow Agent
+        // calls without consuming every permit used by unrelated host IO. Once saturated,
+        // admission above fails clearly instead of queueing healthy agents indefinitely.
+        val agentExecutionDispatcher = Dispatchers.IO.limitedParallelism(AGENT_EXECUTION_PARALLELISM)
     }
 }

@@ -55,9 +55,14 @@ object AgentNode {
             "Timeout (ms)",
             FieldType.NUMBER,
             default = "120000",
-            placeholder = "must be greater than 0",
+            placeholder = "blank = 120000; must be greater than 0",
         ),
-        ConfigField(MAX_TOKENS_KEY, "Max tokens", FieldType.NUMBER, placeholder = "unbounded if blank"),
+        ConfigField(
+            MAX_TOKENS_KEY,
+            "Max tokens",
+            FieldType.NUMBER,
+            placeholder = "unbounded if blank; otherwise must be greater than 0",
+        ),
     )
 }
 
@@ -104,6 +109,9 @@ class AgentNodeExecutor(
             .run(system = system, input = settings.input, allowlist = settings.allowlist, log = log)
         log("agent stopped: ${result.stopReason} (${result.steps} step(s), ${result.toolCalls} tool call(s))")
         if (result.stopReason == StopReason.TIMEOUT) {
+            result.finalText.takeIf { it.isNotBlank() }?.let { partial ->
+                log("agent partial text: ${partial.replace('\n', ' ').take(500)}")
+            }
             throw ExecError("Agent timed out after ${settings.budget.timeoutMs}ms")
         }
         return NodeOutput.single(listOf(
@@ -126,8 +134,9 @@ class AgentNodeExecutor(
     private fun parse(cfg: ConfigReader, inputs: List<Item>): AgentSettings {
         val inlineInput = cfg.str(AgentNode.INPUT_KEY)
         val input = inlineInput.ifBlank { inputs.firstOrNull()?.json?.toString() ?: "" }
-        val timeoutMs = cfg.str(AgentNode.TIMEOUT_KEY).trim().toLongOrNull() ?: 120_000
-        if (timeoutMs <= 0) throw ExecError("Agent timeout (timeoutMs) must be greater than 0")
+        val maxSteps = cfg.positiveInt(AgentNode.MAX_STEPS_KEY, 8, "Agent max steps")
+        val timeoutMs = cfg.positiveLong(AgentNode.TIMEOUT_KEY, 120_000, "Agent timeout")
+        val maxTokens = cfg.positiveInt(AgentNode.MAX_TOKENS_KEY, Int.MAX_VALUE, "Agent max tokens")
         return AgentSettings(
             promptId = cfg.str(AgentNode.PROMPT_ID_KEY).ifBlank { null },
             system = cfg.str(AgentNode.SYSTEM_KEY),
@@ -135,11 +144,26 @@ class AgentNodeExecutor(
             allowlist = parseAllowlist(cfg),
             model = cfg.str(AgentNode.MODEL_KEY).ifBlank { AgentNode.DEFAULT_MODEL },
             budget = AgentBudget(
-                maxSteps = cfg.int(AgentNode.MAX_STEPS_KEY, 8),
+                maxSteps = maxSteps,
                 timeoutMs = timeoutMs,
-                maxTokens = cfg.int(AgentNode.MAX_TOKENS_KEY, Int.MAX_VALUE),
+                maxTokens = maxTokens,
             ),
         )
+    }
+
+    private fun ConfigReader.positiveLong(key: String, default: Long, label: String): Long {
+        val raw = str(key).trim()
+        if (raw.isEmpty()) return default
+        val value = raw.toLongOrNull()
+            ?: throw ExecError("$label ($key) must be a whole number greater than 0")
+        if (value <= 0) throw ExecError("$label ($key) must be greater than 0")
+        return value
+    }
+
+    private fun ConfigReader.positiveInt(key: String, default: Int, label: String): Int {
+        val value = positiveLong(key, default.toLong(), label)
+        if (value > Int.MAX_VALUE) throw ExecError("$label ($key) is too large")
+        return value.toInt()
     }
 
     /** Allowlist as a JSON array of names, or a comma/newline-separated string. */
