@@ -107,6 +107,55 @@ class AgentNodeTest {
     }
 
     @Test
+    fun `default text encoded empty JSON allowlist remains a valid tool-free agent`() {
+        var advertised = listOf("not observed")
+        val provider = FakeProvider { _, _, _, tools ->
+            advertised = tools.map { it.name }
+            AssistantTurn(text = "tool-free answer")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(listOf("lookup")) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.ALLOWLIST_KEY, "[]")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertTrue(advertised.isEmpty())
+        assertTrue(state.logs.contains("agent tools resolved: 0"))
+    }
+
+    @Test
+    fun `legacy comma and newline allowlist still resolves every named tool`() {
+        var advertised = emptySet<String>()
+        val provider = FakeProvider { _, _, _, tools ->
+            advertised = tools.map { it.name }.toSet()
+            AssistantTurn(text = "done")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(listOf("lookup", "other")) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.ALLOWLIST_KEY, "lookup,\n other")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals(setOf("lookup", "other"), advertised)
+    }
+
+    @Test
     fun `structured mode advertises the schema tool and emits only its validated object`() {
         val source = RecordingSource(listOf("lookup"))
         var seenSystem = ""

@@ -244,14 +244,19 @@ class AgentNodeExecutor(
             null, JsonNull -> emptyList()
             is JsonArray -> allowlistEntries(configured)
             is JsonPrimitive -> {
+                if (!configured.isString) {
+                    throw ExecError(
+                        "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) must be a JSON array or comma-separated names",
+                    )
+                }
                 val raw = configured.content.trim()
                 when {
                     raw.isEmpty() -> emptyList()
-                    raw.startsWith("[") -> {
+                    raw.startsWith("[") || raw.startsWith("{") -> {
                         val parsed = runCatching { Json.parseToJsonElement(raw) }.getOrElse { error ->
                             throw ExecError(
                                 "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) must be a valid JSON array: " +
-                                    (error.message ?: "invalid JSON"),
+                                    safeAllowlistError(error),
                             )
                         }
                         val array = parsed as? JsonArray
@@ -281,6 +286,17 @@ class AgentNodeExecutor(
             ?: throw ExecError(
                 "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) entry ${index + 1} must not be blank",
             )
+    }
+
+    /** Parser diagnostics may include source excerpts; keep node errors bounded and single-line. */
+    private fun safeAllowlistError(error: Throwable): String =
+        (error.message ?: "invalid JSON")
+            .take(MAX_ALLOWLIST_ERROR_DETAIL_CHARS)
+            .map { if (it.isISOControl()) ' ' else it }
+            .joinToString("")
+
+    private companion object {
+        const val MAX_ALLOWLIST_ERROR_DETAIL_CHARS = 240
     }
 }
 
