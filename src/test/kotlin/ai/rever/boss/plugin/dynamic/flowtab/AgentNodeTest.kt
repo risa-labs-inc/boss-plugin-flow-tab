@@ -127,10 +127,53 @@ class AgentNodeTest {
         val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
 
         assertEquals(RunStatus.ERROR, states["a"]?.status)
-        assertEquals("Agent timed out after 100ms", states["a"]?.error)
+        assertEquals(
+            "Agent stopped: TIMEOUT after 1 completed step(s), 1 tool call(s); timeout was 100ms",
+            states["a"]?.error,
+        )
         assertTrue(states["a"]?.logs.orEmpty().any { it.startsWith("agent stopped: TIMEOUT") })
         assertTrue(states["a"]?.logs.orEmpty().contains("agent partial text: working answer"))
         assertTrue(states["a"]?.output.orEmpty().isEmpty())
+    }
+
+    @Test
+    fun `provider failure persists a sanitized terminal diagnostic`() {
+        val provider = FakeProvider { _, _, _, _ ->
+            throw ExecError("The provider does not offer the selected model")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.SYSTEM_KEY, "SYSTEM-PROMPT-SECRET")
+            put(AgentNode.INPUT_KEY, "INPUT-SECRET")
+        }
+
+        val state = runFlow(
+            reg,
+            listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)),
+            emptyList(),
+        ).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertEquals(
+            "Agent stopped: FAILED after 0 completed step(s), 0 tool call(s): " +
+                "The provider does not offer the selected model",
+            state.error,
+        )
+        assertEquals(
+            listOf(
+                "agent step 1: requesting model",
+                "agent stopped: FAILED (0 completed step(s), 0 tool call(s))",
+            ),
+            state.logs,
+        )
+        val report = state.logs.joinToString("\n")
+        assertFalse("SYSTEM-PROMPT-SECRET" in report)
+        assertFalse("INPUT-SECRET" in report)
     }
 
     @Test

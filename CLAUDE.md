@@ -76,6 +76,14 @@ it must be a red node failure rather than a successful output carrying `stopReas
 partial answer. User-configured step, timeout, and token budgets must be positive whole numbers;
 zero does not mean unlimited.
 
+Agent diagnostics are incremental and sanitized. The runtime logs each model step before the
+provider call, each tool's name plus started/succeeded/failed status, and a terminal stop line.
+Provider failures therefore retain the number of completed steps and attempted tool calls even
+when the loop throws. Raw prompts, model text, tool arguments, and tool-result content are never
+written to these progress logs; the node error keeps the provider's error message with the same
+`FAILED` counters. Runtime-owned terminal logging is intentional—the executor cannot reliably log
+after a thrown provider boundary.
+
 The agent's browser tool lane is bound to the run's `defaultSessionId`. In that lane,
 `session_id` is optional and omission means the same browser session native Open/Navigate/Click/
 Type/Extract nodes use. An explicit id still wins for multi-session agents. `browser_open` without

@@ -62,6 +62,57 @@ class AgentRuntimeTest {
         assertTrue(source.invoked.contains("lookup"))
     }
 
+    @Test
+    fun `provider failure preserves incremental counters without logging sensitive content`() = runBlocking {
+        val logs = mutableListOf<String>()
+        val source = RecordingSource(
+            listOf(desc("lookup")),
+            mapOf("lookup" to ToolResult("TOOL-RESULT-SECRET", isError = true)),
+        )
+        val provider = FakeProvider { step, _, _, _ ->
+            if (step == 0) {
+                AssistantTurn(
+                    text = "MODEL-TEXT-SECRET",
+                    toolCalls = listOf(call("lookup", """{"secret":"TOOL-ARG-SECRET"}""")),
+                )
+            } else {
+                throw ExecError("The provider rejected the request")
+            }
+        }
+
+        val failure = runCatching {
+            AgentRuntime(provider, source)
+                .run(system = "SYSTEM-PROMPT-SECRET", input = "INPUT-SECRET", allowlist = setOf("lookup"), log = logs::add)
+        }.exceptionOrNull()
+
+        assertTrue(failure is AgentRunFailure)
+        assertEquals(1, failure.steps)
+        assertEquals(1, failure.toolCalls)
+        assertEquals(
+            "Agent stopped: FAILED after 1 completed step(s), 1 tool call(s): " +
+                "The provider rejected the request",
+            failure.message,
+        )
+        assertEquals(
+            listOf(
+                "agent step 1: requesting model",
+                "agent tool 1 'lookup': started",
+                "agent tool 1 'lookup': failed",
+                "agent step 2: requesting model",
+                "agent stopped: FAILED (1 completed step(s), 1 tool call(s))",
+            ),
+            logs,
+        )
+        val report = logs.joinToString("\n")
+        listOf(
+            "SYSTEM-PROMPT-SECRET",
+            "INPUT-SECRET",
+            "MODEL-TEXT-SECRET",
+            "TOOL-ARG-SECRET",
+            "TOOL-RESULT-SECRET",
+        ).forEach { secret -> assertFalse(secret in report) }
+    }
+
     // ---- allowlist enforcement ---------------------------------------------
 
     @Test
@@ -231,6 +282,32 @@ class AgentRuntimeTest {
     }
 
     @Test
+    fun `provider-local cancellation is logged as a failure while the caller remains active`() = runBlocking {
+        val logs = mutableListOf<String>()
+        val provider = FakeProvider { _, _, _, _ ->
+            throw CancellationException("provider request aborted")
+        }
+
+        val failure = runCatching {
+            AgentRuntime(provider, RecordingSource(emptyList()))
+                .run(system = "s", input = "go", allowlist = emptySet(), log = logs::add)
+        }.exceptionOrNull()
+
+        assertTrue(failure is AgentRunFailure)
+        assertEquals(
+            "Agent stopped: FAILED after 0 completed step(s), 0 tool call(s): provider request aborted",
+            failure.message,
+        )
+        assertEquals(
+            listOf(
+                "agent step 1: requesting model",
+                "agent stopped: FAILED (0 completed step(s), 0 tool call(s))",
+            ),
+            logs,
+        )
+    }
+
+    @Test
     fun `a saturated execution lane fails admission without invoking another provider`() = runBlocking {
         val lane = Dispatchers.IO.limitedParallelism(1)
         val firstStarted = CompletableDeferred<Unit>()
@@ -272,9 +349,10 @@ class AgentRuntimeTest {
         val elapsed = System.currentTimeMillis() - started
 
         try {
-            assertTrue(failure is ExecError)
+            assertTrue(failure is AgentRunFailure)
             assertEquals(
-                "Agent execution capacity is busy; retry after other Agent runs finish",
+                "Agent stopped: FAILED after 0 completed step(s), 0 tool call(s): " +
+                    "Agent execution capacity is busy; retry after other Agent runs finish",
                 failure.message,
             )
             assertEquals(0, secondCalls.get())
