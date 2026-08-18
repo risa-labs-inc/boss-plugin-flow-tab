@@ -193,6 +193,9 @@ fun agentNodeSpec(
     accent = AgentNode.ACCENT,
     description = "Run an LLM agent: a bounded tool-loop over an allowlist of tools.",
     runMode = RunMode.PER_ITEM,
+    // Must stay false: browser tools acquire the default session's non-reentrant
+    // mutex per call. Holding it around the whole Agent node would deadlock them.
+    usesSession = false,
     hasMetaRow = false,
     configFields = AgentNode.CONFIG_FIELDS,
     executor = AgentNodeExecutor(prompts, providerFor, toolSourceFor),

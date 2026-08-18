@@ -16,6 +16,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
@@ -123,11 +125,16 @@ class SessionRegistryTest {
     }
 
     /** Mints a fresh [FakePage] per createBrowser, so distinct sessions get distinct pages. */
-    private class MultiFakeService(private val make: () -> FakePage) : BrowserService {
+    private class MultiFakeService(
+        private val createDelayMs: Long = 0,
+        private val make: () -> FakePage,
+    ) : BrowserService {
         val pages = mutableListOf<FakePage>()
         override fun isAvailable() = true
-        override suspend fun createBrowser(config: BrowserConfig): BrowserHandle =
-            make().also { pages.add(it) }
+        override suspend fun createBrowser(config: BrowserConfig): BrowserHandle {
+            if (createDelayMs > 0) delay(createDelayMs)
+            return make().also { pages.add(it) }
+        }
         override suspend fun disposeBrowser(handle: BrowserHandle) { (handle as FakePage).disposed = true }
         override fun getActiveBrowserCount() = pages.size
     }
@@ -174,7 +181,7 @@ class SessionRegistryTest {
     }
 
     private fun registry(make: () -> FakePage = { FakePage() }): Pair<SessionRegistry, MultiFakeService> {
-        val svc = MultiFakeService(make)
+        val svc = MultiFakeService(make = make)
         return SessionRegistry(Ctx(svc)) to svc
     }
 
@@ -223,6 +230,21 @@ class SessionRegistryTest {
         assertEquals(2, svc.pages.size)
         assertTrue(svc.pages[0].disposed, "previous handle disposed on reopen (no leak — red-team S5)")
         assertFalse(svc.pages[1].disposed)
+    }
+
+    @Test
+    fun `openIfAbsent serializes concurrent opens for one session id`() = runBlocking {
+        val svc = MultiFakeService(make = { FakePage() }, createDelayMs = 50)
+        val reg = SessionRegistry(Ctx(svc))
+
+        val reused = listOf(
+            async { reg.openIfAbsent(headless = true, id = "shared") },
+            async { reg.openIfAbsent(headless = true, id = "shared") },
+        ).awaitAll()
+
+        assertEquals(1, svc.pages.size)
+        assertEquals(1, reused.count { it })
+        assertEquals(1, reused.count { !it })
     }
 
     @Test
@@ -291,10 +313,8 @@ class SessionRegistryTest {
     }
 
     @Test
-    fun `run-bound browser tools default to the reserved session`() = runBlocking {
-        val (reg, svc) = registry { FakePage(responder = { script ->
-            if (script.contains("JSON.stringify")) """{"ok":true,"value":"Hello"}""" else true
-        }) }
+    fun `run-bound browser tool schemas advertise the default session contract`() = runBlocking {
+        val (reg, _) = registry()
         val defaultId = reg.newSessionId()
         val src = FlowBrowserToolSource(reg, defaultId)
 
@@ -310,13 +330,23 @@ class SessionRegistryTest {
         assertEquals(listOf("selector", "text"), tools.getValue("browser_type").requiredProperties())
         assertEquals(listOf("selector"), tools.getValue("browser_extract").requiredProperties())
         assertEquals(listOf("session_id"), tools.getValue("browser_close").requiredProperties())
-        assertFalse(tools.getValue("browser_close").description.contains("Omit session_id"))
+        assertTrue(tools.getValue("browser_close").description.contains("cannot be closed"))
+    }
+
+    @Test
+    fun `run-bound browser tools default to the reserved session`() = runBlocking {
+        val (reg, svc) = registry { FakePage(responder = { script ->
+            if (script.contains("JSON.stringify")) """{"ok":true,"value":"Hello"}""" else true
+        }) }
+        val defaultId = reg.newSessionId()
+        val src = FlowBrowserToolSource(reg, defaultId)
 
         val opened = src.invoke("browser_open", """{"headless":true}""")
         assertFalse(opened.isError)
         val openedJson = JSON.parseToJsonElement(opened.text).jsonObject
         assertEquals(defaultId, openedJson["session_id"]!!.jsonPrimitive.content)
         assertEquals(false, openedJson["reused"]!!.jsonPrimitive.booleanOrNull)
+        assertEquals(false, openedJson["closable"]!!.jsonPrimitive.booleanOrNull)
         assertNotNull(reg.get(defaultId))
 
         // Opening again without an id reuses the page established for the run.
@@ -354,13 +384,25 @@ class SessionRegistryTest {
             """{"session_id":"agent-extra","headless":true,"url":"https://extra.example"}""",
         )
         assertFalse(extra.isError)
-        assertEquals(false, JSON.parseToJsonElement(extra.text).jsonObject["reused"]!!.jsonPrimitive.booleanOrNull)
+        val extraJson = JSON.parseToJsonElement(extra.text).jsonObject
+        assertEquals(false, extraJson["reused"]!!.jsonPrimitive.booleanOrNull)
+        assertEquals(true, extraJson["closable"]!!.jsonPrimitive.booleanOrNull)
         assertEquals(2, svc.pages.size)
         assertEquals(
             listOf("https://open.example", "https://explicit-default.example", "https://navigate.example"),
             page.navigated,
         )
         assertEquals(listOf("https://extra.example"), svc.pages[1].navigated)
+
+        val reusedExtra = src.invoke(
+            "browser_open",
+            """{"session_id":"agent-extra","headless":true,"url":"https://extra-reused.example"}""",
+        )
+        assertFalse(reusedExtra.isError)
+        assertEquals(true, JSON.parseToJsonElement(reusedExtra.text).jsonObject["reused"]!!.jsonPrimitive.booleanOrNull)
+        assertEquals(2, svc.pages.size)
+        assertEquals(listOf("https://extra.example", "https://extra-reused.example"), svc.pages[1].navigated)
+
         assertFalse(src.invoke("browser_close", """{"session_id":"agent-extra"}""").isError)
         assertTrue(svc.pages[1].disposed)
 
@@ -371,8 +413,10 @@ class SessionRegistryTest {
         assertFalse(page.disposed)
 
         val defaultClose = src.invoke("browser_close", """{"session_id":"$defaultId"}""")
-        assertTrue(defaultClose.isError)
-        assertTrue(defaultClose.text.contains("shared browser session"))
+        assertFalse(defaultClose.isError)
+        val defaultCloseJson = JSON.parseToJsonElement(defaultClose.text).jsonObject
+        assertEquals(false, defaultCloseJson["closed"]!!.jsonPrimitive.booleanOrNull)
+        assertTrue(defaultCloseJson["reason"]!!.jsonPrimitive.content.contains("flow run owns"))
         assertNotNull(reg.get(defaultId))
         assertFalse(page.disposed)
 

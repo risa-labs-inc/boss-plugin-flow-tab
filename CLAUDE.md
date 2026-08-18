@@ -81,10 +81,11 @@ The agent's browser tool lane is bound to the run's `defaultSessionId`. In that 
 Type/Extract nodes use. An explicit id still wins for multi-session agents. `browser_open` without
 an id opens the reserved default session when needed and reuses it when an upstream node already
 opened it, so it does not replace the page the flow established; explicitly naming that default id
-also reuses it for compatibility with old prompts. `browser_close` rejects the run-owned default
-session even when explicitly named; the run owns that shared page's lifecycle, while an agent may
-still close additional sessions it opened under other ids. A default-
-constructed `FlowBrowserToolSource` keeps the explicit-session contract and schemas.
+also reuses it for compatibility with old prompts. Named secondary sessions reuse too; an agent can
+close and reopen one when it needs a fresh page. `browser_close` treats the run-owned default as a
+successful no-op even when explicitly named, preventing cleanup retry loops while the run retains
+ownership of the shared page. An agent may close additional sessions it opened under other ids.
+A default-constructed `FlowBrowserToolSource` keeps the explicit-session contract and schemas.
 
 This binding is intentionally shared state. If the agent opens the default session, downstream
 native nodes inherit that page and its visibility. A later or parallel native Open Browser can
