@@ -16,8 +16,8 @@ package ai.rever.boss.plugin.dynamic.flowtab
  */
 object BrowserScripts {
 
-    /** Escapes text embedded in the single-quoted JavaScript literals below. */
-    private fun esc(s: String): String = buildString(s.length) {
+    /** Escapes text embedded in a single-quoted JavaScript literal. */
+    internal fun escapeSingleQuotedContent(s: String): String = buildString(s.length) {
         for (char in s) {
             when (char) {
                 '\\' -> append("\\\\")
@@ -43,7 +43,7 @@ object BrowserScripts {
 
     /** JS expression evaluating to the first matching element (or null). */
     fun elementExpr(selectorType: String, selector: String): String {
-        val v = esc(selector)
+        val v = escapeSingleQuotedContent(selector)
         return when (selectorType) {
             "xpath" -> "document.evaluate('$v', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue"
             "text" -> "Array.from(document.querySelectorAll('*')).find(function(e){return e.textContent && e.textContent.trim()==='$v';})"
@@ -53,7 +53,7 @@ object BrowserScripts {
 
     /** JS expression evaluating to an array of all matching elements. */
     private fun allElementsExpr(selectorType: String, selector: String): String {
-        val v = esc(selector)
+        val v = escapeSingleQuotedContent(selector)
         return when (selectorType) {
             "xpath" -> "(function(){var r=document.evaluate('$v',document,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null);var a=[];for(var i=0;i<r.snapshotLength;i++)a.push(r.snapshotItem(i));return a;})()"
             "text" -> "Array.from(document.querySelectorAll('*')).filter(function(e){return e.textContent && e.textContent.trim()==='$v';})"
@@ -67,7 +67,7 @@ object BrowserScripts {
 
     /** Sets a field's value + fires input/change events. Returns true/false. */
     fun inputScript(selectorType: String, selector: String, value: String): String {
-        val tv = esc(value)
+        val tv = escapeSingleQuotedContent(value)
         return "(function(){var el=${elementExpr(selectorType, selector)}; if(!el) return false; " +
             "el.focus(); el.value='$tv'; " +
             "el.dispatchEvent(new Event('input',{bubbles:true})); " +
@@ -85,7 +85,7 @@ object BrowserScripts {
         attr: String,
         multiple: Boolean
     ): String {
-        val a = esc(attr)
+        val a = escapeSingleQuotedContent(attr)
         val readOne = when (mode) {
             "html" -> "function(e){return e.innerHTML;}"
             "attr" -> "function(e){return e.getAttribute('$a');}"

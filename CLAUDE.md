@@ -146,12 +146,16 @@ key. Controller/MCP mutations and open-tab autosave therefore serialize through
 loads before acknowledging the revision; autosaves captured against an older revision are skipped.
 In-canvas rename additionally uses a temporary name guard that clears after convergence.
 
-### HTTP secrets
+### Runtime secret templates
 
-HTTP node URL, headers, and body fields accept `{{ $secret.name }}` references. `name` is matched
-against the website or username in the host secret manager, using the same resolver as external
-MCP configuration. Flow stores only the reference in graph JSON; the password is substituted at
-execution time and is never written back or included in HTTP-node logs and error messages.
+HTTP node URL, headers, and body fields plus Type text and Inject scripts accept
+`{{ $secret.name }}` references. `name` is matched against the website or username in the host
+secret manager, using the same resolver as external MCP configuration. Flow stores only the
+reference in graph JSON; the password is substituted at execution time and is never written back
+or included in Flow's own node logs and secret-lookup errors. Type passes the resolved value
+through `BrowserScripts` escaping before execution. Inject secret references must be placed inside
+a single-quoted JavaScript string, as shown by its inspector placeholder; the resolver escapes the
+secret as single-quoted literal content before executing the raw script.
 
 ### Browser script literals
 

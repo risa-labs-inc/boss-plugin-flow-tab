@@ -108,7 +108,7 @@ enum class NodeType(
         TYPE -> listOf(
             ConfigField("selectorType", "Selector type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
             ConfigField("selector", "Selector", FieldType.TEXT, placeholder = "input[name=q]"),
-            ConfigField("text", "Text", FieldType.TEXT, placeholder = "hello or {{ \$json.q }}")
+            ConfigField("text", "Text", FieldType.TEXT, placeholder = "{{ \$json.q }} or {{ \$secret.account_password }}")
         )
         EXTRACT -> listOf(
             ConfigField("selectorType", "Selector type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
@@ -119,7 +119,12 @@ enum class NodeType(
             ConfigField("multiple", "All matches", FieldType.BOOL, default = "false")
         )
         INJECT -> listOf(
-            ConfigField("script", "JavaScript", FieldType.TEXTAREA, placeholder = "document.title = '{{ \$json.title }}'")
+            ConfigField(
+                "script",
+                "JavaScript",
+                FieldType.TEXTAREA,
+                placeholder = "document.querySelector('#token').value = '{{ \$secret.api_token }}'",
+            )
         )
         HTTP -> listOf(
             ConfigField("method", "Method", FieldType.SELECT, listOf("GET", "POST", "PUT", "DELETE", "PATCH"), default = "GET"),

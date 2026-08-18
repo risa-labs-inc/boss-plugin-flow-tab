@@ -122,7 +122,7 @@ class NodeExecutorsTest {
             SecretTemplateResolver(SecretResolver { throw IllegalStateException("provider credential") })
                 .resolve("{{ \$secret.token }}") { it }
         }
-        assertEquals("HTTP secret 'token' was not found", missing.message)
+        assertEquals("Secret 'token' was not found", missing.message)
         assertFalse(missing.message!!.contains("provider credential"))
 
         val malformed = assertFailsWith<ExecError> {

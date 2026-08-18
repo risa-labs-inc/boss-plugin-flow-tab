@@ -22,6 +22,7 @@ import kotlin.math.max
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 // ---- fakes -----------------------------------------------------------------
@@ -133,10 +134,11 @@ private fun runGraph(
     edges: List<EdgeModel>,
     service: BrowserService? = null,
     registry: NodeRegistry = builtinNodeRegistry(),
+    secrets: SecretResolver = SecretResolver.constant(null),
 ): Map<String, NodeRun> {
     val states = ConcurrentHashMap<String, NodeRun>()
     runBlocking(Dispatchers.Default) {
-        FlowExecutor(FakeContext(service), registry).run(nodes, edges) { id, r -> states[id] = r }
+        FlowExecutor(FakeContext(service), registry, secrets).run(nodes, edges) { id, r -> states[id] = r }
     }
     return states
 }
@@ -279,6 +281,53 @@ class FlowExecutorTest {
         assertTrue(handle.navigated.contains("https://example.com/x")) // Navigate
         assertTrue(handle.jsCalls.any { it.contains("#go") })          // Click selector in JS
         assertEquals("Hello", states["ex"]!!.output.single().json.str("title")) // Extract returned data
+    }
+
+    @Test
+    fun `browser value nodes resolve secrets at runtime without logging them`() {
+        val password = "line one\nline'two"
+        val token = "token line one\ntoken'two"
+        val lookups = mutableListOf<String>()
+        val handle = FakeHandle(responder = { true })
+        val nodes = listOf(
+            n("open", NodeType.OPEN_BROWSER),
+            n("type", NodeType.TYPE, "selector" to "#password", "text" to "{{ \$secret.login_password }}"),
+            n("inject", NodeType.INJECT, "script" to "window.apiToken='{{ \$secret.api_token }}'"),
+        )
+        val states = runGraph(
+            nodes,
+            listOf(e("open", "type"), e("type", "inject")),
+            service = FakeService(handle),
+            secrets = SecretResolver { name ->
+                lookups += name
+                when (name) {
+                    "login_password" -> password
+                    "api_token" -> token
+                    else -> null
+                }
+            },
+        )
+
+        assertEquals(listOf("login_password", "api_token"), lookups)
+        assertTrue(handle.jsCalls.any { it.contains("el.value='line one\\nline\\'two'") })
+        assertTrue(handle.jsCalls.any { it.contains("window.apiToken='token line one\\ntoken\\'two'") })
+        assertEquals(RunStatus.SUCCESS, states["type"]?.status)
+        assertEquals(RunStatus.SUCCESS, states["inject"]?.status)
+        val reported = states.values.flatMap { it.logs } + states.values.mapNotNull { it.error }
+        assertFalse(reported.any { password in it || token in it })
+    }
+
+    @Test
+    fun `browser secret lookup errors do not expose provider failures`() {
+        val states = runGraph(
+            listOf(n("type", NodeType.TYPE, "selector" to "#password", "text" to "{{ \$secret.login_password }}")),
+            emptyList(),
+            secrets = SecretResolver { throw IllegalStateException("provider credential") },
+        )
+
+        assertEquals(RunStatus.ERROR, states["type"]?.status)
+        assertEquals("Secret 'login_password' was not found", states["type"]?.error)
+        assertFalse(states["type"]!!.error!!.contains("provider credential"))
     }
 
     @Test
