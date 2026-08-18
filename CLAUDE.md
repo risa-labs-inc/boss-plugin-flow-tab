@@ -236,6 +236,15 @@ must not discard hand-tuned positions automatically—and the canvas retains one
 snapshot for Undo. Controller-created nodes use the same geometry to choose the first
 collision-free authoring slot, so deleting a node cannot make its replacement stack on a survivor.
 
+### Browser waits and human sign-in
+
+Click, Type, and Extract expose `waitMs` while preserving the historical 20-second default for
+saved flows that omit it. Await Login is the explicit human-in-the-loop gate: it checks a
+configured signed-in marker immediately, then focuses the visible run browser and shows an
+indefinite host notification only when user action is actually needed. The notification is
+dismissed on success, timeout, or cancellation. Await Login defaults to five minutes and passes
+its input items through unchanged once the marker appears.
+
 ### Inject execution contract
 
 Inject optionally waits for `waitFor` using `waitForType` and `waitMs` before executing its raw

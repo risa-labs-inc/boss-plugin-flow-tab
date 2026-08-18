@@ -1,6 +1,8 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.BrowserIntegration
+import ai.rever.boss.plugin.api.NotificationDuration
+import ai.rever.boss.plugin.api.NotificationType
 import ai.rever.boss.plugin.api.PluginContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -122,6 +124,9 @@ class RunContext(
 
     fun requireSession(): BrowserIntegration =
         session ?: throw ExecError("No browser session — add an 'Open Browser' node upstream")
+
+    /** Bring the default visible browser tab forward; no-op for headless sessions. */
+    suspend fun focusSession(): Boolean = sessions.focus(defaultSessionId)
 
     /** Releases every session this run opened according to the registry's ownership policy. */
     suspend fun close() {
@@ -269,11 +274,58 @@ object NodeCatalog {
             NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
         }
 
+        NodeType.AWAIT_LOGIN -> NodeExecutor { ctx, cfg, inputs, log ->
+            val selector = cfg.str("selector").trim()
+            if (selector.isEmpty()) throw ExecError("Await Login needs a signed-in marker")
+            val selectorType = cfg.str("selectorType", "css")
+            val waitMs = cfg.int("waitMs", 300_000).coerceAtLeast(0)
+            val message = cfg.str(
+                "message",
+                "Sign in in the browser to continue this flow.",
+            ).ifBlank { "Sign in in the browser to continue this flow." }
+            val session = ctx.requireSession()
+
+            if (session.awaitElement(selectorType, selector, timeoutMs = 0)) {
+                log("Sign-in already detected")
+                return@NodeExecutor NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
+            }
+
+            // Focusing is helpful but not required for correctness: host tab state can
+            // change between opening and this gate, so a focus failure must not abort
+            // an otherwise recoverable sign-in wait.
+            runCatching { ctx.focusSession() }
+            log(message)
+            val notificationId = ctx.context.notificationProvider?.let { notifications ->
+                runCatching {
+                    notifications.showToast(
+                        message = message,
+                        type = NotificationType.INFO,
+                        duration = NotificationDuration.INDEFINITE,
+                        title = "Flow waiting for sign-in",
+                    )
+                }.getOrNull()
+            }
+            try {
+                if (!session.awaitElement(selectorType, selector, timeoutMs = waitMs)) {
+                    throw ExecError("Await Login: sign-in marker '$selector' not found within ${waitMs}ms")
+                }
+                log("Sign-in detected; continuing flow")
+            } finally {
+                notificationId?.let { id ->
+                    runCatching { ctx.context.notificationProvider?.dismiss(id) }
+                }
+            }
+            NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
+        }
+
         NodeType.CLICK -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
             val type = cfg.str("selectorType", "css")
+            val waitMs = cfg.int("waitMs", ELEMENT_WAIT_MS).coerceAtLeast(0)
             val session = ctx.requireSession()
-            if (!session.awaitElement(type, sel)) throw ExecError("Click: no element matched '$sel'")
+            if (!session.awaitElement(type, sel, timeoutMs = waitMs)) {
+                throw ExecError("Click: no element matched '$sel' within ${waitMs}ms")
+            }
             val ok = session.executeJavaScript(BrowserScripts.clickScript(type, sel)) == true
             if (!ok) throw ExecError("Click: no element matched '$sel'")
             log("Clicked '$sel'")
@@ -283,9 +335,12 @@ object NodeCatalog {
         NodeType.TYPE -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
             val type = cfg.str("selectorType", "css")
+            val waitMs = cfg.int("waitMs", ELEMENT_WAIT_MS).coerceAtLeast(0)
             val text = SecretTemplateResolver(ctx.secrets).resolve(cfg.raw("text"), cfg::interpolate)
             val session = ctx.requireSession()
-            if (!session.awaitElement(type, sel)) throw ExecError("Type: no element matched '$sel'")
+            if (!session.awaitElement(type, sel, timeoutMs = waitMs)) {
+                throw ExecError("Type: no element matched '$sel' within ${waitMs}ms")
+            }
             val ok = session.executeJavaScript(BrowserScripts.inputScript(type, sel, text)) == true
             if (!ok) throw ExecError("Type: no element matched '$sel'")
             log("Typed into '$sel'")
@@ -297,11 +352,12 @@ object NodeCatalog {
             val type = cfg.str("selectorType", "css")
             val multiple = cfg.bool("multiple")
             val optional = cfg.bool("optional")
+            val waitMs = cfg.int("waitMs", ELEMENT_WAIT_MS).coerceAtLeast(0)
             val field = cfg.str("field", "value").ifEmpty { "value" }
             val session = ctx.requireSession()
             // Best-effort wait so extraction doesn't race a still-loading page;
             // for `multiple` an empty result is still valid, so we proceed regardless.
-            session.awaitElement(type, sel)
+            session.awaitElement(type, sel, timeoutMs = waitMs)
             val script = BrowserScripts.extractScript(
                 selectorType = type,
                 selector = sel,

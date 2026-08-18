@@ -1,5 +1,8 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import ai.rever.boss.plugin.api.NotificationDuration
+import ai.rever.boss.plugin.api.NotificationProvider
+import ai.rever.boss.plugin.api.NotificationType
 import ai.rever.boss.plugin.api.PanelRegistry
 import ai.rever.boss.plugin.api.PluginContext
 import ai.rever.boss.plugin.api.TabRegistry
@@ -111,11 +114,46 @@ private class FakeService(private val handle: FakeHandle) : BrowserService {
     override fun getActiveBrowserCount() = 1
 }
 
-private class FakeContext(private val service: BrowserService?) : PluginContext {
+private class FakeNotifications : NotificationProvider {
+    data class Shown(
+        val message: String,
+        val type: NotificationType,
+        val duration: NotificationDuration,
+        val title: String?,
+    )
+
+    val shown = mutableListOf<Shown>()
+    val dismissed = mutableListOf<String>()
+
+    override fun showToast(
+        message: String,
+        type: NotificationType,
+        duration: NotificationDuration,
+        title: String?,
+        actionLabel: String?,
+        onAction: (() -> Unit)?,
+    ): String = "notification-${shown.size + 1}".also {
+        shown += Shown(message, type, duration, title)
+    }
+
+    override fun dismiss(notificationId: String) {
+        dismissed += notificationId
+    }
+
+    override fun dismissAll() {
+        dismissed += shown.indices.map { "notification-${it + 1}" }
+    }
+}
+
+private class FakeContext(
+    private val service: BrowserService?,
+    private val notifications: NotificationProvider? = null,
+) : PluginContext {
     override val panelRegistry = PanelRegistry()
     override val tabRegistry = TabRegistry()
     override val pluginScope = CoroutineScope(Dispatchers.Default)
     override val browserService: BrowserService? get() = service
+    override val notificationProvider: NotificationProvider? get() = notifications
 }
 
 // ---- helpers ---------------------------------------------------------------
@@ -136,10 +174,11 @@ private fun runGraph(
     service: BrowserService? = null,
     registry: NodeRegistry = builtinNodeRegistry(),
     secrets: SecretResolver = SecretResolver.constant(null),
+    notifications: NotificationProvider? = null,
 ): Map<String, NodeRun> {
     val states = ConcurrentHashMap<String, NodeRun>()
     runBlocking(Dispatchers.Default) {
-        FlowExecutor(FakeContext(service), registry, secrets).run(nodes, edges) { id, r -> states[id] = r }
+        FlowExecutor(FakeContext(service, notifications), registry, secrets).run(nodes, edges) { id, r -> states[id] = r }
     }
     return states
 }
@@ -282,6 +321,109 @@ class FlowExecutorTest {
         assertTrue(handle.navigated.contains("https://example.com/x")) // Navigate
         assertTrue(handle.jsCalls.any { it.contains("#go") })          // Click selector in JS
         assertEquals("Hello", states["ex"]!!.output.single().json.str("title")) // Extract returned data
+    }
+
+    @Test
+    fun `click uses its configured element wait timeout`() {
+        val handle = FakeHandle(responder = { false })
+        val states = runGraph(
+            listOf(
+                n("open", NodeType.OPEN_BROWSER),
+                n("click", NodeType.CLICK, "selector" to "#late", "waitMs" to "0"),
+            ),
+            listOf(e("open", "click")),
+            FakeService(handle),
+        )
+
+        assertEquals(RunStatus.ERROR, states["click"]?.status)
+        assertEquals("Click: no element matched '#late' within 0ms", states["click"]?.error)
+    }
+
+    @Test
+    fun `await login prompts once and resumes when the signed-in marker appears`() {
+        var markerPolls = 0
+        val handle = FakeHandle(responder = { script ->
+            if (script.contains("return !!")) ++markerPolls >= 3 else true
+        })
+        val notifications = FakeNotifications()
+        val states = runGraph(
+            listOf(
+                n("open", NodeType.OPEN_BROWSER),
+                n(
+                    "login",
+                    NodeType.AWAIT_LOGIN,
+                    "selector" to ".account-menu",
+                    "waitMs" to "1000",
+                    "message" to "Please finish SSO",
+                ),
+            ),
+            listOf(e("open", "login")),
+            service = FakeService(handle),
+            notifications = notifications,
+        )
+
+        assertEquals(RunStatus.SUCCESS, states["login"]?.status)
+        assertEquals(3, markerPolls)
+        assertEquals(
+            listOf(
+                FakeNotifications.Shown(
+                    "Please finish SSO",
+                    NotificationType.INFO,
+                    NotificationDuration.INDEFINITE,
+                    "Flow waiting for sign-in",
+                ),
+            ),
+            notifications.shown,
+        )
+        assertEquals(listOf("notification-1"), notifications.dismissed)
+        assertEquals(
+            listOf("Please finish SSO", "Sign-in detected; continuing flow"),
+            states["login"]?.logs,
+        )
+    }
+
+    @Test
+    fun `await login skips the prompt when the session is already signed in`() {
+        val notifications = FakeNotifications()
+        val states = runGraph(
+            listOf(
+                n("open", NodeType.OPEN_BROWSER),
+                n("login", NodeType.AWAIT_LOGIN, "selector" to ".account-menu"),
+            ),
+            listOf(e("open", "login")),
+            service = FakeService(FakeHandle(responder = { true })),
+            notifications = notifications,
+        )
+
+        assertEquals(RunStatus.SUCCESS, states["login"]?.status)
+        assertTrue(notifications.shown.isEmpty())
+        assertEquals(listOf("Sign-in already detected"), states["login"]?.logs)
+    }
+
+    @Test
+    fun `await login dismisses its prompt when the marker times out`() {
+        val notifications = FakeNotifications()
+        val states = runGraph(
+            listOf(
+                n("open", NodeType.OPEN_BROWSER),
+                n(
+                    "login",
+                    NodeType.AWAIT_LOGIN,
+                    "selector" to ".account-menu",
+                    "waitMs" to "0",
+                ),
+            ),
+            listOf(e("open", "login")),
+            service = FakeService(FakeHandle(responder = { false })),
+            notifications = notifications,
+        )
+
+        assertEquals(RunStatus.ERROR, states["login"]?.status)
+        assertEquals(
+            "Await Login: sign-in marker '.account-menu' not found within 0ms",
+            states["login"]?.error,
+        )
+        assertEquals(listOf("notification-1"), notifications.dismissed)
     }
 
     @Test

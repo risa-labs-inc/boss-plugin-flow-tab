@@ -99,4 +99,20 @@ class FlowNodeViewTest {
         )
         assertEquals(listOf("xpath", "5000ms wait"), nodeMetaChips(waiting))
     }
+
+    @Test
+    fun `await login card explains its marker and human wait`() {
+        val login = node(
+            NodeType.AWAIT_LOGIN,
+            "selectorType" to "xpath",
+            "selector" to "//button[@aria-label='Account']",
+            "waitMs" to "300000",
+        )
+
+        assertEquals(
+            "Waits for sign-in marker //button[@aria-label='Account']",
+            nodeSummary(login),
+        )
+        assertEquals(listOf("xpath", "300000ms wait"), nodeMetaChips(login))
+    }
 }

@@ -14,7 +14,7 @@ class BuiltinNodesTest {
     private val reg = builtinNodeRegistry()
 
     @Test
-    fun `registers exactly the 12 builtin kinds keyed by enum name in order`() {
+    fun `registers every builtin kind keyed by enum name in order`() {
         assertEquals(NodeType.entries.map { it.name }, reg.all().map { it.id })
     }
 
@@ -49,5 +49,21 @@ class BuiltinNodesTest {
             val s = reg[t.name]!!
             assertNotNull(s.executor, "${t.name} registry executor")
         }
+    }
+
+    @Test
+    fun `selector actions expose waits and await login defaults to five minutes`() {
+        listOf(NodeType.CLICK, NodeType.TYPE, NodeType.EXTRACT).forEach { type ->
+            val wait = reg[type.name]!!.configFields.single { it.key == "waitMs" }
+            assertEquals(FieldType.NUMBER, wait.type, type.name)
+            assertEquals("20000", wait.default, type.name)
+        }
+
+        val login = reg[NodeType.AWAIT_LOGIN.name]!!
+        assertEquals("300000", login.configFields.single { it.key == "waitMs" }.default)
+        assertEquals(
+            "Sign in in the browser to continue this flow.",
+            login.configFields.single { it.key == "message" }.default,
+        )
     }
 }

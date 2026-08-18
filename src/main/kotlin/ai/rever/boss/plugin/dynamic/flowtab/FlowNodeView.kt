@@ -27,6 +27,7 @@ import androidx.compose.material.Icon
 import androidx.compose.material.Text
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.CallSplit
+import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.automirrored.filled.MergeType
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.Build
@@ -86,6 +87,7 @@ fun iconForKind(kind: String): ImageVector = when (kind) {
     "TRIGGER" -> Icons.Filled.Bolt
     "OPEN_BROWSER" -> Icons.Filled.Public
     "NAVIGATE" -> Icons.Filled.Navigation
+    "AWAIT_LOGIN" -> Icons.AutoMirrored.Filled.Login
     "CLICK" -> Icons.Filled.TouchApp
     "TYPE" -> Icons.Filled.Keyboard
     "EXTRACT" -> Icons.Filled.Download
@@ -128,6 +130,7 @@ fun nodeSummary(node: FlowNode): String {
         "TRIGGER" -> "Starts this flow"
         "OPEN_BROWSER" -> withTarget("Opens", c("url"), "Opens a browser session")
         "NAVIGATE" -> withTarget("Navigates to", c("url"), "Navigates to a URL")
+        "AWAIT_LOGIN" -> withTarget("Waits for sign-in marker", c("selector"), "Waits for a human to sign in")
         "CLICK" -> withTarget("Clicks", c("selector"), "Clicks a page element")
         "TYPE" -> withTarget("Types into", c("selector"), "Types text into a page field")
         "EXTRACT" -> {
@@ -166,6 +169,10 @@ fun nodeMetaChips(node: FlowNode): List<String> {
     }
     return when (node.kind) {
         "OPEN_BROWSER" -> listOf(if (c("headless").equals("true", true)) "headless" else "visible")
+        "AWAIT_LOGIN" -> {
+            val waitMs = c("waitMs").toIntOrNull() ?: 300_000
+            listOf(c("selectorType").ifBlank { "css" }, "${waitMs.coerceAtLeast(0)}ms wait")
+        }
         "HTTP" -> buildList {
             add(c("method").ifBlank { "GET" }.uppercase())
             if ("\$secret." in c("headers") || "\$secret." in c("body") || "\$secret." in c("url")) add("uses secret")
