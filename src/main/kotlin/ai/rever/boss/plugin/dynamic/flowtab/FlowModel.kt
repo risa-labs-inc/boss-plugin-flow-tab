@@ -116,7 +116,8 @@ enum class NodeType(
             ConfigField("mode", "Extract", FieldType.SELECT, listOf("text", "html", "attr"), default = "text"),
             ConfigField("attr", "Attribute", FieldType.TEXT, placeholder = "href (when mode = attr)"),
             ConfigField("field", "Output field", FieldType.TEXT, default = "value"),
-            ConfigField("multiple", "All matches", FieldType.BOOL, default = "false")
+            ConfigField("multiple", "All matches", FieldType.BOOL, default = "false"),
+            ConfigField("optional", "Optional (emit null when no element matches)", FieldType.BOOL, default = "false")
         )
         INJECT -> listOf(
             ConfigField(

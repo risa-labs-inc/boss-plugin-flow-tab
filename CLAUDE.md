@@ -179,6 +179,14 @@ single-quoted JavaScript literals. `BrowserScripts` escapes quotes, backslashes,
 line terminator, and ASCII control characters before interpolation; keep all new browser-script
 string inputs on that shared escaping path.
 
+### Optional Extract fallback
+
+An Extract node normally fails when its selector matches no element. Enabling `optional` changes
+only that absence case: the node succeeds with one item whose configured output field is JSON
+`null`, including an empty `multiple` result. This preserves a data item so a following If node can
+route to a fallback branch. Selector syntax errors, browser failures, and other script errors still
+fail the node; optional extraction must not hide operational errors.
+
 ### Template expression resolution
 
 Flow templates are deterministic JSON paths, not JavaScript. They support `$json` and
