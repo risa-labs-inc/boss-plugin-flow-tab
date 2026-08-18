@@ -55,7 +55,7 @@ class AgentNodeTest {
     }
 
     @Test
-    fun `agent node runs the loop and emits its final text`() {
+    fun `agent node accepts the inspector's text encoded JSON allowlist`() {
         val source = RecordingSource(listOf("lookup"))
         val provider = FakeProvider.scripted(
             AssistantTurn(toolCalls = listOf(ToolCall("1", "lookup", "{}"))),
@@ -68,7 +68,7 @@ class AgentNodeTest {
         val cfg = buildJsonObject {
             put("system", "be helpful")
             put("input", "do the thing")
-            put(AgentNode.ALLOWLIST_KEY, buildJsonArray { add(kotlinx.serialization.json.JsonPrimitive("lookup")) })
+            put(AgentNode.ALLOWLIST_KEY, """["lookup"]""")
         }
         val states = runFlow(
             reg,
@@ -78,6 +78,111 @@ class AgentNodeTest {
         assertEquals(RunStatus.SUCCESS, states["a"]!!.status)
         assertEquals("final answer", states["a"]!!.output.single().json["text"]!!.jsonPrimitive.content)
         assertTrue(source.invoked.contains("lookup"))
+        assertTrue(states["a"]!!.logs.contains("agent tools resolved: 1 (lookup)"))
+    }
+
+    @Test
+    fun `agent node rejects malformed JSON allowlist before requesting the model`() {
+        val providerCalls = AtomicInteger()
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls.incrementAndGet()
+            AssistantTurn(text = "must not run")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(listOf("lookup")) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.ALLOWLIST_KEY, "[\"lookup\"")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertContains(state.error.orEmpty(), "toolAllowlist) must be a valid JSON array")
+        assertEquals(0, providerCalls.get())
+    }
+
+    @Test
+    fun `default text encoded empty JSON allowlist remains a valid tool-free agent`() {
+        var advertised = listOf("not observed")
+        val provider = FakeProvider { _, _, _, tools ->
+            advertised = tools.map { it.name }
+            AssistantTurn(text = "tool-free answer")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(listOf("lookup")) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.ALLOWLIST_KEY, "[]")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertTrue(advertised.isEmpty())
+        assertTrue(state.logs.contains("agent tools resolved: 0"))
+    }
+
+    @Test
+    fun `legacy comma and newline allowlist still resolves every named tool`() {
+        var advertised = emptySet<String>()
+        val provider = FakeProvider { _, _, _, tools ->
+            advertised = tools.map { it.name }.toSet()
+            AssistantTurn(text = "done")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(listOf("lookup", "other")) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.ALLOWLIST_KEY, "lookup,\n other")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals(setOf("lookup", "other"), advertised)
+    }
+
+    @Test
+    fun `unavailable allowlist entry becomes a plain node configuration error`() {
+        val providerCalls = AtomicInteger()
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls.incrementAndGet()
+            AssistantTurn(text = "must not run")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(listOf("lookup")) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.ALLOWLIST_KEY, """["missing"]""")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertEquals(
+            "Agent tool allowlist contains 1 unavailable entry: 'missing' " +
+                "(misspelled, not registered, or its tool source is unavailable)",
+            state.error,
+        )
+        assertEquals(0, providerCalls.get())
+        assertEquals("agent configuration failed", state.logs.last())
     }
 
     @Test
@@ -258,6 +363,60 @@ class AgentNodeTest {
         assertEquals(RunStatus.SUCCESS, notAllowlisted.status)
         assertEquals(1, providerCalls.get())
         assertTrue(source.invoked.isEmpty())
+    }
+
+    @Test
+    fun `redundant reserved output tool entry remains backward compatible`() {
+        val provider = FakeProvider { _, _, _, _ ->
+            AssistantTurn(toolCalls = listOf(ToolCall("out", AgentStructuredOutput.TOOL_NAME, """{"ok":true}""")))
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(AgentNode.OUTPUT_SCHEMA_KEY, """{"type":"object"}""")
+            put(
+                AgentNode.ALLOWLIST_KEY,
+                buildJsonArray { add(JsonPrimitive(AgentStructuredOutput.TOOL_NAME)) },
+            )
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertTrue(state.output.single().json.getValue("ok").jsonPrimitive.boolean)
+        assertTrue(state.logs.contains("agent tools resolved: 0; structured output enabled"))
+    }
+
+    @Test
+    fun `raw JSON array with a scoped kind id resolves end to end`() {
+        var advertised = emptyList<String>()
+        val provider = FakeProvider { _, _, _, tools ->
+            advertised = tools.map { it.ref.kindId }
+            AssistantTurn(text = "done")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(listOf("lookup")) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "go")
+            put(
+                AgentNode.ALLOWLIST_KEY,
+                buildJsonArray { add(JsonPrimitive("tool:boss:lookup")) },
+            )
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals(listOf("tool:boss:lookup"), advertised)
     }
 
     @Test
@@ -696,6 +855,7 @@ class AgentNodeTest {
         )
         assertEquals(
             listOf(
+                "agent tools resolved: 0",
                 "agent step 1: requesting model",
                 "agent stopped: FAILED (0 completed step(s), 0 attempted tool call(s))",
             ),

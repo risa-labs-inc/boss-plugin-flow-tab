@@ -92,6 +92,18 @@ details remain visible there even though they are not copied into progress logs.
 remains its own plain capacity error because no Agent run started. Runtime-owned terminal logging is
 intentional—the executor cannot reliably log after a thrown provider boundary.
 
+The Agent tool allowlist is static per node: it does not resolve `{{ }}` expressions. It accepts a
+JSON array entered in the inspector or raw flow JSON, legacy comma/newline-separated names, and
+stable scoped kind-ids such as `tool:boss:docker_ps`. Every non-empty entry must resolve against the
+tools available at run start. If any entry is misspelled, not registered yet, or temporarily absent
+because its external source is unavailable, the node fails before its first model request rather
+than letting the model answer without expected evidence. The startup log lists the resolved tool
+count and bounded names. An omitted allowlist, a blank value, or `[]` intentionally advertises no
+ordinary tools and remains valid for tool-free agents; structured output may still add its reserved
+submission tool. Explicitly listing that synthetic tool by name or `tool:flow:flow_submit_output` is
+accepted as a backward-compatible no-op; a real allowlisted tool that shadows the reserved name is
+still a configuration conflict.
+
 Agent structured output is optional and backward-compatible. A non-blank `outputSchema` must have
 root `"type": "object"`; Flow advertises a reserved `flow_submit_output` tool whose input schema
 is that exact contract and appends a system instruction requiring the model to call it alone for

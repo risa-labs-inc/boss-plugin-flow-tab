@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.PluginContext
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -41,7 +42,12 @@ object AgentNode {
         ConfigField(PROMPT_ID_KEY, "Prompt id (optional)", FieldType.TEXT, placeholder = "a saved prompt's id"),
         ConfigField(SYSTEM_KEY, "System prompt (inline)", FieldType.TEXTAREA, placeholder = "You are…"),
         ConfigField(INPUT_KEY, "Input", FieldType.TEXTAREA, placeholder = "task, or {{ \$json.text }}"),
-        ConfigField(ALLOWLIST_KEY, "Tool allowlist", FieldType.JSON, placeholder = """["tool_a","tool_b"]"""),
+        ConfigField(
+            ALLOWLIST_KEY,
+            "Tool allowlist",
+            FieldType.JSON,
+            placeholder = """["tool:boss:docker_ps"] or ["docker_ps"]""",
+        ),
         ConfigField(
             OUTPUT_SCHEMA_KEY,
             "Output JSON Schema (optional)",
@@ -233,13 +239,71 @@ class AgentNodeExecutor(
         return value
     }
 
-    /** Allowlist as a JSON array of names, or a comma/newline-separated string. */
-    private fun parseAllowlist(cfg: ConfigReader): Set<String> =
-        when (val el = cfg.element(AgentNode.ALLOWLIST_KEY)) {
-            is JsonArray -> el.mapNotNull { (it as? JsonPrimitive)?.content?.trim() }.filter { it.isNotEmpty() }.toSet()
-            is JsonPrimitive -> el.content.split(',', '\n').map { it.trim() }.filter { it.isNotEmpty() }.toSet()
-            else -> emptySet()
+    /**
+     * Allowlist as a JSON array of names/tool kind-ids, or a comma/newline-separated
+     * string. The inspector stores JSON editor content in a JsonPrimitive, while raw
+     * flow JSON may contain a real JsonArray, so both representations are intentional.
+     */
+    private fun parseAllowlist(cfg: ConfigReader): Set<String> {
+        val entries = when (val configured = cfg.element(AgentNode.ALLOWLIST_KEY)) {
+            null, JsonNull -> emptyList()
+            is JsonArray -> allowlistEntries(configured)
+            is JsonPrimitive -> {
+                if (!configured.isString) {
+                    throw ExecError(
+                        "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) must be a JSON array or comma-separated names",
+                    )
+                }
+                val raw = configured.content.trim()
+                when {
+                    raw.isEmpty() -> emptyList()
+                    raw.startsWith("[") || raw.startsWith("{") -> {
+                        val parsed = runCatching { ALLOWLIST_JSON.parseToJsonElement(raw) }.getOrElse { error ->
+                            throw ExecError(
+                                "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) must be a valid JSON array: " +
+                                    safeAllowlistError(error),
+                            )
+                        }
+                        val array = parsed as? JsonArray
+                            ?: throw ExecError(
+                                "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) must be a JSON array of strings",
+                            )
+                        allowlistEntries(array)
+                    }
+                    else -> raw.split(',', '\n').map(String::trim).filter(String::isNotEmpty)
+                }
+            }
+            else -> throw ExecError(
+                "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) must be a JSON array or comma-separated names",
+            )
         }
+        return entries.toCollection(LinkedHashSet())
+    }
+
+    private fun allowlistEntries(array: JsonArray): List<String> = array.mapIndexed { index, element ->
+        val primitive = element as? JsonPrimitive
+        if (primitive == null || !primitive.isString) {
+            throw ExecError(
+                "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) entry ${index + 1} must be a string",
+            )
+        }
+        primitive.content.trim().takeIf(String::isNotEmpty)
+            ?: throw ExecError(
+                "Agent tool allowlist (${AgentNode.ALLOWLIST_KEY}) entry ${index + 1} must not be blank",
+            )
+    }
+
+    /** Parser diagnostics may include source excerpts; keep node errors bounded and single-line. */
+    private fun safeAllowlistError(error: Throwable): String =
+        (error.message ?: "invalid JSON")
+            .take(MAX_ALLOWLIST_ERROR_DETAIL_CHARS)
+            .map { if (it.isISOControl()) ' ' else it }
+            .joinToString("")
+
+    private companion object {
+        const val MAX_ALLOWLIST_ERROR_DETAIL_CHARS = 240
+        val ALLOWLIST_JSON = Json { isLenient = false }
+    }
 }
 
 /**

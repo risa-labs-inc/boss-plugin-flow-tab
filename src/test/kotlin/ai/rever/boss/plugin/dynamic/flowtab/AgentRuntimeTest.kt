@@ -62,6 +62,7 @@ class AgentRuntimeTest {
         assertEquals("the answer is 42", result.finalText)
         assertEquals(1, result.toolCalls)
         assertTrue(source.invoked.contains("lookup"))
+        assertTrue("agent tools resolved: 1 (lookup)" in logs)
         assertTrue("agent tool 1 'lookup': succeeded" in logs)
         assertEquals(
             "agent stopped: COMPLETED (2 completed step(s), 1 attempted tool call(s))",
@@ -102,6 +103,7 @@ class AgentRuntimeTest {
         )
         assertEquals(
             listOf(
+                "agent tools resolved: 1 (lookup)",
                 "agent step 1: requesting model",
                 "agent tool 1 'lookup': started",
                 "agent tool 1 'lookup': failed",
@@ -151,8 +153,43 @@ class AgentRuntimeTest {
             seen = tools.map { it.name }
             AssistantTurn(text = "done")
         }
-        AgentRuntime(provider, source).run(system = "s", input = "go", allowlist = setOf("a", "c"))
+        AgentRuntime(provider, source).run(
+            system = "s",
+            input = "go",
+            allowlist = setOf("a", "tool:boss:c"),
+        )
         assertEquals(setOf("a", "c"), seen.toSet())
+    }
+
+    @Test
+    fun `unmatched allowlist entries remain exact and fail as configuration before the model`() = runBlocking {
+        val logs = mutableListOf<String>()
+        val providerCalls = AtomicInteger()
+        val provider = FakeProvider { _, _, _, _ ->
+            providerCalls.incrementAndGet()
+            AssistantTurn(text = "must not run")
+        }
+
+        val failure = runCatching {
+            AgentRuntime(provider, RecordingSource(listOf(desc("allowed"))))
+                .run(
+                    system = "s",
+                    input = "go",
+                    allowlist = setOf("allowed", "docker ps", "missing\nspoofed"),
+                    log = logs::add,
+                )
+        }.exceptionOrNull()
+
+        assertTrue(failure is AgentConfigurationError)
+        assertEquals(
+            "Agent tool allowlist contains 2 unavailable entries: 'docker ps', 'missing\\nspoofed' " +
+                "(misspelled, not registered, or its tool source is unavailable)",
+            failure.message,
+        )
+        assertEquals(0, providerCalls.get())
+        assertEquals("agent tools resolved: 1 (allowed)", logs.first())
+        assertTrue(logs.none { '\n' in it })
+        assertEquals("agent configuration failed", logs.last())
     }
 
     // ---- bounds -------------------------------------------------------------
@@ -346,6 +383,7 @@ class AgentRuntimeTest {
         )
         assertEquals(
             listOf(
+                "agent tools resolved: 0",
                 "agent step 1: requesting model",
                 "agent stopped: FAILED (0 completed step(s), 0 attempted tool call(s))",
             ),

@@ -99,6 +99,9 @@ class AgentRunFailure(
     cause,
 )
 
+/** A bad Agent setting discovered after the runtime enumerates its dynamic tool source. */
+class AgentConfigurationError(message: String) : ExecError(message)
+
 /**
  * A bounded, provider-agnostic tool-loop. Given a [provider] and a [source] of tools,
  * it drives: system prompt + transcript → model → execute the model's tool calls via
@@ -179,10 +182,11 @@ class AgentRuntime(
             logGate.close()
             log(message)
         }
-        fun wrappedFailure(cause: Throwable): AgentRunFailure {
+        fun wrappedFailure(cause: Throwable): Throwable {
             val snapshot = progress.get()
-            return if (cause is AgentRunFailure) cause else {
-                AgentRunFailure(snapshot.steps, snapshot.toolCalls, cause)
+            return when (cause) {
+                is AgentConfigurationError, is AgentRunFailure -> cause
+                else -> AgentRunFailure(snapshot.steps, snapshot.toolCalls, cause)
             }
         }
         val loopStarted = CompletableDeferred<Unit>()
@@ -273,15 +277,40 @@ class AgentRuntime(
     ): AgentResult {
         val started = System.currentTimeMillis()
         val available = source.list()
-        if (outputSchema != null && AgentStructuredOutput.TOOL_NAME in allowlist &&
-            available.any { it.ref.name == AgentStructuredOutput.TOOL_NAME }
-        ) {
-            throw ExecError(
-                "Agent output tool '${AgentStructuredOutput.TOOL_NAME}' conflicts with an allowlisted tool of the same name",
+        var effectiveAllowlist = allowlist
+        if (outputSchema != null) {
+            val reservedDescriptor = AgentStructuredOutput.descriptor(outputSchema)
+            val allowlistedRealReserved = available.any { descriptor ->
+                descriptor.ref.name == AgentStructuredOutput.TOOL_NAME &&
+                    (descriptor.ref.name in allowlist || descriptor.ref.kindId in allowlist)
+            }
+            if (allowlistedRealReserved) {
+                throw AgentConfigurationError(
+                    "Agent output tool '${AgentStructuredOutput.TOOL_NAME}' conflicts with an allowlisted tool of the same name",
+                )
+            }
+            // Older flows sometimes listed the synthetic submission tool explicitly.
+            // It is added below exactly once, so those redundant entries remain a no-op.
+            effectiveAllowlist = allowlist - AgentStructuredOutput.TOOL_NAME - reservedDescriptor.ref.kindId
+        }
+        val resolved = available.filter { descriptor ->
+            descriptor.ref.name in effectiveAllowlist || descriptor.ref.kindId in effectiveAllowlist
+        }
+        val matched = resolved.flatMapTo(HashSet()) { listOf(it.ref.name, it.ref.kindId) }
+        val unmatched = effectiveAllowlist.filterNot { entry ->
+            entry in matched
+        }
+        log(resolvedToolsLog(resolved, outputSchema != null))
+        if (unmatched.isNotEmpty()) {
+            throw AgentConfigurationError(
+                "Agent tool allowlist contains ${unmatched.size} unavailable " +
+                    "${if (unmatched.size == 1) "entry" else "entries"}: " +
+                    formatConfiguredEntries(unmatched) +
+                    " (misspelled, not registered, or its tool source is unavailable)",
             )
         }
         val allowed = buildList {
-            addAll(available.filter { it.ref.name in allowlist })
+            addAll(resolved)
             outputSchema?.let { add(AgentStructuredOutput.descriptor(it)) }
         }
         val allowedNames = allowed.map { it.ref.name }.toSet()
@@ -441,9 +470,44 @@ class AgentRuntime(
         "agent stopped: ${result.stopReason} " +
             "(${result.steps} completed step(s), ${result.toolCalls} attempted tool call(s))"
 
-    private fun failureLog(failure: AgentRunFailure): String =
-        "agent stopped: FAILED " +
-            "(${failure.steps} completed step(s), ${failure.toolCalls} attempted tool call(s))"
+    private fun failureLog(failure: Throwable): String = when (failure) {
+        is AgentConfigurationError -> "agent configuration failed"
+        is AgentRunFailure ->
+            "agent stopped: FAILED " +
+                "(${failure.steps} completed step(s), ${failure.toolCalls} attempted tool call(s))"
+        else -> "agent stopped: FAILED"
+    }
+
+    private fun resolvedToolsLog(resolved: List<ToolDescriptor>, structuredOutput: Boolean): String {
+        val tools = if (resolved.isEmpty()) "" else " (${formatToolNames(resolved.map { it.ref.name })})"
+        val structured = if (structuredOutput) "; structured output enabled" else ""
+        return "agent tools resolved: ${resolved.size}$tools$structured"
+    }
+
+    private fun formatToolNames(names: Collection<String>): String {
+        val shown = names.take(MAX_LOG_TOOL_LIST_ENTRIES).joinToString(", ") { safeToolName(it) }
+        return shown + if (names.size > MAX_LOG_TOOL_LIST_ENTRIES) ", …" else ""
+    }
+
+    /** Preserve config typos exactly enough to diagnose them while keeping one bounded line. */
+    private fun formatConfiguredEntries(names: Collection<String>): String =
+        names.take(MAX_LOG_TOOL_LIST_ENTRIES).joinToString(", ") { name ->
+            buildString {
+                append('\'')
+                for (char in name.take(MAX_LOG_TOOL_NAME_CHARS)) {
+                    when (char) {
+                        '\\' -> append("\\\\")
+                        '\'' -> append("\\'")
+                        '\n' -> append("\\n")
+                        '\r' -> append("\\r")
+                        '\t' -> append("\\t")
+                        else -> if (char.isISOControl()) append('_') else append(char)
+                    }
+                }
+                if (name.length > MAX_LOG_TOOL_NAME_CHARS) append('…')
+                append('\'')
+            }
+        } + if (names.size > MAX_LOG_TOOL_LIST_ENTRIES) ", … (${names.size} total)" else ""
 
     /** Model-supplied names must remain one bounded, trustworthy log-line token. */
     private fun safeToolName(name: String): String =
@@ -462,6 +526,7 @@ class AgentRuntime(
         const val ADMISSION_TIMEOUT_MS = 1_000L
         const val MIN_HARD_TIMEOUT_GRACE_MS = 500L
         const val MAX_LOG_TOOL_NAME_CHARS = 80
+        const val MAX_LOG_TOOL_LIST_ENTRIES = 12
         const val MAX_LOG_VALIDATION_REASON_CHARS = 240
         const val MAX_STRUCTURED_OUTPUT_FAILURES = 3
         val STRUCTURED_OUTPUT_FAILURE_MESSAGE =
