@@ -28,8 +28,8 @@ object AgentNode {
 
     const val ACCENT = 0xFF6D4AFF
 
-    /** Leaves one minute for the flow controller to persist and report a timed-out node. */
-    const val MAX_TIMEOUT_MS = 14 * 60 * 1_000L
+    /** Ensures no single Agent node can consume the whole flow-run watchdog. */
+    val MAX_TIMEOUT_MS: Long = MAX_ELEMENT_WAIT_MS.toLong()
 
     val CONFIG_FIELDS: List<ConfigField> = listOf(
         ConfigField(PROMPT_ID_KEY, "Prompt id (optional)", FieldType.TEXT, placeholder = "a saved prompt's id"),
@@ -45,17 +45,17 @@ object AgentNode {
         ),
         ConfigField(
             TEMPERATURE_KEY,
-            "Temperature (optional)",
+            "Temperature (optional; blank = provider setting)",
             FieldType.NUMBER,
-            placeholder = "blank = use provider setting; ranges vary by provider (for example 0.2)",
+            placeholder = "0–2; for example 0.2 or {{ \$json.temp }}",
         ),
         ConfigField(MAX_STEPS_KEY, "Max steps", FieldType.NUMBER, default = "8"),
         ConfigField(
             TIMEOUT_KEY,
-            "Timeout (ms)",
+            "Timeout (ms, max 840000)",
             FieldType.NUMBER,
             default = "120000",
-            placeholder = "blank = 120000; capped at 840000 (14 minutes)",
+            placeholder = "blank = 120000",
         ),
         ConfigField(
             MAX_TOKENS_KEY,
@@ -176,6 +176,7 @@ class AgentNodeExecutor(
             ?: throw ExecError("$label ($key) must be a finite number")
         if (!value.isFinite()) throw ExecError("$label ($key) must be a finite number")
         if (value < 0f) throw ExecError("$label ($key) must be zero or greater")
+        if (value > 2f) throw ExecError("$label ($key) must be 2 or less")
         return value
     }
 

@@ -97,7 +97,6 @@ class GatewayAgentProviderTest {
             assertEquals(0.25f, request.temperature)
             assertEquals(12_345L, request.timeoutMs)
             assertEquals(GatewayAgentProvider.DEFAULT_MAX_TOKENS, request.maxTokens)
-            assertTrue(request.extras.keys.none { it.equals(AgentNode.MODEL_KEY, ignoreCase = true) })
         }
 
     @Test

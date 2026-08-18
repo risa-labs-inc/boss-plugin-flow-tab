@@ -24,7 +24,10 @@ enum class RunMode {
  */
 enum class FieldType { TEXT, TEXTAREA, SELECT, BOOL, JSON, NUMBER, INFO }
 
-/** Declarative config-field schema — rendered by the inspector, read by executors. */
+/**
+ * Declarative config-field schema — rendered by the inspector, read by executors.
+ * [note] is body copy for [FieldType.INFO] only; editable field types use [placeholder].
+ */
 data class ConfigField(
     val key: String,
     val label: String,

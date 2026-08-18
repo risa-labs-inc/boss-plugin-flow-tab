@@ -89,7 +89,7 @@ internal class GatewayAgentProvider(
             pendingTurn = null
         }
 
-        val request =
+        val baseRequest =
             AiRequest(
                 system = system,
                 // Tool rounds travel structurally in `rounds`, not as transcript
@@ -99,9 +99,8 @@ internal class GatewayAgentProvider(
                 // temperature when that setting is also absent.
                 temperature = temperature,
                 maxTokens = maxTokens,
-            ).let { base ->
-                requestTimeoutMs?.let { base.copy(timeoutMs = it) } ?: base
-            }
+            )
+        val request = requestTimeoutMs?.let { baseRequest.copy(timeoutMs = it) } ?: baseRequest
 
         val turn =
             api

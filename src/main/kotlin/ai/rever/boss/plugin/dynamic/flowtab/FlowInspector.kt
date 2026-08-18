@@ -153,9 +153,8 @@ private fun ParametersTab(node: FlowNode) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         for (field in fields) {
             val info = field.note.trim()
-            if (field.type != FieldType.INFO || info.isNotEmpty()) {
-                FieldLabel(field.label)
-            }
+            if (field.type == FieldType.INFO && info.isEmpty()) continue
+            FieldLabel(field.label)
             when (field.type) {
                 FieldType.TEXT -> TextInput(configValue(node, field), placeholder = field.placeholder, singleLine = true) {
                     setConfig(node, field.key, it)
@@ -186,9 +185,7 @@ private fun ParametersTab(node: FlowNode) {
                 }
                 // Explanatory text only. Deliberately ignore node.config so a legacy
                 // stored value cannot masquerade as a live editable setting.
-                FieldType.INFO -> if (info.isNotEmpty()) {
-                    Text(info, color = Muted, fontSize = 12.sp)
-                }
+                FieldType.INFO -> Text(info, color = Muted, fontSize = 12.sp)
             }
         }
     }

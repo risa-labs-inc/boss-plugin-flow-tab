@@ -127,6 +127,8 @@ class AgentNodeTest {
         assertEquals(FieldType.INFO, modelField.type)
         assertTrue(modelField.note.contains("Settings"))
         assertTrue(modelField.note.contains("ignored"))
+        assertTrue(modelField.default.isEmpty())
+        assertTrue(modelField.placeholder.isEmpty())
 
         val snapshot = GraphSnapshot(
             nodes = listOf(NodeModel("a", AgentNode.KIND, "Agent", 0f, 0f, cfg)),
@@ -199,11 +201,14 @@ class AgentNodeTest {
 
         val nonFinite = stateFor("nan", "NaN")
         val negative = stateFor("negative", "-0.1")
+        val tooHigh = stateFor("high", "20")
 
         assertEquals(RunStatus.ERROR, nonFinite.status)
         assertEquals("Agent temperature (temperature) must be a finite number", nonFinite.error)
         assertEquals(RunStatus.ERROR, negative.status)
         assertEquals("Agent temperature (temperature) must be zero or greater", negative.error)
+        assertEquals(RunStatus.ERROR, tooHigh.status)
+        assertEquals("Agent temperature (temperature) must be 2 or less", tooHigh.error)
         assertEquals(0, providerCalls.get())
     }
 
