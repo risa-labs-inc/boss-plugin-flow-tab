@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.flowtab
 import ai.rever.boss.plugin.api.AiGatewayAPI
 import ai.rever.boss.plugin.api.PluginContext
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -25,6 +26,7 @@ object AgentNode {
     const val MAX_STEPS_KEY = "maxSteps"
     const val TIMEOUT_KEY = "timeoutMs"
     const val MAX_TOKENS_KEY = "maxTokens"
+    const val OUTPUT_SCHEMA_KEY = "outputSchema"
 
     const val ACCENT = 0xFF6D4AFF
 
@@ -39,6 +41,12 @@ object AgentNode {
         ConfigField(SYSTEM_KEY, "System prompt (inline)", FieldType.TEXTAREA, placeholder = "You are…"),
         ConfigField(INPUT_KEY, "Input", FieldType.TEXTAREA, placeholder = "task, or {{ \$json.text }}"),
         ConfigField(ALLOWLIST_KEY, "Tool allowlist", FieldType.JSON, placeholder = """["tool_a","tool_b"]"""),
+        ConfigField(
+            OUTPUT_SCHEMA_KEY,
+            "Output JSON Schema (optional)",
+            FieldType.JSON,
+            placeholder = """{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}""",
+        ),
         ConfigField(
             MODEL_KEY,
             "Model",
@@ -71,13 +79,15 @@ object AgentNode {
 
 /**
  * Parsed agent configuration for one run: the resolved [input], the tool [allowlist],
- * optional [temperature], the [budget], and the prompt source ([promptId] or inline [system]).
+ * optional [outputSchema] and [temperature], the [budget], and the prompt source
+ * ([promptId] or inline [system]).
  */
 data class AgentSettings(
     val promptId: String?,
     val system: String,
     val input: String,
     val allowlist: Set<String>,
+    val outputSchema: AgentOutputSchema?,
     val temperature: Float?,
     val budget: AgentBudget,
 )
@@ -109,15 +119,35 @@ class AgentNodeExecutor(
         val provider = providerFor(settings)
         val source = toolSourceFor(ctx)
         val result = AgentRuntime(provider, source, settings.budget)
-            .run(system = system, input = settings.input, allowlist = settings.allowlist, log = log)
+            .run(
+                system = system,
+                input = settings.input,
+                allowlist = settings.allowlist,
+                outputSchema = settings.outputSchema,
+                log = log,
+            )
         if (result.stopReason == StopReason.TIMEOUT) {
             if (result.finalText.isNotBlank()) {
                 log("agent partial text withheld (${result.finalText.length} chars)")
             }
             throw ExecError(
                 "Agent stopped: TIMEOUT after ${result.steps} completed step(s), " +
-                    "${result.toolCalls} attempted tool call(s); timeout was ${settings.budget.timeoutMs}ms",
+                    "${result.toolCalls} attempted tool call(s); timeout was ${settings.budget.timeoutMs}ms" +
+                    if (settings.outputSchema == null) "" else "; no valid structured output was produced",
             )
+        }
+        if (settings.outputSchema != null) {
+            val structured = result.structuredOutput
+            if (structured == null) {
+                if (result.finalText.isNotBlank()) {
+                    log("agent non-structured final text withheld (${result.finalText.length} chars)")
+                }
+                throw ExecError(
+                    "Agent stopped: ${result.stopReason} after ${result.steps} completed step(s), " +
+                        "${result.toolCalls} attempted tool call(s); no valid structured output was produced",
+                )
+            }
+            return NodeOutput.single(listOf(Item(structured)))
         }
         return NodeOutput.single(listOf(
             Item(buildJsonObject {
@@ -148,6 +178,7 @@ class AgentNodeExecutor(
             system = cfg.str(AgentNode.SYSTEM_KEY),
             input = input,
             allowlist = parseAllowlist(cfg),
+            outputSchema = parseOutputSchema(cfg),
             temperature = cfg.optionalFiniteFloat(AgentNode.TEMPERATURE_KEY, "Agent temperature"),
             budget = AgentBudget(
                 maxSteps = maxSteps,
@@ -155,6 +186,16 @@ class AgentNodeExecutor(
                 maxTokens = maxTokens,
             ),
         )
+    }
+
+    private fun parseOutputSchema(cfg: ConfigReader): AgentOutputSchema? {
+        val configured = cfg.element(AgentNode.OUTPUT_SCHEMA_KEY) ?: return null
+        val raw = when (configured) {
+            is JsonPrimitive -> configured.content
+            is JsonObject -> configured.toString()
+            else -> throw ExecError("Agent output schema (outputSchema) must be a JSON object")
+        }.trim()
+        return raw.takeIf { it.isNotEmpty() }?.let(AgentStructuredOutput::parse)
     }
 
     private fun ConfigReader.positiveLong(key: String, default: Long, label: String): Long {

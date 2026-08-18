@@ -12,6 +12,7 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -80,6 +81,7 @@ data class AgentResult(
     val steps: Int,
     val toolCalls: Int,
     val usage: TokenUsage = TokenUsage(),
+    val structuredOutput: JsonObject? = null,
 )
 
 /**
@@ -151,6 +153,7 @@ class AgentRuntime(
         system: String,
         input: String,
         allowlist: Set<String>,
+        outputSchema: AgentOutputSchema? = null,
         log: (String) -> Unit = {},
     ): AgentResult {
         val timeoutMs = budget.timeoutMs.coerceAtLeast(0)
@@ -185,7 +188,7 @@ class AgentRuntime(
         val loopStarted = CompletableDeferred<Unit>()
         val execution = executionScope.async {
             loopStarted.complete(Unit)
-            runLoop(system, input, allowlist, progress, logGate::write)
+            runLoop(system, input, allowlist, outputSchema, progress, logGate::write)
                 .also { successfulCompletion.set(it) }
         }
         execution.invokeOnCompletion { cause ->
@@ -264,12 +267,31 @@ class AgentRuntime(
         system: String,
         input: String,
         allowlist: Set<String>,
+        outputSchema: AgentOutputSchema?,
         progress: AtomicReference<Progress>,
         log: (String) -> Unit,
     ): AgentResult {
         val started = System.currentTimeMillis()
-        val allowed = source.list().filter { it.ref.name in allowlist }
+        val available = source.list()
+        if (outputSchema != null && AgentStructuredOutput.TOOL_NAME in allowlist &&
+            available.any { it.ref.name == AgentStructuredOutput.TOOL_NAME }
+        ) {
+            throw ExecError(
+                "Agent output tool '${AgentStructuredOutput.TOOL_NAME}' conflicts with an allowlisted tool of the same name",
+            )
+        }
+        val allowed = buildList {
+            addAll(available.filter { it.ref.name in allowlist })
+            outputSchema?.let { add(AgentStructuredOutput.descriptor(it)) }
+        }
         val allowedNames = allowed.map { it.ref.name }.toSet()
+        val effectiveSystem = if (outputSchema == null) {
+            system
+        } else {
+            listOf(system.trim(), AgentStructuredOutput.SYSTEM_INSTRUCTION)
+                .filter { it.isNotEmpty() }
+                .joinToString("\n\n")
+        }
 
         val messages = mutableListOf<AgentMessage>(UserMsg(input))
         var steps = 0
@@ -287,13 +309,68 @@ class AgentRuntime(
             val stepRemaining = budget.timeoutMs - (System.currentTimeMillis() - started)
             if (stepRemaining <= 0) return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
             log("agent step ${steps + 1}: requesting model")
-            val turn = withTimeoutOrNull(stepRemaining) { provider.step(system, messages.toList(), allowed) }
+            val turn = withTimeoutOrNull(stepRemaining) { provider.step(effectiveSystem, messages.toList(), allowed) }
                 ?: return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
             steps++
             turn.usage?.let { usage += it }
             turn.text?.let { lastText = it }
             progress.set(Progress(lastText, steps, toolCalls, usage))
             messages.add(AssistantMsg(turn.text, turn.toolCalls))
+
+            if (outputSchema != null) {
+                val submissions = turn.toolCalls.filter { it.name == AgentStructuredOutput.TOOL_NAME }
+                if (submissions.isNotEmpty()) {
+                    val rejectedAsMixed = turn.toolCalls.size != 1 || submissions.size != 1
+                    val outcomes = turn.toolCalls.map { call ->
+                        toolCalls++
+                        progress.set(Progress(lastText, steps, toolCalls, usage))
+                        if (call.name == AgentStructuredOutput.TOOL_NAME && !rejectedAsMixed) {
+                            val parsed = AgentStructuredOutput.parseSubmission(call.argsJson, outputSchema)
+                            val value = parsed.getOrNull()
+                            if (value != null) {
+                                log("agent structured output submission: accepted")
+                                return done(
+                                    text = "",
+                                    reason = StopReason.COMPLETED,
+                                    steps = steps,
+                                    toolCalls = toolCalls,
+                                    usage = usage,
+                                    structuredOutput = value,
+                                )
+                            }
+                            log("agent structured output submission: rejected")
+                            ToolOutcome(
+                                call.id,
+                                call.name,
+                                parsed.exceptionOrNull()?.message ?: "the structured output is invalid",
+                                isError = true,
+                            )
+                        } else {
+                            val prefix = "agent tool $toolCalls '${safeToolName(call.name)}'"
+                            log("$prefix: blocked (structured output must be submitted alone)")
+                            ToolOutcome(
+                                call.id,
+                                call.name,
+                                "flow_submit_output must be the only tool call in its turn",
+                                isError = true,
+                            )
+                        }
+                    }
+                    messages.add(ToolResultsMsg(outcomes))
+                    if (usage.total >= budget.maxTokens) {
+                        return done(lastText, StopReason.TOKEN_BUDGET, steps, toolCalls, usage)
+                    }
+                    continue
+                }
+                if (turn.toolCalls.isEmpty()) {
+                    log("agent structured output submission: missing")
+                    messages.add(UserMsg(AgentStructuredOutput.MISSING_SUBMISSION_MESSAGE))
+                    if (usage.total >= budget.maxTokens) {
+                        return done(lastText, StopReason.TOKEN_BUDGET, steps, toolCalls, usage)
+                    }
+                    continue
+                }
+            }
 
             if (turn.toolCalls.isEmpty()) {
                 return done(lastText, StopReason.COMPLETED, steps, toolCalls, usage)
@@ -326,8 +403,14 @@ class AgentRuntime(
         }
     }
 
-    private fun done(text: String, reason: StopReason, steps: Int, toolCalls: Int, usage: TokenUsage) =
-        AgentResult(text, reason, steps, toolCalls, usage)
+    private fun done(
+        text: String,
+        reason: StopReason,
+        steps: Int,
+        toolCalls: Int,
+        usage: TokenUsage,
+        structuredOutput: JsonObject? = null,
+    ) = AgentResult(text, reason, steps, toolCalls, usage, structuredOutput)
 
     private fun stopLog(result: AgentResult): String =
         "agent stopped: ${result.stopReason} " +

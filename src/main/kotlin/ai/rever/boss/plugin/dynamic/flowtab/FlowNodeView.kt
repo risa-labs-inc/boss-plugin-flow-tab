@@ -152,7 +152,11 @@ fun nodeSummary(node: FlowNode): String {
         "CODE" -> "Transforms each input item"
         "IF" -> withTarget("Branches when", c("condition"), "Routes items by a condition")
         "MERGE" -> "Combines both input branches"
-        AgentNode.KIND -> "Runs an AI agent with approved tools"
+        AgentNode.KIND -> if (c(AgentNode.OUTPUT_SCHEMA_KEY).isBlank()) {
+            "Runs an AI agent with approved tools"
+        } else {
+            "Runs an AI agent and returns structured data"
+        }
         LanagerNode.KIND -> withTarget("Runs sub-flow", c(LanagerNode.FLOW_ID_KEY), "Runs another flow")
         else -> node.spec.description.ifBlank { "Runs ${node.spec.label}" }
     }

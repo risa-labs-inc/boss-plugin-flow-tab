@@ -10,8 +10,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.concurrent.ConcurrentHashMap
@@ -74,6 +76,185 @@ class AgentNodeTest {
         assertEquals(RunStatus.SUCCESS, states["a"]!!.status)
         assertEquals("final answer", states["a"]!!.output.single().json["text"]!!.jsonPrimitive.content)
         assertTrue(source.invoked.contains("lookup"))
+    }
+
+    @Test
+    fun `structured mode advertises the schema tool and emits only its validated object`() {
+        val source = RecordingSource(listOf("lookup"))
+        var seenSystem = ""
+        var seenTools = emptyList<ToolDescriptor>()
+        val provider = FakeProvider { _, system, _, tools ->
+            seenSystem = system
+            seenTools = tools
+            AssistantTurn(
+                text = "this text must not become output",
+                toolCalls = listOf(
+                    ToolCall("out-1", AgentStructuredOutput.TOOL_NAME, """{"selector":"#main","found":true}"""),
+                ),
+            )
+        }
+        val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val schema =
+            """{"type":"object","properties":{"selector":{"type":"string"},"found":{"type":"boolean"}},"required":["selector","found"],"additionalProperties":false}"""
+        val cfg = buildJsonObject {
+            put(AgentNode.SYSTEM_KEY, "Use the page evidence.")
+            put(AgentNode.INPUT_KEY, "locate the section")
+            put(AgentNode.OUTPUT_SCHEMA_KEY, schema)
+            put(AgentNode.ALLOWLIST_KEY, buildJsonArray { add(JsonPrimitive("lookup")) })
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        val output = state.output.single().json
+        assertEquals("#main", output.getValue("selector").jsonPrimitive.content)
+        assertTrue(output.getValue("found").jsonPrimitive.boolean)
+        assertEquals(setOf("selector", "found"), output.keys)
+        assertTrue(AgentStructuredOutput.SYSTEM_INSTRUCTION in seenSystem)
+        assertEquals(schema, seenTools.single { it.name == AgentStructuredOutput.TOOL_NAME }.inputSchema)
+        assertTrue(source.invoked.isEmpty())
+        assertTrue(state.logs.contains("agent structured output submission: accepted"))
+        assertFalse(state.logs.joinToString("\n").contains("#main"))
+        assertFalse(state.logs.joinToString("\n").contains("this text must not become output"))
+    }
+
+    @Test
+    fun `invalid structured submission is returned to the model for a corrected retry`() {
+        var sawValidationFeedback = false
+        val provider = FakeProvider { step, _, messages, _ ->
+            if (step == 0) {
+                AssistantTurn(
+                    toolCalls = listOf(
+                        ToolCall("bad", AgentStructuredOutput.TOOL_NAME, """{"count":"secret-invalid-value"}"""),
+                    ),
+                )
+            } else {
+                val feedback = (messages.last() as ToolResultsMsg).outcomes.single()
+                sawValidationFeedback = feedback.isError && feedback.content == "$.count must be integer"
+                AssistantTurn(
+                    toolCalls = listOf(ToolCall("good", AgentStructuredOutput.TOOL_NAME, """{"count":2}""")),
+                )
+            }
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "count")
+            put(
+                AgentNode.OUTPUT_SCHEMA_KEY,
+                """{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]}""",
+            )
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals("2", state.output.single().json.getValue("count").jsonPrimitive.content)
+        assertTrue(sawValidationFeedback)
+        assertTrue(state.logs.contains("agent structured output submission: rejected"))
+        assertTrue(state.logs.contains("agent structured output submission: accepted"))
+        assertFalse(state.logs.joinToString("\n").contains("secret-invalid-value"))
+    }
+
+    @Test
+    fun `structured submission mixed with another tool is rejected without side effects`() {
+        val source = RecordingSource(listOf("write"))
+        var sawBothErrors = false
+        val provider = FakeProvider { step, _, messages, _ ->
+            if (step == 0) {
+                AssistantTurn(
+                    toolCalls = listOf(
+                        ToolCall("out", AgentStructuredOutput.TOOL_NAME, """{"ok":true}"""),
+                        ToolCall("write", "write", """{"secret":"must-not-run"}"""),
+                    ),
+                )
+            } else {
+                val feedback = (messages.last() as ToolResultsMsg).outcomes
+                sawBothErrors = feedback.size == 2 && feedback.all { it.isError }
+                AssistantTurn(
+                    toolCalls = listOf(ToolCall("corrected", AgentStructuredOutput.TOOL_NAME, """{"ok":true}""")),
+                )
+            }
+        }
+        val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "finish")
+            put(AgentNode.OUTPUT_SCHEMA_KEY, """{"type":"object","properties":{"ok":{"type":"boolean"}}}""")
+            put(AgentNode.ALLOWLIST_KEY, buildJsonArray { add(JsonPrimitive("write")) })
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertTrue(sawBothErrors)
+        assertTrue(source.invoked.isEmpty())
+        assertFalse(state.logs.joinToString("\n").contains("must-not-run"))
+    }
+
+    @Test
+    fun `plain text is retried and fails closed when the step budget ends`() {
+        var sawCorrection = false
+        val provider = FakeProvider { _, _, messages, _ ->
+            sawCorrection = messages.any {
+                it is UserMsg && it.text == AgentStructuredOutput.MISSING_SUBMISSION_MESSAGE
+            }
+            AssistantTurn(text = "secret prose instead of json")
+        }
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = { provider },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.INPUT_KEY, "answer")
+            put(AgentNode.MAX_STEPS_KEY, "2")
+            put(AgentNode.OUTPUT_SCHEMA_KEY, """{"type":"object","properties":{"answer":{"type":"string"}}}""")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertEquals(
+            "Agent stopped: MAX_STEPS after 2 completed step(s), 0 attempted tool call(s); " +
+                "no valid structured output was produced",
+            state.error,
+        )
+        assertTrue(sawCorrection)
+        assertTrue(state.output.isEmpty())
+        assertTrue(state.logs.contains("agent non-structured final text withheld (28 chars)"))
+        assertFalse(state.logs.joinToString("\n").contains("secret prose instead of json"))
+    }
+
+    @Test
+    fun `invalid output schema fails before provider work starts`() {
+        val providerCalls = AtomicInteger()
+        val spec = agentNodeSpec(
+            prompts = null,
+            providerFor = {
+                FakeProvider { _, _, _, _ ->
+                    providerCalls.incrementAndGet()
+                    AssistantTurn(text = "should not run")
+                }
+            },
+            toolSourceFor = { RecordingSource(emptyList()) },
+        )
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.OUTPUT_SCHEMA_KEY, """{"type":"array"}""")
+        }
+
+        val state = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList()).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertEquals("Agent output schema (outputSchema) must describe an object", state.error)
+        assertEquals(0, providerCalls.get())
     }
 
     @Test
