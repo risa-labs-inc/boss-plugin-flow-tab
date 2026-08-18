@@ -995,14 +995,23 @@ class FlowControllerTest {
 
     /** Minimal fake registry exposing one boss tool so syncBossTools has something to sync. */
     private class FakeBossRegistry(name: String) : McpToolRegistry {
-        private val _tools = MutableStateFlow(
-            listOf(RegisteredMcpTool("prov", McpToolDefinition(name, "d", """{"type":"object"}""", true) { McpToolResult("ok", false) }))
-        )
+        private val _tools = MutableStateFlow(listOf(registeredTool(name)))
         override val tools: StateFlow<List<RegisteredMcpTool>> get() = _tools
         override val allTools: StateFlow<List<RegisteredMcpTool>> get() = _tools
         override val disabledToolNames: StateFlow<Set<String>> = MutableStateFlow(emptySet())
         override fun setToolEnabled(toolName: String, enabled: Boolean) {}
         override suspend fun invoke(toolName: String, arguments: String): McpToolResult = McpToolResult("ok", false)
+
+        fun replaceWith(name: String) {
+            _tools.value = listOf(registeredTool(name))
+        }
+
+        companion object {
+            private fun registeredTool(name: String) = RegisteredMcpTool(
+                "prov",
+                McpToolDefinition(name, "d", """{"type":"object"}""", true) { McpToolResult("ok", false) },
+            )
+        }
     }
 
     private fun contextWithBossTool(storage: PluginStorageProvider, tool: String): PluginContext = object : PluginContext {
@@ -1027,5 +1036,45 @@ class FlowControllerTest {
         val spec = controller.registry.resolve("tool:boss:demo")
         assertTrue(!spec.isUnavailable, "boss tool kind must be registered on the headless registry")
         assertNotNull(spec.executor, "boss tool node must be runnable via flow_run")
+    }
+
+    @Test
+    fun `headless tool sync survives sandbox scope replacement and stops on dispose`() = runBlocking {
+        val storage = DesktopStorage()
+        val bossRegistry = FakeBossRegistry("before-restart")
+        var sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val ctx = object : PluginContext {
+            override val panelRegistry = PanelRegistry()
+            override val tabRegistry = TabRegistry()
+            override val pluginScope: CoroutineScope get() = sandboxScope
+            override val mcpToolRegistry: McpToolRegistry = bossRegistry
+            override val pluginStorageFactory = object : PluginStorageFactory {
+                override fun createStorage(pluginId: String): PluginStorageProvider = storage
+            }
+        }
+        val controller = buildHeadlessController(ctx, PromptRegistry(storage), external = null)
+
+        try {
+            withTimeout(2_000) {
+                while (controller.registry.resolve("tool:boss:before-restart").isUnavailable) delay(10)
+            }
+
+            sandboxScope.cancel()
+            sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            bossRegistry.replaceWith("after-restart")
+
+            withTimeout(2_000) {
+                while (controller.registry.resolve("tool:boss:after-restart").isUnavailable) delay(10)
+            }
+            assertTrue(controller.registry.resolve("tool:boss:before-restart").isUnavailable)
+
+            controller.dispose()
+            bossRegistry.replaceWith("after-dispose")
+            delay(100)
+            assertTrue(controller.registry.resolve("tool:boss:after-dispose").isUnavailable)
+        } finally {
+            controller.dispose()
+            sandboxScope.cancel()
+        }
     }
 }

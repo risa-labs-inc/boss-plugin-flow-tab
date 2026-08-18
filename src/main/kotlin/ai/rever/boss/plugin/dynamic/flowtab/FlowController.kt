@@ -81,9 +81,19 @@ class FlowController(
     private val executions = ConcurrentHashMap<String, Job>()
     private val runStates = ConcurrentHashMap<String, ConcurrentHashMap<String, NodeRun>>()
     private val persistMutex = Mutex()
-    /** Independent from pluginScope so it can observe that scope being replaced, but
-     * still explicitly owned by this controller and cancelled from [dispose]. */
-    private val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    /** Independent from pluginScope so controller-owned work survives a sandbox watchdog
+     * replacing that scope. Everything launched here is cancelled from [dispose]. */
+    private val lifecycleScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /**
+     * Keep the headless registry synchronized for this controller's whole lifetime.
+     * These collectors deliberately do not belong to [scopeProvider]: that scope may be
+     * replaced by the host while the controller and its registry remain registered.
+     */
+    internal fun startToolRegistrySync(external: ExternalMcpManager?) {
+        syncBossTools(context, registry, lifecycleScope)
+        external?.let { syncExternalMcpTools(it, registry, lifecycleScope) }
+    }
 
     // ---- authoring (storage-seated) -----------------------------------------
 
@@ -405,7 +415,7 @@ class FlowController(
                     }
                     // Serialize storage writes through persistRun so a delayed live
                     // snapshot can never overwrite a terminal watchdog verdict.
-                    monitorScope.launch { jobs[runId]?.let { persistRun(it) } }
+                    lifecycleScope.launch { jobs[runId]?.let { persistRun(it) } }
                 }
                 val firstError = states.values.firstOrNull { it.status == RunStatus.ERROR }
                 RunJob(
@@ -433,7 +443,7 @@ class FlowController(
 
         // This monitor is deliberately not a child of execution. join() is cancellable,
         // so its timeout fires even if execution is stuck in a non-suspending host call.
-        monitorScope.launch {
+        lifecycleScope.launch {
             val completed = withTimeoutOrNull(runTimeoutMs) {
                 execution.join()
                 true
@@ -474,10 +484,10 @@ class FlowController(
         return stopped
     }
 
-    /** Release independent run monitors when the owning tab/plugin is destroyed. */
+    /** Release controller-owned registry sync and run monitors on tab/plugin teardown. */
     fun dispose() {
         executions.values.forEach { it.cancel(CancellationException("Flow controller disposed")) }
-        monitorScope.cancel()
+        lifecycleScope.cancel()
     }
 
     private fun publishTerminalIfRunning(runId: String, candidate: RunJob): RunJob =
@@ -665,19 +675,17 @@ fun buildHeadlessController(
     external: ExternalMcpManager?,
     scope: CoroutineScope? = null,
 ): FlowController {
-    val initialScope = scope ?: context.pluginScope
     val scopeProvider: () -> CoroutineScope = { scope ?: context.pluginScope }
     val controller = FlowController(
         context = context,
         scopeProvider = scopeProvider,
     )
-    // Host tools -> tool:boss:* kinds (the fix): reactively synced onto this registry.
-    syncBossTools(context, controller.registry, initialScope)
+    // Host and external tools are synchronized on the controller-owned lifecycle. The
+    // host can replace pluginScope after a watchdog restart without freezing this registry.
+    controller.startToolRegistrySync(external)
     // Make agent + lanager kinds runnable in headless (MCP-driven) runs too, sharing
     // the controller's registry so a lanager's sub-run resolves the same kinds.
     controller.registry.register(defaultAgentNodeSpec(context, prompts, external))
     controller.registry.register(lanagerNodeSpec(controller))
-    // Surface external MCP tools (flag-gated inside) as tool:ext:<server>/* kinds.
-    external?.let { syncExternalMcpTools(it, controller.registry, initialScope) }
     return controller
 }
