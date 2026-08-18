@@ -146,6 +146,11 @@ and/or merges config keys, and `flow_delete_node` removes the node plus incident
 autosave, so an agent can repair a graph without rebuilding it or having a live canvas overwrite
 the repair. `flow_stop` cancels an in-memory `flow_run`; for compatibility its terminal state is
 `FAILED` with an explicit `Flow run stopped by caller` error, and repeated stops are idempotent.
+Browser-session cleanup is ownership-aware. Interactive canvas runs leave their last visible tab
+open for inspection and close it when the UI admits the next run. Controller/MCP `flow_run` calls
+have no UI owner, so `FlowExecutor` marks their `SessionRegistry` as owning visible tabs and closes
+every visible session during terminal/cancellation cleanup. Keep that distinction explicit when
+adding another headless run entrypoint; otherwise each invocation leaks a Fluck tab.
 `flow_result` returns status, errors, and bounded logs by default, with node outputs omitted so
 large HTML/SVG values cannot exhaust the MCP response path. A caller may pass `nodeId` together
 with `includeOutput: true` to fetch that node's recursively bounded output; explicit response flags

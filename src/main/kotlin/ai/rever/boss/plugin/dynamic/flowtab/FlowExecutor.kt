@@ -65,6 +65,9 @@ class FlowExecutor(
         edges: List<EdgeModel>,
         humanize: Boolean = false,
         onVisibleTab: (String?) -> Unit = {},
+        /** Close visible tabs during cleanup for MCP/headless runs. Interactive canvas
+         * runs leave this false so their last browser tab remains inspectable. */
+        closeVisibleTabsOnClose: Boolean = false,
         /** Nesting level of this run (0 top-level); a lanager sub-run passes parent+1. */
         depth: Int = 0,
         /** Flow ids already on the call stack, so a nested lanager can detect cycles. */
@@ -87,6 +90,7 @@ class FlowExecutor(
             context,
             secrets = secrets,
             onVisibleTab = onVisibleTab,
+            closeVisibleTabsOnClose = closeVisibleTabsOnClose,
             depth = depth,
             ancestry = ancestry,
         )
