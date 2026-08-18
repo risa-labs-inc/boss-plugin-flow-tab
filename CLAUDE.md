@@ -140,6 +140,12 @@ matching open tab first. The launcher uses the same controller and storage names
 contracts, lets users rename readable flows, and asks for confirmation before deletion. An open
 flow shows its current name in the canvas toolbar with an edit action; that path persists the live
 snapshot immediately, so even a brand-new tab can be named before its debounced autosave runs.
+MCP authoring is mutable: `flow_rename` changes flow metadata, `flow_update_node` patches a title
+and/or merges config keys, and `flow_delete_node` removes the node plus incident edges while
+`flow_delete_edge` removes one connection. These operations use the same coordinator as open-tab
+autosave, so an agent can repair a graph without rebuilding it or having a live canvas overwrite
+the repair. `flow_stop` cancels an in-memory `flow_run`; for compatibility its terminal state is
+`FAILED` with an explicit `Flow run stopped by caller` error, and repeated stops are idempotent.
 `flow_result` returns status, errors, and bounded logs by default, with node outputs omitted so
 large HTML/SVG values cannot exhaust the MCP response path. A caller may pass `nodeId` together
 with `includeOutput: true` to fetch that node's recursively bounded output; explicit response flags

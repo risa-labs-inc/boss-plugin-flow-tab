@@ -4,6 +4,7 @@ import ai.rever.boss.plugin.api.PluginContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
@@ -77,6 +78,8 @@ class FlowController(
         context.pluginStorageFactory?.createStorage(STORAGE_NAMESPACE)
     }.getOrNull()
     private val jobs = ConcurrentHashMap<String, RunJob>()
+    private val executions = ConcurrentHashMap<String, Job>()
+    private val runStates = ConcurrentHashMap<String, ConcurrentHashMap<String, NodeRun>>()
     private val persistMutex = Mutex()
     /** Independent from pluginScope so it can observe that scope being replaced, but
      * still explicitly owned by this controller and cancelled from [dispose]. */
@@ -150,6 +153,80 @@ class FlowController(
             writeUnlocked(tabId, updated)
             FlowPersistenceCoordinator.publishGraphUpdate(tabId, updated)
             edgeId
+        }
+    }
+
+    /**
+     * Patch a node's title and/or config without changing its kind or position. Config
+     * keys are merged over the existing config so an MCP caller can correct one field
+     * without first reproducing every default and secret-backed field.
+     */
+    suspend fun updateNode(
+        tabId: String,
+        nodeId: String,
+        title: String? = null,
+        configPatch: JsonObject? = null,
+    ): NodeModel {
+        require(title != null || configPatch != null) { "provide 'title' and/or 'config'" }
+        val normalizedTitle = title?.trim()?.also {
+            require(it.isNotEmpty()) { "Node title cannot be blank" }
+            require(it.length <= MAX_NODE_TITLE_LENGTH) {
+                "Node title cannot exceed $MAX_NODE_TITLE_LENGTH characters"
+            }
+        }
+        return FlowPersistenceCoordinator.withFlowLock(tabId) {
+            val snap = FlowPersistenceCoordinator.latestLiveSnapshot(tabId)
+                ?: getFlow(tabId)
+                ?: throw IllegalArgumentException("No flow '$tabId'")
+            val index = snap.nodes.indexOfFirst { it.id == nodeId }
+            require(index >= 0) { "unknown node '$nodeId'" }
+            if (normalizedTitle != null) {
+                require(snap.nodes.none { it.id != nodeId && it.title == normalizedTitle }) {
+                    "node title '$normalizedTitle' is already in use"
+                }
+            }
+            val current = snap.nodes[index]
+            val updatedNode = current.copy(
+                title = normalizedTitle ?: current.title,
+                config = configPatch?.let { JsonObject(current.config + it) } ?: current.config,
+            )
+            val updatedNodes = snap.nodes.toMutableList().also { it[index] = updatedNode }
+            val updated = snap.copy(nodes = updatedNodes)
+            writeUnlocked(tabId, updated)
+            FlowPersistenceCoordinator.publishGraphUpdate(tabId, updated)
+            updatedNode
+        }
+    }
+
+    /** Delete a node and all of its incident edges, returning the number of removed edges. */
+    suspend fun deleteNode(tabId: String, nodeId: String): Int {
+        return FlowPersistenceCoordinator.withFlowLock(tabId) {
+            val snap = FlowPersistenceCoordinator.latestLiveSnapshot(tabId)
+                ?: getFlow(tabId)
+                ?: throw IllegalArgumentException("No flow '$tabId'")
+            require(snap.nodes.any { it.id == nodeId }) { "unknown node '$nodeId'" }
+            val keptEdges = snap.edges.filterNot { it.fromNode == nodeId || it.toNode == nodeId }
+            val removedEdgeCount = snap.edges.size - keptEdges.size
+            val updated = snap.copy(
+                nodes = snap.nodes.filterNot { it.id == nodeId },
+                edges = keptEdges,
+            )
+            writeUnlocked(tabId, updated)
+            FlowPersistenceCoordinator.publishGraphUpdate(tabId, updated)
+            removedEdgeCount
+        }
+    }
+
+    /** Delete one edge by id. */
+    suspend fun deleteEdge(tabId: String, edgeId: String) {
+        FlowPersistenceCoordinator.withFlowLock(tabId) {
+            val snap = FlowPersistenceCoordinator.latestLiveSnapshot(tabId)
+                ?: getFlow(tabId)
+                ?: throw IllegalArgumentException("No flow '$tabId'")
+            require(snap.edges.any { it.id == edgeId }) { "unknown edge '$edgeId'" }
+            val updated = snap.copy(edges = snap.edges.filterNot { it.id == edgeId })
+            writeUnlocked(tabId, updated)
+            FlowPersistenceCoordinator.publishGraphUpdate(tabId, updated)
         }
     }
 
@@ -290,6 +367,7 @@ class FlowController(
         val runId = "run-${UUID.randomUUID()}"
         jobs[runId] = RunJob(runId, tabId, RunJobState.RUNNING)
         val states = ConcurrentHashMap<String, NodeRun>()
+        runStates[runId] = states
         val execution = scopeProvider().launch(Dispatchers.Default) {
             // Persist RUNNING before executing so a reload can still diagnose an in-flight run.
             persistRun(jobs[runId] ?: RunJob(runId, tabId, RunJobState.RUNNING))
@@ -333,6 +411,11 @@ class FlowController(
             val published = publishTerminalIfRunning(runId, candidate)
             persistRun(published)
         }
+        executions[runId] = execution
+        execution.invokeOnCompletion {
+            executions.remove(runId, execution)
+            runStates.remove(runId, states)
+        }
 
         // This monitor is deliberately not a child of execution. join() is cancellable,
         // so its timeout fires even if execution is stuck in a non-suspending host call.
@@ -359,8 +442,27 @@ class FlowController(
         return runId
     }
 
+    /**
+     * Stop an actively executing in-memory run. Stopped runs use the existing FAILED
+     * terminal state so older callers remain compatible, with an explicit caller-stop
+     * error distinguishing cancellation from execution failure.
+     *
+     * Returns the terminal job, or null when the run is unknown or already terminal.
+     */
+    suspend fun stopRun(runId: String): RunJob? {
+        val execution = executions[runId] ?: return null
+        val states = runStates[runId] ?: return null
+        val current = jobs[runId] ?: return null
+        val message = "Flow run stopped by caller"
+        val stopped = transitionToFailed(runId, current.tabId, states, message) ?: return null
+        persistRun(stopped)
+        execution.cancel(CancellationException(message))
+        return stopped
+    }
+
     /** Release independent run monitors when the owning tab/plugin is destroyed. */
     fun dispose() {
+        executions.values.forEach { it.cancel(CancellationException("Flow controller disposed")) }
         monitorScope.cancel()
     }
 
@@ -525,6 +627,7 @@ class FlowController(
 
     companion object {
         private const val MAX_KINDS_IN_ERROR = 30
+        const val MAX_NODE_TITLE_LENGTH = 100
         const val MAX_FLOW_NAME_LENGTH = 100
         const val STORAGE_NAMESPACE = "ai.rever.boss.plugin.dynamic.flowtab"
         const val GRAPH_PREFIX = "graph:"

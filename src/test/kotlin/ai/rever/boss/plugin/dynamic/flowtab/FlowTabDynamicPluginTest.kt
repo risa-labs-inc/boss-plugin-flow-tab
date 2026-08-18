@@ -74,7 +74,8 @@ class FlowTabDynamicPluginTest {
         assertNotNull(provider, "register() must register a FlowMcpToolProvider")
         assertEquals(
             setOf(
-                "flow_create", "flow_add_node", "flow_connect", "flow_run",
+                "flow_create", "flow_rename", "flow_add_node", "flow_update_node",
+                "flow_connect", "flow_delete_node", "flow_delete_edge", "flow_run", "flow_stop",
                 "flow_status", "flow_result", "flow_list", "flow_get", "flow_delete",
                 "prompt_upsert", "prompt_get", "prompt_list",
             ),

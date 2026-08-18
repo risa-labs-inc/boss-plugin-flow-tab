@@ -189,6 +189,53 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `updateNode merges config and preserves kind position and untouched fields`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+        val nodeId = fc.addNode(
+            tabId,
+            "HTTP",
+            buildJsonObject {
+                put("method", "POST")
+                put("url", "https://old.example")
+            },
+        )
+        val before = fc.getFlow(tabId)!!.nodes.single()
+
+        val updated = fc.updateNode(
+            tabId,
+            nodeId,
+            title = "Fetch claims",
+            configPatch = buildJsonObject { put("url", "https://new.example") },
+        )
+
+        assertEquals("Fetch claims", updated.title)
+        assertEquals("HTTP", updated.type)
+        assertEquals(before.x, updated.x)
+        assertEquals(before.y, updated.y)
+        assertEquals("POST", updated.config.getValue("method").jsonPrimitive.content)
+        assertEquals("https://new.example", updated.config.getValue("url").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `deleteNode removes incident edges and deleteEdge removes only its connection`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+        val trigger = fc.addNode(tabId, "TRIGGER")
+        val first = fc.addNode(tabId, "SET")
+        val second = fc.addNode(tabId, "SET")
+        val firstEdge = fc.connect(tabId, trigger, 0, first, 0)
+        fc.connect(tabId, trigger, 0, second, 0)
+
+        fc.deleteEdge(tabId, firstEdge)
+        assertEquals(1, fc.getFlow(tabId)!!.edges.size)
+        assertEquals(1, fc.deleteNode(tabId, second))
+        val final = fc.getFlow(tabId)!!
+        assertEquals(setOf(trigger, first), final.nodes.map { it.id }.toSet())
+        assertTrue(final.edges.isEmpty())
+    }
+
+    @Test
     fun `listFlows returns every stored flow id`() = runBlocking {
         val fc = controller()
         val a = fc.createFlow()

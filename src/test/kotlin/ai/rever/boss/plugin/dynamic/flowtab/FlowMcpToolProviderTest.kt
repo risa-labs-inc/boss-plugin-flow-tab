@@ -12,6 +12,8 @@ import ai.rever.boss.plugin.api.TabRegistry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.emptyFlow
@@ -98,7 +100,8 @@ class FlowMcpToolProviderTest {
         val names = provider().tools().map { it.name }
         assertEquals(
             setOf(
-                "flow_create", "flow_add_node", "flow_connect", "flow_run",
+                "flow_create", "flow_rename", "flow_add_node", "flow_update_node",
+                "flow_connect", "flow_delete_node", "flow_delete_edge", "flow_run", "flow_stop",
                 "flow_status", "flow_result", "flow_list", "flow_get", "flow_delete",
                 "prompt_upsert", "prompt_get", "prompt_list",
             ),
@@ -141,6 +144,56 @@ class FlowMcpToolProviderTest {
         assertEquals("Router", detail.getValue("name").jsonPrimitive.content)
         assertEquals(2, detail.getValue("nodeCount").jsonPrimitive.content.toInt())
         assertEquals("true", detail.getValue("readable").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `rename update and delete tools repair an authored flow in place`() = runBlocking {
+        val p = provider()
+        val tabId = obj(call(p, "flow_create", """{"name":"Draft"}"""))
+            .getValue("tabId").jsonPrimitive.content
+        val trigger = obj(call(p, "flow_add_node", """{"tabId":"$tabId","kind":"TRIGGER"}"""))
+            .getValue("nodeId").jsonPrimitive.content
+        val set = obj(call(p, "flow_add_node",
+            """{"tabId":"$tabId","kind":"SET","config":{"assignments":"{}"}}"""))
+            .getValue("nodeId").jsonPrimitive.content
+        val edgeId = obj(call(p, "flow_connect",
+            """{"tabId":"$tabId","from":"$trigger","to":"$set"}"""))
+            .getValue("edgeId").jsonPrimitive.content
+
+        assertFalse(call(p, "flow_rename", """{"tabId":"$tabId","name":"Production"}""").isError)
+        assertFalse(call(p, "flow_update_node",
+            """{"tabId":"$tabId","nodeId":"$set","title":"Prepare data","config":{"assignments":"{\"ready\":true}"}}"""
+        ).isError)
+        assertFalse(call(p, "flow_delete_edge", """{"tabId":"$tabId","edgeId":"$edgeId"}""").isError)
+
+        val repaired = obj(call(p, "flow_get", """{"tabId":"$tabId"}"""))
+        assertEquals("Production", repaired.getValue("metadata").jsonObject.getValue("name").jsonPrimitive.content)
+        val updatedNode = repaired.getValue("nodes").jsonArray.map { it.jsonObject }
+            .single { it.getValue("id").jsonPrimitive.content == set }
+        assertEquals("Prepare data", updatedNode.getValue("title").jsonPrimitive.content)
+        assertEquals(
+            "{\"ready\":true}",
+            updatedNode.getValue("config").jsonObject.getValue("assignments").jsonPrimitive.content,
+        )
+        assertTrue(repaired.getValue("edges").jsonArray.isEmpty())
+
+        call(p, "flow_connect", """{"tabId":"$tabId","from":"$trigger","to":"$set"}""")
+        val deleted = obj(call(p, "flow_delete_node", """{"tabId":"$tabId","nodeId":"$set"}"""))
+        assertEquals("1", deleted.getValue("deletedEdgeCount").jsonPrimitive.content)
+        val afterDelete = obj(call(p, "flow_get", """{"tabId":"$tabId"}"""))
+        assertEquals(1, afterDelete.getValue("nodes").jsonArray.size)
+        assertTrue(afterDelete.getValue("edges").jsonArray.isEmpty())
+    }
+
+    @Test
+    fun `mutation tools reject missing targets and empty updates`() = runBlocking {
+        val p = provider()
+        val tabId = obj(call(p, "flow_create")).getValue("tabId").jsonPrimitive.content
+
+        assertTrue(call(p, "flow_update_node", """{"tabId":"$tabId","nodeId":"missing"}""").isError)
+        assertTrue(call(p, "flow_delete_node", """{"tabId":"$tabId","nodeId":"missing"}""").isError)
+        assertTrue(call(p, "flow_delete_edge", """{"tabId":"$tabId","edgeId":"missing"}""").isError)
+        assertTrue(call(p, "flow_rename", """{"tabId":"$tabId","name":"  "}""").isError)
     }
 
     @Test
@@ -194,6 +247,42 @@ class FlowMcpToolProviderTest {
         val result = obj(call(p, "flow_result", """{"runId":"$runId"}"""))
         assertTrue(result.getValue("nodes").jsonObject.containsKey(set))
         assertEquals("false", result.getValue("outputIncluded").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `flow_stop cancels an active run and is idempotent once terminal`() = runBlocking {
+        val started = CompletableDeferred<Unit>()
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "BLOCKING",
+                    label = "Blocking",
+                    inputs = 0,
+                    outputs = 0,
+                    accent = 0,
+                    description = "test only",
+                    executor = NodeExecutor { _, _, _, _ ->
+                        started.complete(Unit)
+                        awaitCancellation()
+                    },
+                )
+            )
+        }
+        val p = provider(registry = registry)
+        val tabId = obj(call(p, "flow_create")).getValue("tabId").jsonPrimitive.content
+        call(p, "flow_add_node", """{"tabId":"$tabId","kind":"BLOCKING"}""")
+        val runId = obj(call(p, "flow_run", """{"tabId":"$tabId"}"""))
+            .getValue("runId").jsonPrimitive.content
+        withTimeout(5_000) { started.await() }
+
+        val stopped = obj(call(p, "flow_stop", """{"runId":"$runId"}"""))
+        assertEquals("true", stopped.getValue("stopped").jsonPrimitive.content)
+        assertEquals("FAILED", stopped.getValue("state").jsonPrimitive.content)
+        assertContains(stopped.getValue("error").jsonPrimitive.content, "stopped by caller")
+
+        val repeated = obj(call(p, "flow_stop", """{"runId":"$runId"}"""))
+        assertEquals("false", repeated.getValue("stopped").jsonPrimitive.content)
+        assertEquals("FAILED", repeated.getValue("state").jsonPrimitive.content)
     }
 
     @Test
