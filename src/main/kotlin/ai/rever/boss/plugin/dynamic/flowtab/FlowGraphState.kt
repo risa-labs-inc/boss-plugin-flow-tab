@@ -143,6 +143,10 @@ class FlowGraphState(
     /** Transient neutral status message (e.g. import results). */
     var notice by mutableStateOf<String?>(null)
 
+    /** One-step safety net for the last explicit Tidy layout action. */
+    private var preTidyPositions by mutableStateOf<Map<String, Offset>?>(null)
+    val canUndoTidyLayout: Boolean get() = preTidyPositions != null
+
     fun clearRun() {
         runStates.clear()
         runError = null
@@ -209,6 +213,46 @@ class FlowGraphState(
         val centerWorld = Offset((minX + maxX) / 2f, (minY + maxY) / 2f)
         val viewportCenter = Offset(viewport.width / 2f, viewport.height / 2f)
         panOffset = viewportCenter - centerWorld * newScale
+    }
+
+    /**
+     * Reposition every node from dependency depth. Returns false when no position
+     * changed. The previous coordinates are retained for one explicit undo.
+     */
+    fun tidyLayout(): Boolean {
+        val positions = layeredNodeLayout(
+            nodes = nodes.map { LayoutNode(it.id, nodeHeight(it.spec), it.x, it.y) },
+            edges = edges,
+        )
+        val changed = nodes.any { node ->
+            val next = positions[node.id]
+            next != null && (next.x != node.x || next.y != node.y)
+        }
+        if (!changed) return false
+
+        preTidyPositions = nodes.associate { it.id to Offset(it.x, it.y) }
+        nodes.forEach { node ->
+            positions[node.id]?.let { position ->
+                node.x = position.x
+                node.y = position.y
+            }
+        }
+        return true
+    }
+
+    /** Restore the coordinates captured immediately before the last tidy action. */
+    fun undoTidyLayout(): Boolean {
+        val positions = preTidyPositions ?: return false
+        var changed = false
+        nodes.forEach { node ->
+            positions[node.id]?.let { position ->
+                if (node.x != position.x || node.y != position.y) changed = true
+                node.x = position.x
+                node.y = position.y
+            }
+        }
+        preTidyPositions = null
+        return changed
     }
 
     // ---- mutations ----------------------------------------------------------
@@ -374,6 +418,7 @@ class FlowGraphState(
         idCounter = max(snapshot.nextId, maxExisting + 1)
         selection = null
         pendingConnection = null
+        preTidyPositions = null
         return true
     }
 

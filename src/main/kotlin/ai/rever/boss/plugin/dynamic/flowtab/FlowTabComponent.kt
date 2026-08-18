@@ -31,7 +31,9 @@ import androidx.compose.material.Text
 import androidx.compose.material.TextButton
 import androidx.compose.material.TextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileOpen
@@ -621,6 +623,22 @@ class FlowTabComponent(
                 onTemplates = { showGallery = true },
                 onZoomIn = { state.zoomBy(1.2f, viewCenterScreen()) },
                 onZoomOut = { state.zoomBy(1f / 1.2f, viewCenterScreen()) },
+                tidyEnabled = state.nodes.size > 1,
+                onTidy = {
+                    if (state.tidyLayout()) {
+                        state.fitToContent(viewportSize)
+                        state.notice = "Tidy layout applied"
+                    } else {
+                        state.notice = "Layout is already tidy"
+                    }
+                },
+                undoTidyEnabled = state.canUndoTidyLayout,
+                onUndoTidy = {
+                    if (state.undoTidyLayout()) {
+                        state.fitToContent(viewportSize)
+                        state.notice = "Restored the previous layout"
+                    }
+                },
                 onFit = { state.fitToContent(viewportSize) },
                 onReset = { state.resetView() },
                 onClear = { confirmClear = true },
@@ -790,6 +808,10 @@ private fun Toolbar(
     onTemplates: () -> Unit,
     onZoomIn: () -> Unit,
     onZoomOut: () -> Unit,
+    tidyEnabled: Boolean,
+    onTidy: () -> Unit,
+    undoTidyEnabled: Boolean,
+    onUndoTidy: () -> Unit,
     onFit: () -> Unit,
     onReset: () -> Unit,
     onClear: () -> Unit,
@@ -934,6 +956,8 @@ private fun Toolbar(
             modifier = Modifier.width(48.dp),
         )
         ToolbarButton(Icons.Filled.ZoomIn, "Zoom in", onZoomIn)
+        ToolbarButton(Icons.Filled.AutoFixHigh, "Tidy layout", onTidy, enabled = tidyEnabled)
+        ToolbarButton(Icons.AutoMirrored.Filled.Undo, "Undo tidy layout", onUndoTidy, enabled = undoTidyEnabled)
         ToolbarButton(Icons.Filled.FitScreen, "Fit to content", onFit)
         ToolbarButton(Icons.Filled.RestartAlt, "Reset view", onReset)
         ToolbarButton(Icons.Filled.DeleteOutline, "Clear canvas", onClear)

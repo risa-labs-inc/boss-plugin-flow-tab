@@ -112,13 +112,23 @@ class FlowController(
             val spec = requireNotNull(registry[kind]) { unknownKindMessage(kind) }
             val nodeId = "n${snap.nextId}"
             val title = uniqueTitle(spec.label, snap.nodes.map { it.title }.toSet())
-            val idx = snap.nodes.size
+            val position = collisionFreeNodePosition(
+                existing = snap.nodes.map { existing ->
+                    LayoutNode(
+                        id = existing.id,
+                        height = nodeHeight(registry.resolve(existing.type)),
+                        x = existing.x,
+                        y = existing.y,
+                    )
+                },
+                newNodeHeight = nodeHeight(spec),
+            )
             val node = NodeModel(
                 id = nodeId,
                 type = spec.id,
                 title = title,
-                x = 320f + idx * (nodeOuterWidth() + 120f),
-                y = 200f,
+                x = position.x,
+                y = position.y,
                 config = JsonObject(spec.defaultConfig + config),
             )
             val updated = snap.copy(nodes = snap.nodes + node, nextId = snap.nextId + 1)
