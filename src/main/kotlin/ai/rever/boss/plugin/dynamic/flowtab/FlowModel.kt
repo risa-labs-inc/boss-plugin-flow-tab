@@ -166,12 +166,12 @@ enum class NodeType(
 // ---------------------------------------------------------------------------
 
 /** Visual width of the node card (excluding the left/right port margins). */
-const val NODE_WIDTH = 240f
+const val NODE_WIDTH = 272f
 const val PORT_RADIUS = 6f
 const val NODE_CORNER = 14f
 
-/** Base card height — icon tile + title/subtitle — used when a side has ≤1 port. */
-const val NODE_ROW_H = 74f
+/** Base card height — type eyebrow + title/action summary — used when a side has ≤1 port. */
+const val NODE_ROW_H = 86f
 
 /** Extra height for the metadata chip row, added only to types that show it. */
 const val NODE_META_H = 22f
