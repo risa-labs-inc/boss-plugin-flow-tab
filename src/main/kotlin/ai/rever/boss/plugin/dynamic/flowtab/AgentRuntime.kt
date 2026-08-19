@@ -487,10 +487,10 @@ class AgentRuntime(
                     }
                     if (submissionIsAlone) {
                         structuredFailures++
-                        pendingModelLimit()?.let { reason -> return stoppedAt(reason) }
                         if (structuredFailures >= MAX_STRUCTURED_OUTPUT_FAILURES) {
                             throw ExecError(STRUCTURED_OUTPUT_FAILURE_MESSAGE)
                         }
+                        pendingModelLimit()?.let { reason -> return stoppedAt(reason) }
                     }
                     messages.add(ToolResultsMsg(outcomes))
                     continue

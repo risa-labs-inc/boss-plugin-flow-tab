@@ -13,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -320,6 +321,73 @@ class AgentRuntimeTest {
         assertEquals(1, result.steps)
         assertEquals(0, result.toolCalls)
         assertTrue(source.invoked.isEmpty())
+    }
+
+    @Test
+    fun `mixed structured and generic calls are skipped at step and token limits`() = runBlocking {
+        val schema = AgentStructuredOutput.parse(
+            """{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}""",
+        )
+        val cases = listOf(
+            Triple(AgentBudget(maxSteps = 1), null, StopReason.MAX_STEPS),
+            Triple(
+                AgentBudget(maxSteps = 10, maxTokens = 1),
+                TokenUsage(input = 1, output = 1),
+                StopReason.TOKEN_BUDGET,
+            ),
+        )
+
+        for ((budget, usage, expectedReason) in cases) {
+            val source = RecordingSource(listOf(desc("write")))
+            val provider = FakeProvider.scripted(
+                AssistantTurn(
+                    toolCalls = listOf(
+                        call("write"),
+                        ToolCall("submit", AgentStructuredOutput.TOOL_NAME, """{"ok":true}"""),
+                    ),
+                    usage = usage,
+                ),
+            )
+
+            val result = AgentRuntime(provider, source, budget).run(
+                system = "s",
+                input = "go",
+                allowlist = setOf("write"),
+                outputSchema = schema,
+            )
+
+            assertEquals(expectedReason, result.stopReason)
+            assertEquals(0, result.toolCalls)
+            assertTrue(source.invoked.isEmpty())
+        }
+    }
+
+    @Test
+    fun `invalid sole structured submission cap wins over step and token limits`() = runBlocking {
+        val schema = AgentStructuredOutput.parse(
+            """{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]}""",
+        )
+        val provider = FakeProvider { _, _, _, _ ->
+            AssistantTurn(
+                toolCalls = listOf(
+                    ToolCall("submit", AgentStructuredOutput.TOOL_NAME, """{"count":"wrong"}"""),
+                ),
+                usage = TokenUsage(input = 1),
+            )
+        }
+
+        val failure = runCatching {
+            AgentRuntime(
+                provider,
+                RecordingSource(emptyList()),
+                AgentBudget(maxSteps = 3, maxTokens = 3),
+            ).run(system = "s", input = "go", allowlist = emptySet(), outputSchema = schema)
+        }.exceptionOrNull()
+
+        assertTrue(failure is AgentRunFailure)
+        assertContains(failure.message.orEmpty(), "Agent did not produce valid structured output after 3 attempts")
+        assertEquals(3, failure.steps)
+        assertEquals(3, failure.toolCalls)
     }
 
     @Test

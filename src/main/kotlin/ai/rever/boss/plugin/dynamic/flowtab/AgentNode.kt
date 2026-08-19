@@ -192,6 +192,8 @@ class AgentNodeExecutor(
         log: (String) -> Unit,
     ): NodeOutput {
         if (settings.outputSchema != null) {
+            // Defensive internal invariant: structured runtime completion must always
+            // carry the locally validated object accepted by flow_submit_output.
             val structured = result.structuredOutput
             if (structured == null) {
                 if (result.finalText.isNotBlank()) {
