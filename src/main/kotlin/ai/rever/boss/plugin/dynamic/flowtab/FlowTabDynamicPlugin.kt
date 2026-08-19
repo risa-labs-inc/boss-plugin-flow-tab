@@ -88,10 +88,8 @@ class FlowTabDynamicPlugin : DynamicPlugin {
     }
 
     override fun dispose() {
-        // Unregister tab type + panel when the plugin is unloaded.
-        pluginContext?.tabRegistry?.unregisterTabType(FlowTabType.typeId)
-        pluginContext?.panelRegistry?.unregisterPanel(FlowLauncherInfo.id)
-        runCatching { pluginContext?.unregisterMcpToolProvider(FlowMcpToolProvider.PROVIDER_ID) }
+        // Release plugin-owned work before calling host unregister hooks: a throwing host
+        // callback must not leave registry collectors, child processes, or the classloader alive.
         headlessController?.dispose()
         headlessController = null
         // Reap any external MCP child processes / sockets (red-team F9), bounded so a
@@ -100,6 +98,10 @@ class FlowTabDynamicPlugin : DynamicPlugin {
             runCatching { runBlocking { withTimeoutOrNull(5_000) { mgr.disposeAll() } } }
         }
         externalMcp = null
+        // Unregister host surfaces independently so one faulty callback cannot skip the rest.
+        runCatching { pluginContext?.tabRegistry?.unregisterTabType(FlowTabType.typeId) }
+        runCatching { pluginContext?.panelRegistry?.unregisterPanel(FlowLauncherInfo.id) }
+        runCatching { pluginContext?.unregisterMcpToolProvider(FlowMcpToolProvider.PROVIDER_ID) }
         pluginContext = null
     }
 }
