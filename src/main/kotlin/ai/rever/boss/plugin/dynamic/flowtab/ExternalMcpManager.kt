@@ -181,7 +181,16 @@ class ExternalMcpManager(
             }
         } finally {
             stopAcceptanceAndDrain()
-            managerJob.cancel()
+            // A forced cancellation can race a successful connect being published to
+            // [open]. Reap anything the synchronous cancelNow snapshot did not observe
+            // before allowing this worker (and its plugin classloader) to terminate.
+            try {
+                closeDetachedLives(detachOpenLives())
+            } catch (fatal: Error) {
+                logActorFailure("forced cleanup failed", fatal)
+            } finally {
+                managerJob.cancel()
+            }
         }
     }
 
@@ -274,8 +283,14 @@ class ExternalMcpManager(
      */
     fun cancelNow() {
         stopAcceptanceAndDrain()
+        // Detach already-open transports before cancelling the actor. Their bounded
+        // closes must not inherit managerJob cancellation, otherwise a timed-out plugin
+        // unload can orphan stdio children or HTTP clients.
+        launchForcedCleanup(detachOpenLives())
         managerJob.cancel(CancellationException(terminalMessage()))
     }
+
+    private fun isAcceptingRequests(): Boolean = synchronized(requestLock) { acceptingRequests }
 
     private fun stopAcceptanceAndDrain() {
         synchronized(requestLock) {
@@ -477,10 +492,12 @@ class ExternalMcpManager(
         )
 
         for (name in open.keys.toList()) {
+            if (!isAcceptingRequests()) break
             if (name !in enabled) closeOne(name)
         }
 
         for ((name, cfg) in enabled) {
+            if (!isAcceptingRequests()) break
             if (open.containsKey(name)) continue
             setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.CONNECTING))
             var transport: McpTransport? = null
@@ -534,6 +551,7 @@ class ExternalMcpManager(
 
         val discovered = buildList {
             for ((name, live) in open.entries.sortedBy { it.key }) {
+                if (!isAcceptingRequests()) break
                 try {
                     addAll(withTimeout(serverOperationTimeoutMs) { live.source.list() })
                     setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.CONNECTED))
@@ -637,10 +655,26 @@ class ExternalMcpManager(
     }
 
     private suspend fun disposeOwnedState() {
-        val lives = open.entries.map { it.key to it.value }
-        lives.forEach { (name, live) -> open.remove(name, live) }
+        val lives = detachOpenLives()
+        closeDetachedLives(lives)
+        mutableDescriptors.value = emptyList()
+        replaceStatuses(
+            mutableServerStatuses.value.mapValues { _ ->
+                ExternalMcpServerStatus(ExternalMcpServerState.DISCONNECTED, "Disconnected")
+            },
+        )
+        initialized = true
+        mutableChangeTick.value += 1
+    }
+
+    private fun detachOpenLives(): List<Live> = open.entries.mapNotNull { (name, live) ->
+        live.takeIf { open.remove(name, live) }
+    }
+
+    private suspend fun closeDetachedLives(lives: List<Live>) {
+        if (lives.isEmpty()) return
         val fatalCloseFailures = withContext(NonCancellable) {
-            lives.map { (_, live) ->
+            lives.map { live ->
                 async {
                     try {
                         closeFailedOpen(live.transport)
@@ -655,14 +689,20 @@ class ExternalMcpManager(
             fatalCloseFailures.drop(1).forEach(first::addSuppressed)
             throw first
         }
-        mutableDescriptors.value = emptyList()
-        replaceStatuses(
-            mutableServerStatuses.value.mapValues { _ ->
-                ExternalMcpServerStatus(ExternalMcpServerState.DISCONNECTED, "Disconnected")
-            },
-        )
-        initialized = true
-        mutableChangeTick.value += 1
+    }
+
+    private fun launchForcedCleanup(lives: List<Live>) {
+        if (lives.isEmpty()) return
+        val cleanupJob = SupervisorJob()
+        CoroutineScope(cleanupJob + ioDispatcher).launch {
+            try {
+                closeDetachedLives(lives)
+            } catch (fatal: Error) {
+                logActorFailure("forced cleanup failed", fatal)
+            } finally {
+                cleanupJob.cancel()
+            }
+        }
     }
 
     private fun replaceStatuses(statuses: Map<String, ExternalMcpServerStatus>) {

@@ -1007,6 +1007,93 @@ class ExternalMcpTest {
     }
 
     @Test
+    fun `dispose stops an active reconcile before connecting later servers`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        val configs = listOf("first", "second").map { name ->
+            McpServerConfig(name, McpTransportKind.STDIO, command = "x", enabled = true)
+        }
+        storage.putJson(
+            ExternalMcpManager.CONFIG_KEY,
+            Json.encodeToString(ListSerializer(McpServerConfig.serializer()), configs),
+        )
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        val firstConnectStarted = CompletableDeferred<Unit>()
+        val allowFirstConnect = CompletableDeferred<Unit>()
+        val firstClosed = AtomicBoolean(false)
+        val secondConnects = AtomicInteger(0)
+        val m = manager(storage, ioDispatcher = dispatcher) { cfg, _ ->
+            object : McpTransport {
+                override suspend fun connect() {
+                    if (cfg.name == "first") {
+                        firstConnectStarted.complete(Unit)
+                        allowFirstConnect.await()
+                    } else {
+                        secondConnects.incrementAndGet()
+                    }
+                }
+                override suspend fun listTools(): List<RemoteTool> = emptyList()
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() {
+                    if (cfg.name == "first") firstClosed.set(true)
+                }
+            }
+        }
+
+        val startup = async { m.start() }
+        firstConnectStarted.await()
+        val disposal = async { m.disposeAll() }
+        runCurrent()
+        allowFirstConnect.complete(Unit)
+        startup.await()
+        disposal.await()
+
+        assertEquals(0, secondConnects.get())
+        assertTrue(firstClosed.get())
+    }
+
+    @Test
+    fun `cancelNow reaps open transports while a later connect is stuck`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        val configs = listOf("first", "second").map { name ->
+            McpServerConfig(name, McpTransportKind.STDIO, command = "x", enabled = true)
+        }
+        storage.putJson(
+            ExternalMcpManager.CONFIG_KEY,
+            Json.encodeToString(ListSerializer(McpServerConfig.serializer()), configs),
+        )
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        val firstClosed = AtomicBoolean(false)
+        val secondConnectStarted = CompletableDeferred<Unit>()
+        val secondClosed = AtomicBoolean(false)
+        val m = manager(storage, ioDispatcher = dispatcher) { cfg, _ ->
+            object : McpTransport {
+                override suspend fun connect() {
+                    if (cfg.name == "second") {
+                        secondConnectStarted.complete(Unit)
+                        CompletableDeferred<Unit>().await()
+                    }
+                }
+                override suspend fun listTools(): List<RemoteTool> = emptyList()
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() {
+                    if (cfg.name == "first") firstClosed.set(true) else secondClosed.set(true)
+                }
+            }
+        }
+
+        val startup = m.requestStart()
+        secondConnectStarted.await()
+        m.cancelNow()
+        runCurrent()
+
+        assertFailsWith<CancellationException> { startup.await() }
+        assertTrue(firstClosed.get())
+        assertTrue(secondClosed.get())
+    }
+
+    @Test
     fun `cancelNow fails queued work rejects terminal work and is idempotent`() = runTest {
         val dispatcher = UnconfinedTestDispatcher(testScheduler)
         val storage = TestStorage()
