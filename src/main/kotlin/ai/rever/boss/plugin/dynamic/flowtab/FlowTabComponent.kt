@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -43,6 +44,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material.icons.filled.ZoomIn
@@ -177,9 +179,11 @@ class FlowTabComponent(
         // degrades cleanly to built-ins only. The collector is tied to [coroutineScope]
         // and cancelled on destroy.
         runCatching { syncBossTools(context, registry, coroutineScope) }
-        // Surface external MCP tools (P7) as palette nodes too — flag-gated inside refresh,
-        // so nothing connects until the user enables external MCP and adds a server.
-        externalMcp?.let { runCatching { syncExternalMcpTools(it, registry, coroutineScope) } }
+        // Surface external MCP tools (P7) as palette nodes too. Each open tab applies
+        // cached snapshots, while the plugin-wide manager owns connection/discovery I/O.
+        externalMcp?.let { manager ->
+            runCatching { syncExternalMcpTools(manager, registry, coroutineScope) }
+        }
         // Register the agent + lanager kinds so they appear in the palette and dispatch.
         runCatching {
             registry.register(defaultAgentNodeSpec(context, prompts, externalMcp))
@@ -596,6 +600,7 @@ class FlowTabComponent(
         val selectedNode = (state.selection as? Selection.Node)?.let { state.nodeById(it.id) }
         var confirmClear by remember { mutableStateOf(false) }
         var showGallery by remember { mutableStateOf(false) }
+        var showMcpConfig by remember { mutableStateOf(false) }
         var showRename by remember { mutableStateOf(false) }
         var renameInProgress by remember { mutableStateOf(false) }
         val renameEnabled = initialized && !renameInProgress
@@ -622,6 +627,8 @@ class FlowTabComponent(
                 renameEnabled = renameEnabled,
                 onRename = { showRename = true },
                 onTemplates = { showGallery = true },
+                externalMcpAvailable = externalMcp != null,
+                onExternalMcp = { showMcpConfig = true },
                 onZoomIn = { state.zoomBy(1.2f, viewCenterScreen()) },
                 onZoomOut = { state.zoomBy(1f / 1.2f, viewCenterScreen()) },
                 tidyEnabled = state.nodes.size > 1,
@@ -733,6 +740,26 @@ class FlowTabComponent(
                 )
             }
 
+            val mcpManager = externalMcp
+            if (showMcpConfig && mcpManager != null) {
+                AlertDialog(
+                    onDismissRequest = { showMcpConfig = false },
+                    text = {
+                        McpServerConfigPanel(
+                            manager = mcpManager,
+                            modifier = Modifier.heightIn(max = 480.dp),
+                        )
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showMcpConfig = false }) {
+                            Text("Close", color = FlowTheme.TextPrimary)
+                        }
+                    },
+                    backgroundColor = FlowTheme.Surface,
+                    contentColor = FlowTheme.TextPrimary,
+                )
+            }
+
             if (showRename) {
                 var renameText by remember(currentFlowName) { mutableStateOf(currentFlowName) }
                 AlertDialog(
@@ -807,6 +834,8 @@ private fun Toolbar(
     onNewFlow: () -> Unit,
     onRename: () -> Unit,
     onTemplates: () -> Unit,
+    externalMcpAvailable: Boolean,
+    onExternalMcp: () -> Unit,
     onZoomIn: () -> Unit,
     onZoomOut: () -> Unit,
     tidyEnabled: Boolean,
@@ -948,6 +977,13 @@ private fun Toolbar(
         }
 
         Spacer(Modifier.weight(1f))
+
+        ToolbarButton(
+            Icons.Filled.Settings,
+            "External MCP servers",
+            onExternalMcp,
+            enabled = externalMcpAvailable,
+        )
 
         ToolbarButton(Icons.Filled.ZoomOut, "Zoom out", onZoomOut)
         Text(

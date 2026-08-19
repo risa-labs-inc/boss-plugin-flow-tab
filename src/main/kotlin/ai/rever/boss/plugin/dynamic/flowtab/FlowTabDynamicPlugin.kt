@@ -46,7 +46,12 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         // the tab UI and the headless MCP path share it and dispose() reaps its children.
         val external = runCatching {
             val storage = context.pluginStorageFactory?.createStorage(FlowController.STORAGE_NAMESPACE)
-            ExternalMcpManager(storage, SecretResolver.fromSecrets(context), SettingsStore(storage))
+            ExternalMcpManager(
+                storage,
+                SecretResolver.fromSecrets(context),
+                SettingsStore(storage),
+                log = { message -> println("[flow-tab] ${boundedExternalMcpDiagnostic(message)}") },
+            )
         }.getOrNull()
         externalMcp = external
 
@@ -95,7 +100,22 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         // Reap any external MCP child processes / sockets (red-team F9), bounded so a
         // hung server can't block plugin teardown.
         externalMcp?.let { mgr ->
-            runCatching { runBlocking { withTimeoutOrNull(5_000) { mgr.disposeAll() } } }
+            try {
+                runCatching { runBlocking { withTimeoutOrNull(5_000) { mgr.disposeAll() } } }
+            } finally {
+                // If graceful disposal timed out, synchronously reject queued/new work
+                // and cancel the manager scope so hot unload cannot retain the plugin.
+                val forcedCleanup = mgr.cancelNow()
+                // Join the detached cleanup within its bounded close budget so plugin
+                // unload does not return while reaping cooperative stdio/HTTP clients.
+                runCatching {
+                    runBlocking {
+                        withTimeoutOrNull(ExternalMcpManager.FORCED_CLEANUP_JOIN_TIMEOUT_MS) {
+                            forcedCleanup.join()
+                        }
+                    }
+                }
+            }
         }
         externalMcp = null
         // Unregister host surfaces independently so one faulty callback cannot skip the rest.

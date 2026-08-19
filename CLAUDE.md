@@ -253,6 +253,34 @@ key. Controller/MCP mutations and open-tab autosave therefore serialize through
 loads before acknowledging the revision; autosaves captured against an older revision are skipped.
 In-canvas rename additionally uses a temporary name guard that clears after convergence.
 
+### External MCP lifecycle
+
+External MCP is plugin-wide, OFF by default, and configured from the Flow toolbar. The
+`ExternalMcpManager` owns one supervised IO request actor for config writes, connection lifecycle,
+and tool discovery; accepted mutations must survive dialog/tab composition cancellation. Each
+settled change performs one discovery pass and publishes cached descriptor and per-server status
+`StateFlow`s. Every UI/headless registry may collect the descriptor snapshot and apply it through
+its own `ToolNodeSync`, but collectors must never call transport `listTools` or cancel shared MCP
+requests. Each server connect, discovery, and close has an independent cooperative 15-second deadline;
+timeouts must attempt bounded reaping and let queued mutations continue. Reconciliation is deliberately
+serial for deterministic ordering, so its worst-case bound is the sum of per-server deadlines; the
+dialog stays dismissible and Remove/refresh actions remain queueable behind the pass. A startup pass
+with any server error is not latched as initialized, and an uncached headless `list()` submits the same
+idempotent retry no more than once per 30-second cooldown; concurrent implicit callers coalesce and
+await it for at most one second before serving the last descriptor snapshot. The manager-owned retry
+continues after that caller latency bound. Explicit Refresh always bypasses the cooldown floor.
+Changing a connected server config or resolved secret closes and reopens its transport. Server names
+are one routing segment: `/` and control characters are invalid.
+Server configs persist only secret references; resolved values stay in the host vault /
+transport boundary and must be redacted from bounded, control-free, single-line UI and log diagnostics. Disposal
+stops accepting requests, drains accepted work, concurrently attempts every live close under the
+two-second NonCancellable cleanup bound, and publishes the terminal empty snapshot before terminating
+the manager actor; a terminal actor failure or forced `cancelNow` must also stop acceptance, fail every
+queued request, and boundedly reap already-open transports instead of leaving work or child processes
+without an owner. Plugin disposal joins that forced cleanup and the actor finalizer within a bounded
+unload budget. Fatal actor failure is logged without provider payloads and rejects later requests as crashed with plugin
+reload guidance, distinct from normal disposal.
+
 ### Runtime secret templates
 
 HTTP node URL, headers, and body fields plus Type text and Inject scripts accept
