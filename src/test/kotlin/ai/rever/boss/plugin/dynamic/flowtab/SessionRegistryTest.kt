@@ -110,7 +110,6 @@ class SessionRegistryTest {
         override fun removeLoadingListener(listener: (Boolean) -> Unit) {}
         override fun isSecure() = false
         override fun setContextMenuCallback(callback: ContextMenuCallback?) {}
-        override suspend fun fillCredentials(username: String, password: String, fillBoth: Boolean) = true
         override fun copySelection() {}
         override fun paste() {}
         override fun cut() {}
