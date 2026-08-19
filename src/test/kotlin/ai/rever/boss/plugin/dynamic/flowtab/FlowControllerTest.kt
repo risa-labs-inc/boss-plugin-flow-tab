@@ -39,6 +39,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
@@ -80,6 +82,21 @@ class FlowControllerTest {
         runTimeoutMs: Long = FlowController.DEFAULT_RUN_TIMEOUT_MS,
         tabUpdates: TabUpdateProviderFactory? = null,
     ) = FlowController(context(storage, tabUpdates), { scope }, registry, runTimeoutMs)
+
+    private fun hangingRegistry(kind: String): NodeRegistry = builtinNodeRegistry().also {
+        it.register(
+            NodeSpec(
+                id = kind,
+                label = "Hang",
+                inputs = 0,
+                outputs = 1,
+                accent = 0,
+                description = "test only",
+                runMode = RunMode.ONCE,
+                executor = NodeExecutor { _, _, _, _ -> awaitCancellation() },
+            ),
+        )
+    }
 
     // ---- authoring ----------------------------------------------------------
 
@@ -925,47 +942,54 @@ class FlowControllerTest {
     }
 
     @Test
-    fun `repeat dispose cancels a run started after initial disposal`() = runBlocking {
-        val entered = CompletableDeferred<Unit>()
-        val cancelled = CompletableDeferred<Unit>()
-        val registry = builtinNodeRegistry().also {
-            it.register(
-                NodeSpec(
-                    id = "POST_DISPOSE_HANG",
-                    label = "Post-dispose Hang",
-                    inputs = 0,
-                    outputs = 1,
-                    accent = 0,
-                    description = "test only",
-                    runMode = RunMode.ONCE,
-                    executor = NodeExecutor { _, _, _, _ ->
-                        entered.complete(Unit)
-                        try {
-                            awaitCancellation()
-                        } finally {
-                            cancelled.complete(Unit)
-                        }
-                    },
-                ),
-            )
-        }
-        val fc = controller(registry = registry)
+    fun `start after disposal is promptly failed without a second dispose`() = runBlocking {
+        val fc = controller(registry = hangingRegistry("POST_DISPOSE_HANG"))
         val tabId = fc.createFlow()
         fc.addNode(tabId, "POST_DISPOSE_HANG")
 
         try {
             fc.dispose()
             val runId = fc.startRun(tabId)
-            withTimeout(5_000) { entered.await() }
-            assertEquals(RunJobState.RUNNING, fc.runStatus(runId)?.state)
-
-            fc.dispose()
-            withTimeout(5_000) { cancelled.await() }
-            val terminal = awaitTerminal(fc, runId)
+            val terminal = fc.runStatus(runId)!!
             assertEquals(RunJobState.FAILED, terminal.state)
-            assertContains(terminal.error.orEmpty(), "Flow controller disposed")
+            assertEquals("Flow controller disposed", terminal.error)
         } finally {
             fc.dispose()
+        }
+    }
+
+    @Test
+    fun `start racing disposal is failed after execution installation`() = runBlocking {
+        val storage = DesktopStorage()
+        val providerEntered = CountDownLatch(1)
+        val releaseProvider = CountDownLatch(1)
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val fc = FlowController(
+            context = context(storage),
+            scopeProvider = {
+                providerEntered.countDown()
+                check(releaseProvider.await(5, TimeUnit.SECONDS)) { "test did not release scope provider" }
+                runScope
+            },
+            registry = hangingRegistry("RACING_DISPOSE_HANG"),
+        )
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "RACING_DISPOSE_HANG")
+        val start = async(Dispatchers.Default) { fc.startRun(tabId) }
+
+        try {
+            assertTrue(providerEntered.await(5, TimeUnit.SECONDS), "start must reach the scope provider")
+            fc.dispose()
+            releaseProvider.countDown()
+
+            val runId = withTimeout(5_000) { start.await() }
+            val terminal = fc.runStatus(runId)!!
+            assertEquals(RunJobState.FAILED, terminal.state)
+            assertEquals("Flow controller disposed", terminal.error)
+        } finally {
+            releaseProvider.countDown()
+            fc.dispose()
+            runScope.cancel()
         }
     }
 
@@ -1115,7 +1139,7 @@ class FlowControllerTest {
     }
 
     @Test
-    fun `empty tool sync startup remains retryable when host registry appears`() = runBlocking {
+    fun `external-only sync does not block later host registry startup`() = runBlocking {
         val storage = DesktopStorage()
         var bossRegistry: McpToolRegistry? = null
         val ctx = object : PluginContext {
@@ -1128,13 +1152,21 @@ class FlowControllerTest {
             }
         }
         val controller = FlowController(ctx)
+        val external = ExternalMcpManager(
+            storage,
+            SecretResolver.constant(null),
+            SettingsStore(storage),
+        )
 
         try {
-            assertTrue(controller.startToolRegistrySync(external = null).isEmpty())
+            val externalOnly = controller.startToolRegistrySync(external)
+            assertEquals(1, externalOnly.size, "the external job should start without a host registry")
 
             bossRegistry = FakeBossRegistry("late")
-            val started = controller.startToolRegistrySync(external = null)
-            assertEquals(1, started.size, "a later host registry should start one collector")
+            val both = controller.startToolRegistrySync(external)
+            assertEquals(2, both.size, "a later host registry should add its collector")
+            assertTrue(externalOnly.single() in both, "the existing external job must not be duplicated")
+            assertSame(both, controller.startToolRegistrySync(external), "a stable retry must remain idempotent")
             withTimeout(2_000) {
                 while (controller.registry.resolve("tool:boss:late").isUnavailable) delay(10)
             }

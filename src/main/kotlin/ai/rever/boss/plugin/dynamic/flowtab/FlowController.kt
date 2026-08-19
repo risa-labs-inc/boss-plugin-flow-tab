@@ -85,30 +85,41 @@ class FlowController(
      * replacing that scope. Everything launched here is cancelled from [dispose]. */
     private val lifecycleScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val toolSyncLock = Any()
-    private var toolSyncJobs: List<Job>? = null
+    private var bossToolSyncJob: Job? = null
+    private var externalToolSyncJob: Job? = null
+    private var toolSyncJobs: List<Job> = emptyList()
     private var disposed = false
 
     /**
      * Keep the headless registry synchronized for this controller's whole lifetime.
      * These collectors deliberately do not belong to [scopeProvider]: that scope may be
      * replaced by the host while the controller and its registry remain registered. The
-     * first non-empty start fixes the external manager for this controller; later calls
-     * return the same jobs without installing duplicate collectors. An attempt that cannot
-     * start either collector is not memoized, so a host registry that appears later can retry.
+     * Boss and external jobs are memoized independently, so either missing source remains
+     * retryable without duplicating the collector that did start. The first external start
+     * fixes that manager for this controller; calls that start nothing return the same jobs.
      */
     internal fun startToolRegistrySync(external: ExternalMcpManager?): List<Job> {
         return synchronized(toolSyncLock) {
             check(!disposed) { "Cannot start tool registry synchronization after controller disposal" }
-            toolSyncJobs?.let { return@synchronized it }
-            val started = mutableListOf<Job>()
+            val previousBoss = bossToolSyncJob
+            val previousExternal = externalToolSyncJob
+            val previousJobs = toolSyncJobs
             try {
-                syncBossTools(context, registry, lifecycleScope)?.let(started::add)
-                external?.let { started += syncExternalMcpTools(it, registry, lifecycleScope) }
-                started.toList().also { jobs ->
-                    if (jobs.isNotEmpty()) toolSyncJobs = jobs
+                if (bossToolSyncJob == null) {
+                    bossToolSyncJob = syncBossTools(context, registry, lifecycleScope)
                 }
+                if (externalToolSyncJob == null && external != null) {
+                    externalToolSyncJob = syncExternalMcpTools(external, registry, lifecycleScope)
+                }
+                val jobs = listOfNotNull(bossToolSyncJob, externalToolSyncJob)
+                if (jobs != toolSyncJobs) toolSyncJobs = jobs
+                toolSyncJobs
             } catch (failure: Throwable) {
-                started.forEach { it.cancel() }
+                if (bossToolSyncJob !== previousBoss) bossToolSyncJob?.cancel()
+                if (externalToolSyncJob !== previousExternal) externalToolSyncJob?.cancel()
+                bossToolSyncJob = previousBoss
+                externalToolSyncJob = previousExternal
+                toolSyncJobs = previousJobs
                 throw failure
             }
         }
@@ -455,9 +466,22 @@ class FlowController(
             persistRun(published)
         }
         executions[runId] = execution
-        execution.invokeOnCompletion {
+        execution.invokeOnCompletion { cause ->
+            if (cause is CancellationException) {
+                transitionToFailed(
+                    runId,
+                    tabId,
+                    states,
+                    cause.message ?: "Flow run cancelled before dispatch",
+                )
+            }
             executions.remove(runId, execution)
             runStates.remove(runId, states)
+        }
+        if (synchronized(toolSyncLock) { disposed }) {
+            val message = "Flow controller disposed"
+            transitionToFailed(runId, tabId, states, message)
+            execution.cancel(CancellationException(message))
         }
 
         // This monitor is deliberately not a child of execution. join() is cancellable,
