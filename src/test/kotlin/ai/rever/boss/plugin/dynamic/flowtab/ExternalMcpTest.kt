@@ -83,6 +83,7 @@ class ExternalMcpTest {
         log: (String) -> Unit = {},
         serverOperationTimeoutMs: Long = ExternalMcpManager.DEFAULT_SERVER_OPERATION_TIMEOUT_MS,
         implicitRetryCooldownMs: Long = ExternalMcpManager.DEFAULT_IMPLICIT_RETRY_COOLDOWN_MS,
+        implicitRetryAwaitTimeoutMs: Long = ExternalMcpManager.DEFAULT_IMPLICIT_RETRY_AWAIT_TIMEOUT_MS,
         nowMillis: () -> Long = System::currentTimeMillis,
         factory: McpTransportFactory,
     ) = ExternalMcpManager(
@@ -94,6 +95,7 @@ class ExternalMcpTest {
         ioDispatcher = ioDispatcher,
         serverOperationTimeoutMs = serverOperationTimeoutMs,
         implicitRetryCooldownMs = implicitRetryCooldownMs,
+        implicitRetryAwaitTimeoutMs = implicitRetryAwaitTimeoutMs,
         nowMillis = nowMillis,
     )
 
@@ -751,6 +753,44 @@ class ExternalMcpTest {
     }
 
     @Test
+    fun `headless list bounds retry latency while manager-owned discovery continues`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        seedEnabledServer(
+            storage,
+            McpServerConfig("slow", McpTransportKind.STDIO, command = "x", enabled = true),
+        )
+        val connectStarted = CompletableDeferred<Unit>()
+        val releaseConnect = CompletableDeferred<Unit>()
+        val m = manager(
+            storage = storage,
+            ioDispatcher = dispatcher,
+            implicitRetryAwaitTimeoutMs = 100,
+        ) { _, _ ->
+            object : McpTransport {
+                override suspend fun connect() {
+                    connectStarted.complete(Unit)
+                    releaseConnect.await()
+                }
+                override suspend fun listTools() = listOf(remote("eventual"))
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() = Unit
+            }
+        }
+
+        val listing = async { m.list() }
+        connectStarted.await()
+        advanceTimeBy(100)
+        runCurrent()
+
+        assertTrue(listing.await().isEmpty())
+        releaseConnect.complete(Unit)
+        advanceUntilIdle()
+        assertEquals(listOf("slow/eventual"), m.descriptors.value.map { it.ref.name })
+        m.disposeAll()
+    }
+
+    @Test
     fun `headless list returns its cache after terminal manager failure`() = runBlocking {
         val m = manager { _, _ -> FakeTransport(emptyList()) }
         m.cancelNow()
@@ -1166,8 +1206,8 @@ class ExternalMcpTest {
 
         val startup = m.requestStart()
         secondConnectStarted.await()
-        m.cancelNow()
-        runCurrent()
+        val forcedCleanup = m.cancelNow()
+        forcedCleanup.join()
 
         assertFailsWith<CancellationException> { startup.await() }
         assertTrue(firstClosed.get())
@@ -1199,9 +1239,9 @@ class ExternalMcpTest {
         connectStarted.await()
         val queued = m.requestAddConfig(McpServerConfig("queued", McpTransportKind.STDIO, command = "q"))
 
+        val forcedCleanup = m.cancelNow()
         m.cancelNow()
-        m.cancelNow()
-        runCurrent()
+        forcedCleanup.join()
 
         val activeFailure = assertFailsWith<CancellationException> { active.await() }
         assertEquals("External MCP operation cancelled", activeFailure.message)

@@ -26,6 +26,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import java.util.concurrent.ConcurrentHashMap
@@ -81,7 +82,7 @@ class SettingsStore(private val storage: PluginStorageProvider?) {
     companion object { const val KEY = "settings" }
 }
 
-/** Collapse whitespace, apply literal redactions, and bound external-MCP diagnostics. */
+/** Remove controls, collapse whitespace, apply literal redactions, and bound diagnostics. */
 internal fun boundedExternalMcpDiagnostic(
     raw: String?,
     fallback: String = "External MCP operation failed",
@@ -89,6 +90,9 @@ internal fun boundedExternalMcpDiagnostic(
 ): String {
     var safe = raw.orEmpty()
     redactions.filter { it.isNotBlank() }.forEach { secret -> safe = safe.replace(secret, "***") }
+    safe = safe.map { char ->
+        if (char.isISOControl() || char == '\u2028' || char == '\u2029') ' ' else char
+    }.joinToString("")
     safe = safe.replace(Regex("\\s+"), " ").trim().ifBlank { fallback }
     return safe.take(ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH)
 }
@@ -124,6 +128,8 @@ class ExternalMcpManager(
     private val serverOperationTimeoutMs: Long = DEFAULT_SERVER_OPERATION_TIMEOUT_MS,
     /** Minimum delay between automatic, headless retries after an unsettled pass. */
     private val implicitRetryCooldownMs: Long = DEFAULT_IMPLICIT_RETRY_COOLDOWN_MS,
+    /** Maximum Agent-listing latency spent awaiting an automatic external-MCP retry. */
+    private val implicitRetryAwaitTimeoutMs: Long = DEFAULT_IMPLICIT_RETRY_AWAIT_TIMEOUT_MS,
     private val nowMillis: () -> Long = System::currentTimeMillis,
 ) : ToolSource {
 
@@ -157,6 +163,7 @@ class ExternalMcpManager(
     private val open = ConcurrentHashMap<String, Live>()
     private val configMutex = Mutex()
     private val implicitRetryMutex = Mutex()
+    private var implicitRetryInFlight: Deferred<Unit>? = null
     private val mutableChangeTick = MutableStateFlow(0L)
     private val mutableServerStatuses = MutableStateFlow<Map<String, ExternalMcpServerStatus>>(emptyMap())
     private val mutableDescriptors = MutableStateFlow<List<ToolDescriptor>>(emptyList())
@@ -204,6 +211,7 @@ class ExternalMcpManager(
     init {
         require(serverOperationTimeoutMs > 0) { "External MCP server operation timeout must be positive" }
         require(implicitRetryCooldownMs >= 0) { "External MCP implicit retry cooldown must not be negative" }
+        require(implicitRetryAwaitTimeoutMs > 0) { "External MCP implicit retry await timeout must be positive" }
         worker.start()
     }
 
@@ -289,13 +297,14 @@ class ExternalMcpManager(
      * work immediately, fails queued requests, and cancels the actor even when a bounded
      * [disposeAll] attempt could not finish.
      */
-    fun cancelNow() {
+    fun cancelNow(): Job {
         stopAcceptanceAndDrain()
         // Detach already-open transports before cancelling the actor. Their bounded
         // closes must not inherit managerJob cancellation, otherwise a timed-out plugin
         // unload can orphan stdio children or HTTP clients.
-        launchForcedCleanup(detachOpenLives())
+        val cleanup = launchForcedCleanup(detachOpenLives())
         managerJob.cancel(CancellationException(terminalMessage()))
+        return cleanup
     }
 
     private fun isAcceptingRequests(): Boolean = synchronized(requestLock) { acceptingRequests }
@@ -639,20 +648,32 @@ class ExternalMcpManager(
 
     /**
      * Return the settled cache cheaply. When startup/discovery has not settled cleanly,
-     * submit and await the manager-owned idempotent retry so headless callers self-heal.
+     * submit the manager-owned idempotent retry so headless callers self-heal. Await it
+     * only briefly: external MCP must never hold up unrelated Agent tool discovery.
      */
     override suspend fun list(): List<ToolDescriptor> {
         if (!initialized && implicitRetryDue()) {
             implicitRetryMutex.withLock {
                 if (!initialized && implicitRetryDue()) {
+                    val retry = implicitRetryInFlight
+                        ?.takeUnless { it.isCompleted }
+                        ?: requestStart().also { implicitRetryInFlight = it }
                     try {
-                        requestStart().await()
+                        val completed = withTimeoutOrNull(implicitRetryAwaitTimeoutMs) {
+                            retry.await()
+                            true
+                        } ?: false
+                        if (!completed) lastReconcileFinishedAtMs = nowMillis()
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (_: Exception) {
                         // External MCP is an optional tool lane. Preserve the last
                         // published cache rather than failing unrelated Agent tools.
                         lastReconcileFinishedAtMs = nowMillis()
+                    } finally {
+                        if (retry.isCompleted && implicitRetryInFlight === retry) {
+                            implicitRetryInFlight = null
+                        }
                     }
                 }
             }
@@ -731,12 +752,13 @@ class ExternalMcpManager(
         }
     }
 
-    private fun launchForcedCleanup(lives: List<Live>) {
-        if (lives.isEmpty()) return
+    private fun launchForcedCleanup(lives: List<Live>): Job {
         val cleanupJob = SupervisorJob()
-        CoroutineScope(cleanupJob + ioDispatcher).launch {
+        return CoroutineScope(cleanupJob + ioDispatcher).launch {
             try {
                 closeDetachedLives(lives)
+                // The actor finalizer reaps any transport published after the snapshot.
+                worker.join()
             } catch (fatal: Error) {
                 logActorFailure("forced cleanup failed", fatal)
             } finally {
@@ -800,8 +822,10 @@ class ExternalMcpManager(
         const val CONFIG_KEY = "mcpservers:config"
         internal const val DEFAULT_SERVER_OPERATION_TIMEOUT_MS = 15_000L
         internal const val DEFAULT_IMPLICIT_RETRY_COOLDOWN_MS = 30_000L
+        internal const val DEFAULT_IMPLICIT_RETRY_AWAIT_TIMEOUT_MS = 1_000L
         internal const val MAX_STATUS_DETAIL_LENGTH = 240
         internal const val MAX_TRANSPORT_CLEANUP_TIMEOUT_MS = 2_000L
+        internal const val FORCED_CLEANUP_JOIN_TIMEOUT_MS = 2_500L
         private const val DISPOSED_MESSAGE = "External MCP manager is disposed"
         private const val INVALID_SERVER_NAME_MESSAGE =
             "External MCP server name must not contain '/' or control characters"

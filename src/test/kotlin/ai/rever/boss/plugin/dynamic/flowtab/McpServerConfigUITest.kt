@@ -72,9 +72,12 @@ class McpServerConfigUITest {
 
     @Test
     fun `operation diagnostics are single-line and bounded`() {
-        val diagnostic = boundedExternalMcpDiagnostic("  first line\nsecond line  " + "x".repeat(500))
+        val diagnostic = boundedExternalMcpDiagnostic(
+            "  first line\nsecond\u001b[31m\u0000line\u2028next\u2029paragraph  " + "x".repeat(500),
+        )
 
-        assertTrue(diagnostic.startsWith("first line second line"))
+        assertTrue(diagnostic.startsWith("first line second [31m line next paragraph"))
+        assertTrue(diagnostic.none { it.isISOControl() || it == '\u2028' || it == '\u2029' })
         assertTrue(diagnostic.length <= ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH)
     }
 }

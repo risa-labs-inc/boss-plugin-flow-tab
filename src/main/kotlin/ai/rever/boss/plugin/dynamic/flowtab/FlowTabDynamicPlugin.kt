@@ -105,7 +105,16 @@ class FlowTabDynamicPlugin : DynamicPlugin {
             } finally {
                 // If graceful disposal timed out, synchronously reject queued/new work
                 // and cancel the manager scope so hot unload cannot retain the plugin.
-                mgr.cancelNow()
+                val forcedCleanup = mgr.cancelNow()
+                // Join the detached cleanup within its bounded close budget so plugin
+                // unload does not return while reaping cooperative stdio/HTTP clients.
+                runCatching {
+                    runBlocking {
+                        withTimeoutOrNull(ExternalMcpManager.FORCED_CLEANUP_JOIN_TIMEOUT_MS) {
+                            forcedCleanup.join()
+                        }
+                    }
+                }
             }
         }
         externalMcp = null

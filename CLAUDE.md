@@ -267,17 +267,18 @@ serial for deterministic ordering, so its worst-case bound is the sum of per-ser
 dialog stays dismissible and Remove/refresh actions remain queueable behind the pass. A startup pass
 with any server error is not latched as initialized, and an uncached headless `list()` submits the same
 idempotent retry no more than once per 30-second cooldown; concurrent implicit callers coalesce and
-serve the last descriptor snapshot while cooling down. Explicit Refresh always bypasses that floor.
+await it for at most one second before serving the last descriptor snapshot. The manager-owned retry
+continues after that caller latency bound. Explicit Refresh always bypasses the cooldown floor.
 Changing a connected server config or resolved secret closes and reopens its transport. Server names
 are one routing segment: `/` and control characters are invalid.
 Server configs persist only secret references; resolved values stay in the host vault /
-transport boundary and must be redacted from bounded, single-line UI and log diagnostics. Disposal
+transport boundary and must be redacted from bounded, control-free, single-line UI and log diagnostics. Disposal
 stops accepting requests, drains accepted work, concurrently attempts every live close under the
 two-second NonCancellable cleanup bound, and publishes the terminal empty snapshot before terminating
 the manager actor; a terminal actor failure or forced `cancelNow` must also stop acceptance, fail every
 queued request, and boundedly reap already-open transports instead of leaving work or child processes
-without an owner. Fatal
-actor failure is logged without provider payloads and rejects later requests as crashed with plugin
+without an owner. Plugin disposal joins that forced cleanup and the actor finalizer within a bounded
+unload budget. Fatal actor failure is logged without provider payloads and rejects later requests as crashed with plugin
 reload guidance, distinct from normal disposal.
 
 ### Runtime secret templates
