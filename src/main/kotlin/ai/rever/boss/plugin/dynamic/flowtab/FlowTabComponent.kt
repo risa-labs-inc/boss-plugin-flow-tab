@@ -189,9 +189,7 @@ class FlowTabComponent(
             object : Lifecycle.Callbacks {
                 override fun onDestroy() {
                     FlowPersistenceCoordinator.unregisterLiveCanvas(config.id, liveCanvas)
-                    runCatching { controller.dispose() }.onFailure {
-                        println("[flow-tab] failed to dispose tab controller: ${toolSyncFailureMessage(it)}")
-                    }
+                    controller.dispose()
                     coroutineScope.cancel()
                 }
             }

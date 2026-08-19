@@ -37,14 +37,8 @@ class FlowTabDynamicPlugin : DynamicPlugin {
     private var headlessController: FlowController? = null
 
     override fun register(context: PluginContext) {
-        // Some hosts may re-register after replacing pluginScope without first calling
-        // dispose(). Reap the old controller-owned collector before losing its reference.
-        // This does not claim full re-registration teardown: the previous external MCP
-        // manager and already-open tabs have a separate shared lifetime handled elsewhere.
-        runCatching { headlessController?.dispose() }.onFailure {
-            println("[flow-tab] failed to dispose replaced controller: ${toolSyncFailureMessage(it)}")
-        }
-        headlessController = null
+        // Host lifecycle must call dispose() before registering this instance again.
+        // Re-registration without disposal is unsupported and outside this plugin's contract.
         pluginContext = context
 
         // Bring up the shared external-MCP manager (does not connect anything until the
@@ -98,9 +92,7 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         pluginContext?.tabRegistry?.unregisterTabType(FlowTabType.typeId)
         pluginContext?.panelRegistry?.unregisterPanel(FlowLauncherInfo.id)
         runCatching { pluginContext?.unregisterMcpToolProvider(FlowMcpToolProvider.PROVIDER_ID) }
-        runCatching { headlessController?.dispose() }.onFailure {
-            println("[flow-tab] failed to dispose headless controller: ${toolSyncFailureMessage(it)}")
-        }
+        headlessController?.dispose()
         headlessController = null
         // Reap any external MCP child processes / sockets (red-team F9), bounded so a
         // hung server can't block plugin teardown.

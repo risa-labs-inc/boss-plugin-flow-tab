@@ -1,7 +1,6 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.PluginStorageProvider
-import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -166,21 +165,14 @@ class ExternalMcpManager(
  * [ExternalMcpManager.refresh] connects the enabled servers (a no-op when the feature flag
  * is off), then a [ToolNodeSync] registers a `tool:ext:<server>/<tool>` spec per tool and
  * drops any that vanished. Re-run after a config or flag change. Returns the launched job.
- * Failures are reported with bounded diagnostics so a bad external server never breaks
- * the tab silently.
+ * Failures are swallowed so a bad external server never breaks the tab.
  */
 fun syncExternalMcpTools(manager: ExternalMcpManager, registry: NodeRegistry, scope: CoroutineScope): Job {
-    val sync = ToolNodeSync(manager, registry, sourceLabel = "external MCP")
+    val sync = ToolNodeSync(manager, registry)
     return scope.launch {
-        try {
+        runCatching {
             manager.refresh()
             sync.apply(manager.list())
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Exception) {
-            println(
-                "[flow-tab] failed to synchronize external MCP tools: ${toolSyncFailureMessage(failure)}",
-            )
         }
     }
 }

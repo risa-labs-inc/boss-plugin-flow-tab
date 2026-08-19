@@ -143,12 +143,13 @@ fun toolNodeSpec(desc: ToolDescriptor, source: ToolSource): NodeSpec {
 /**
  * Keeps a [NodeRegistry]'s tool specs in sync with a [ToolSource]: registers a spec
  * per descriptor and unregisters ones that have disappeared, leaving built-ins and
- * other kinds untouched. Not thread-safe by itself; drive it from one scope.
+ * other kinds untouched. A malformed descriptor retains its last-known-good spec; an
+ * all-malformed update retains the full prior set until a valid emission can distinguish
+ * stale tools from a transient provider failure. Not thread-safe; drive it from one scope.
  */
 internal class ToolNodeSync(
     private val source: ToolSource,
     private val registry: NodeRegistry,
-    private val sourceLabel: String,
     private val reportFailure: (String) -> Unit = ::println,
 ) {
     private data class Failure(val toolId: String, val exception: Exception)
@@ -157,53 +158,13 @@ internal class ToolNodeSync(
     private var previousFailureKeys: Set<String> = emptySet()
 
     fun apply(descriptors: List<ToolDescriptor>) {
-        apply(descriptors, emptyList())
-    }
-
-    fun applyRegistered(tools: List<RegisteredMcpTool>) {
         val failures = mutableListOf<Failure>()
-        val descriptors = tools.mapIndexedNotNull { index, tool ->
-            val toolId = try {
-                ToolRef(ToolScope.BOSS, tool.definition.name).kindId
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (failure: Exception) {
-                failures += Failure("tool:boss:<unreadable-$index>", failure)
-                return@mapIndexedNotNull null
-            }
+        val specs = descriptors.mapNotNull { descriptor ->
             try {
-                tool.toDescriptor()
+                toolNodeSpec(descriptor, source)
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
-                failures += Failure(toolId, failure)
-                null
-            }
-        }
-        apply(descriptors, failures)
-    }
-
-    private fun apply(descriptors: List<ToolDescriptor>, upstreamFailures: List<Failure>) {
-        val failures = upstreamFailures.toMutableList()
-        val built = descriptors.mapNotNull { descriptor ->
-            try {
-                descriptor to toolNodeSpec(descriptor, source)
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (failure: Exception) {
-                failures += Failure(descriptor.ref.kindId, failure)
-                null
-            }
-        }
-        val specs = built.mapNotNull { (descriptor, spec) ->
-            try {
-                registry.register(spec)
-                spec
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (failure: Exception) {
-                // NodeRegistry is a non-throwing synchronized map today. Keep the state
-                // transition correct if registration later gains validation or delegation.
                 failures += Failure(descriptor.ref.kindId, failure)
                 null
             }
@@ -218,6 +179,7 @@ internal class ToolNodeSync(
         val next = specs.mapTo(mutableSetOf()) { it.id }.apply {
             addAll(current.intersect(failedIds))
         }
+        specs.forEach(registry::register)
         (current - next).forEach(registry::unregister)
         current = next
     }
@@ -232,8 +194,8 @@ internal class ToolNodeSync(
             .values
             .forEach { failure ->
                 reportFailure(
-                    "[flow-tab] failed to synchronize $sourceLabel tool " +
-                        "'${toolSyncIdentifier(failure.toolId)}': ${toolSyncFailureMessage(failure.exception)}",
+                    "[flow-tab] failed to synchronize tool '${toolSyncIdentifier(failure.toolId)}': " +
+                        toolSyncFailureMessage(failure.exception),
                 )
             }
         previousFailureKeys = keyed.keys.toSet()
@@ -249,7 +211,7 @@ internal class ToolNodeSync(
 fun syncBossTools(context: PluginContext, registry: NodeRegistry, scope: CoroutineScope): Job? {
     val reg = context.mcpToolRegistry ?: return null
     val source = BossRegistryToolSource(reg)
-    val sync = ToolNodeSync(source, registry, sourceLabel = "host")
+    val sync = ToolNodeSync(source, registry)
     return scope.launch {
         collectBossToolUpdates(reg.tools, sync)
     }
@@ -260,7 +222,15 @@ internal suspend fun collectBossToolUpdates(
     updates: Flow<List<RegisteredMcpTool>>,
     sync: ToolNodeSync,
 ) {
-    updates.collect(sync::applyRegistered)
+    updates.collect { tools ->
+        try {
+            sync.apply(tools.map { it.toDescriptor() })
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            println("[flow-tab] failed to synchronize host tools: ${toolSyncFailureMessage(failure)}")
+        }
+    }
 }
 
 internal const val MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH = 200
@@ -269,7 +239,7 @@ internal const val MAX_TOOL_SYNC_IDENTIFIER_LENGTH = 100
 internal fun toolSyncIdentifier(identifier: String): String =
     sanitizeToolSyncText(identifier, MAX_TOOL_SYNC_IDENTIFIER_LENGTH)
 
-internal fun toolSyncFailureMessage(failure: Throwable): String =
+internal fun toolSyncFailureMessage(failure: Exception): String =
     sanitizeToolSyncText(failure.message ?: "unknown error", MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH)
 
 private fun sanitizeToolSyncText(value: String, maxLength: Int): String =

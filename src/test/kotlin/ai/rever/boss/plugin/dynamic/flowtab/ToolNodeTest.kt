@@ -196,7 +196,7 @@ class ToolNodeTest {
         val fake = FakeRegistry(listOf(tool("a", "{}"), tool("b", "{}"))) { _, _ -> McpToolResult("", false) }
         val src = BossRegistryToolSource(fake)
         val reg = builtinNodeRegistry()
-        val sync = ToolNodeSync(src, reg, sourceLabel = "host")
+        val sync = ToolNodeSync(src, reg)
         runBlocking {
             sync.apply(src.list())
             assertNotNull(reg["tool:boss:a"])
@@ -216,7 +216,7 @@ class ToolNodeTest {
         val source = BossRegistryToolSource(fake)
         val registry = builtinNodeRegistry()
         val diagnostics = mutableListOf<String>()
-        val sync = ToolNodeSync(source, registry, "host", diagnostics::add)
+        val sync = ToolNodeSync(source, registry, diagnostics::add)
         fun descriptor(ref: String, label: String = ref) =
             ToolDescriptor(ToolRef(ToolScope.BOSS, ref), label, "", "{}")
 
@@ -243,7 +243,7 @@ class ToolNodeTest {
         val source = BossRegistryToolSource(fake)
         val registry = builtinNodeRegistry()
         val diagnostics = mutableListOf<String>()
-        val sync = ToolNodeSync(source, registry, "external MCP", diagnostics::add)
+        val sync = ToolNodeSync(source, registry, diagnostics::add)
         fun descriptor(ref: String, label: String = ref) =
             ToolDescriptor(ToolRef(ToolScope.EXT, ref), label, "", "{}")
 
@@ -252,7 +252,7 @@ class ToolNodeTest {
 
         assertNotNull(registry["tool:ext:last-good"], "an all-failed transient update keeps all last-good specs")
         assertEquals(1, diagnostics.size)
-        assertContains(diagnostics.single(), "external MCP tool 'tool:ext:bad id'")
+        assertContains(diagnostics.single(), "tool 'tool:ext:bad id'")
         assertFalse('\n' in diagnostics.single())
 
         sync.apply(emptyList())
@@ -266,17 +266,17 @@ class ToolNodeTest {
     }
 
     @Test
-    fun `boss tool collector applies live host updates`() = runBlocking {
+    fun `boss tool collector applies healthy peers from a malformed host update`() = runBlocking {
         val updates = MutableSharedFlow<List<RegisteredMcpTool>>()
         val fake = FakeRegistry(emptyList()) { _, _ -> McpToolResult("", false) }
         val registry = builtinNodeRegistry()
-        val sync = ToolNodeSync(BossRegistryToolSource(fake), registry, sourceLabel = "host")
+        val sync = ToolNodeSync(BossRegistryToolSource(fake), registry)
         val job = launch(start = CoroutineStart.UNDISPATCHED) {
             collectBossToolUpdates(updates, sync)
         }
 
         try {
-            updates.emit(listOf(tool("healthy", "{}")))
+            updates.emit(listOf(tool("", "{}"), tool("healthy", "{}")))
 
             withTimeout(2_000) {
                 while (registry["tool:boss:healthy"] == null) kotlinx.coroutines.yield()

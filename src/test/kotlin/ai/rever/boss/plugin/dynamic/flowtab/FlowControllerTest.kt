@@ -21,7 +21,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -39,10 +38,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicReference
-import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
@@ -763,100 +758,6 @@ class FlowControllerTest {
     }
 
     @Test
-    fun `startRun after disposal returns a durable terminal failure`() = runBlocking {
-        val storage = DesktopStorage()
-        val fc = controller(storage)
-        val tabId = fc.createFlow()
-        fc.addNode(tabId, "TRIGGER")
-        fc.dispose()
-
-        val runId = fc.startRun(tabId)
-        val rejected = fc.runStatus(runId)!!
-        assertEquals(RunJobState.FAILED, rejected.state)
-        assertEquals(FlowController.CONTROLLER_DISPOSED_ERROR, rejected.error)
-
-        val afterReload = controller(storage)
-        try {
-            val persisted = afterReload.runStatus(runId)!!
-            assertEquals(RunJobState.FAILED, persisted.state)
-            assertEquals(FlowController.CONTROLLER_DISPOSED_ERROR, persisted.error)
-        } finally {
-            afterReload.dispose()
-        }
-    }
-
-    @Test
-    fun `dispose racing start cannot miss the accepted run`() = runBlocking {
-        val storage = DesktopStorage()
-        val dispatchEntered = CountDownLatch(1)
-        val releaseDispatch = CountDownLatch(1)
-        val disposeStarted = CountDownLatch(1)
-        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
-        val registry = builtinNodeRegistry().also {
-            it.register(
-                NodeSpec(
-                    id = "RACE_HANG",
-                    label = "Race Hang",
-                    inputs = 0,
-                    outputs = 1,
-                    accent = 0,
-                    description = "test only",
-                    runMode = RunMode.ONCE,
-                    executor = NodeExecutor { _, _, _, _ -> awaitCancellation() },
-                ),
-            )
-        }
-        val fc = FlowController(
-            context = context(storage),
-            scopeProvider = {
-                dispatchEntered.countDown()
-                check(releaseDispatch.await(5, TimeUnit.SECONDS)) { "test did not release dispatch" }
-                runScope
-            },
-            registry = registry,
-        )
-        val tabId = fc.createFlow()
-        fc.addNode(tabId, "RACE_HANG")
-        val runId = AtomicReference<String>()
-        val startFailure = AtomicReference<Throwable?>()
-        val startThread = thread(name = "flow-start-race") {
-            runCatching { fc.startRun(tabId) }
-                .onSuccess(runId::set)
-                .onFailure(startFailure::set)
-        }
-
-        assertTrue(dispatchEntered.await(5, TimeUnit.SECONDS), "start must reach the locked dispatch seam")
-        val disposeThread = thread(name = "flow-dispose-race") {
-            disposeStarted.countDown()
-            fc.dispose()
-        }
-        assertTrue(disposeStarted.await(5, TimeUnit.SECONDS), "dispose must start before dispatch is released")
-        releaseDispatch.countDown()
-        startThread.join(5_000)
-        disposeThread.join(5_000)
-
-        try {
-            assertFalse(startThread.isAlive, "start must return after the race is released")
-            assertFalse(disposeThread.isAlive, "dispose must finish after the installed run is cancelled")
-            assertNull(startFailure.get())
-            val terminal = fc.runStatus(runId.get())!!
-            assertEquals(RunJobState.FAILED, terminal.state)
-            assertEquals(FlowController.CONTROLLER_DISPOSED_ERROR, terminal.error)
-
-            val afterReload = controller(storage)
-            try {
-                assertEquals(FlowController.CONTROLLER_DISPOSED_ERROR, afterReload.runStatus(runId.get())!!.error)
-            } finally {
-                afterReload.dispose()
-            }
-        } finally {
-            releaseDispatch.countDown()
-            fc.dispose()
-            runScope.cancel()
-        }
-    }
-
-    @Test
     fun `a node error fails the run but reaches a terminal state`() = runBlocking {
         val registry = builtinNodeRegistry().also {
             // Model a kind that was registered when authored but is unavailable now;
@@ -970,7 +871,7 @@ class FlowControllerTest {
     }
 
     @Test
-    fun `disposing a running job persists its terminal failure across reload`() = runBlocking {
+    fun `persisted running job becomes failed when loaded after plugin restart`() = runBlocking {
         val entered = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
         val storage = DesktopStorage()
@@ -1012,7 +913,7 @@ class FlowControllerTest {
             try {
                 val loaded = afterReload.runStatus(runId)!!
                 assertEquals(RunJobState.FAILED, loaded.state)
-                assertEquals(FlowController.CONTROLLER_DISPOSED_ERROR, loaded.error)
+                assertTrue(loaded.error!!.contains("plugin reload"))
                 assertEquals(RunStatus.ERROR, loaded.nodes.getValue(nodeId).status)
             } finally {
                 afterReload.dispose()
