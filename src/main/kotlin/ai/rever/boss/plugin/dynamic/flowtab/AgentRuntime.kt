@@ -77,8 +77,9 @@ fun interface AgentProvider {
  * unlike a provider's per-request output cap. It is a soft threshold checked before each
  * request: the request that crosses it finishes, and the run stops before another request,
  * so actual usage can exceed [maxTokens] by one full turn. It is best-effort when usage
- * is absent. Step and token thresholds are evaluated between requests; timeout also bounds
- * an in-flight provider or tool call.
+ * is absent. [maxSteps] counts model requests. Step and token thresholds are evaluated
+ * between requests and before generic tools whose results could not be sent in another
+ * request; timeout also bounds an in-flight provider or tool call.
  */
 data class AgentBudget(
     val maxSteps: Int = 8,
@@ -368,6 +369,16 @@ class AgentRuntime(
             )
         }
 
+        /** Token precedence is intentional when one turn reaches both soft thresholds. */
+        fun pendingModelLimit(): StopReason? = when {
+            usage.total >= budget.maxTokens -> StopReason.TOKEN_BUDGET
+            steps >= budget.maxSteps -> StopReason.MAX_STEPS
+            else -> null
+        }
+
+        fun stoppedAt(reason: StopReason): AgentResult =
+            done(lastText, reason, steps, toolCalls, usage, usageReported)
+
         suspend fun executeTool(call: ToolCall): ToolOutcome {
             toolCalls++
             publishProgress()
@@ -396,11 +407,8 @@ class AgentRuntime(
         }
 
         while (true) {
-            if (usage.total >= budget.maxTokens) {
-                return done(lastText, StopReason.TOKEN_BUDGET, steps, toolCalls, usage, usageReported)
-            }
-            if (steps >= budget.maxSteps) {
-                return done(lastText, StopReason.MAX_STEPS, steps, toolCalls, usage, usageReported)
+            pendingModelLimit()?.let { reason ->
+                return stoppedAt(reason)
             }
             if (System.currentTimeMillis() - started >= budget.timeoutMs)
                 return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage, usageReported)
@@ -427,6 +435,12 @@ class AgentRuntime(
                 val submissions = turn.toolCalls.filter { it.name == AgentStructuredOutput.TOOL_NAME }
                 if (submissions.isNotEmpty()) {
                     val submissionIsAlone = turn.toolCalls.size == 1
+                    // A sole valid submission completes this turn even on the last permitted
+                    // request. Mixed calls are non-completing, so do not run their generic tools
+                    // when no following request could consume the outcomes.
+                    if (!submissionIsAlone) {
+                        pendingModelLimit()?.let { reason -> return stoppedAt(reason) }
+                    }
                     val outcomes = turn.toolCalls.map { call ->
                         if (call.name != AgentStructuredOutput.TOOL_NAME) {
                             executeTool(call)
@@ -473,6 +487,7 @@ class AgentRuntime(
                     }
                     if (submissionIsAlone) {
                         structuredFailures++
+                        pendingModelLimit()?.let { reason -> return stoppedAt(reason) }
                         if (structuredFailures >= MAX_STRUCTURED_OUTPUT_FAILURES) {
                             throw ExecError(STRUCTURED_OUTPUT_FAILURE_MESSAGE)
                         }
@@ -497,6 +512,10 @@ class AgentRuntime(
             if (turn.toolCalls.isEmpty()) {
                 return done(lastText, StopReason.COMPLETED, steps, toolCalls, usage, usageReported)
             }
+
+            // Do not create side effects whose outcomes can never be presented to the model.
+            // These skipped calls are neither attempted nor included in the tool-call counter.
+            pendingModelLimit()?.let { reason -> return stoppedAt(reason) }
 
             val outcomes = turn.toolCalls.map { executeTool(it) }
             messages.add(ToolResultsMsg(outcomes))

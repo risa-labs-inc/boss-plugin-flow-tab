@@ -195,18 +195,20 @@ class AgentRuntimeTest {
     // ---- bounds -------------------------------------------------------------
 
     @Test
-    fun `max-steps stops a loop that never finishes`() = runBlocking {
+    fun `max steps skips pending tools when no next model request is permitted`() = runBlocking {
         val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("spin")))
         // Provider never yields a final text — always calls a tool.
         val provider = FakeProvider { _, _, _, _ -> AssistantTurn(toolCalls = listOf(call("spin"))) }
-        val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 3))
+        val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 1))
             .run(system = "s", input = "go", allowlist = setOf("spin"), log = logs::add)
 
         assertEquals(StopReason.MAX_STEPS, result.stopReason)
-        assertEquals(3, result.steps)
+        assertEquals(1, result.steps)
+        assertEquals(0, result.toolCalls)
+        assertTrue(source.invoked.isEmpty())
         assertEquals(
-            "agent stopped: MAX_STEPS (3 completed step(s), 3 attempted tool call(s))",
+            "agent stopped: MAX_STEPS (1 completed step(s), 0 attempted tool call(s))",
             logs.last(),
         )
     }
@@ -229,7 +231,7 @@ class AgentRuntimeTest {
     }
 
     @Test
-    fun `a token budget stops the loop`() = runBlocking {
+    fun `token budget skips pending tools after the crossing request`() = runBlocking {
         val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("spin")))
         val provider = FakeProvider { _, _, _, _ ->
@@ -240,8 +242,10 @@ class AgentRuntimeTest {
 
         assertEquals(StopReason.TOKEN_BUDGET, result.stopReason)
         assertTrue(result.usage.total >= 150)
+        assertEquals(0, result.toolCalls)
+        assertTrue(source.invoked.isEmpty())
         assertEquals(
-            "agent stopped: TOKEN_BUDGET (1 completed step(s), 1 attempted tool call(s))",
+            "agent stopped: TOKEN_BUDGET (1 completed step(s), 0 attempted tool call(s))",
             logs.last(),
         )
     }
@@ -272,6 +276,7 @@ class AgentRuntimeTest {
         assertEquals(TokenUsage(input = 70, output = 50), result.usage)
         assertEquals(120, result.usage.total)
         assertEquals(2, result.steps)
+        assertEquals(1, result.toolCalls)
         assertEquals(2, providerCalls.get(), "the cumulative limit must prevent a third model request")
     }
 
@@ -313,7 +318,8 @@ class AgentRuntimeTest {
 
         assertEquals(StopReason.TOKEN_BUDGET, result.stopReason)
         assertEquals(1, result.steps)
-        assertEquals(1, result.toolCalls)
+        assertEquals(0, result.toolCalls)
+        assertTrue(source.invoked.isEmpty())
     }
 
     @Test
@@ -391,6 +397,7 @@ class AgentRuntimeTest {
         assertEquals(1, result.steps)
         assertEquals(1, result.toolCalls)
         assertEquals(TokenUsage(input = 4, output = 3), result.usage)
+        assertTrue(result.usageReported)
         assertTrue(elapsed < 2_000, "non-cooperative step held the caller for ${elapsed}ms")
         assertEquals(logsAtTimeout, logs, "late completion must not mutate published timeout logs")
         assertEquals(

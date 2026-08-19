@@ -77,12 +77,21 @@ request (rather than the provider's chat-completion default of 2000) because a t
 the headroom. This documents the existing semantics; it does not change either default or split the
 `AgentBudget` API.
 
+`maxSteps` counts model requests. After any non-completing turn, the runtime checks `maxTokens`
+first and then `maxSteps` before executing generic tool calls. If no next model request is permitted,
+pending tools are skipped without invocation and without incrementing the attempted-tool counter;
+their side effects would be pointless because their results could never reach the model. Raise
+`maxSteps` to permit another tool round and a final answer. A valid `flow_submit_output` is still
+accepted on the final permitted step because it completes the structured contract without another
+request. Token-budget precedence is intentional when the same turn reaches both thresholds.
+
 `timeoutMs` is a hard node deadline, not merely a check between agent steps. `AgentRuntime` owns
 its loop on a 64-call, concurrency-limited elastic IO view so a non-cooperative provider or tool
 boundary cannot prevent the caller from publishing TIMEOUT or consume every unrelated host IO
 permit. The budget clock starts only after the loop is admitted to that lane. If all slots remain
 occupied, a short bounded admission wait fails explicitly as Agent capacity exhaustion instead of
-pretending a provider timed out without running. The loop gets the configured cooperative deadline;
+pretending a provider timed out without running. The loop gets the effective cooperative deadline
+(the configured value capped below the flow watchdog);
 a watchdog grace (at least 500ms, or 5% for longer runs) lets it publish complete counters normally
 before the hard caller deadline abandons a non-cooperative call. The scope is cancelled best-effort,
 no new host work starts after the deadline, and progress counters are snapshotted for the timeout

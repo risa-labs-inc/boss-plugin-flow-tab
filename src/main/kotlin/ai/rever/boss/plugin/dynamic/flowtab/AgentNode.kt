@@ -26,6 +26,7 @@ object AgentNode {
     const val MODEL_KEY = "model"
     const val TEMPERATURE_KEY = "temperature"
     const val MAX_STEPS_KEY = "maxSteps"
+    const val MAX_STEPS_INFO_KEY = "maxStepsInfo"
     const val TIMEOUT_KEY = "timeoutMs"
     const val MAX_TOKENS_KEY = "maxTokens"
     const val MAX_TOKENS_INFO_KEY = "maxTokensInfo"
@@ -76,6 +77,14 @@ object AgentNode {
             placeholder = "0–2 (range varies by provider); e.g. 0.2 or {{ \$json.temp }}",
         ),
         ConfigField(MAX_STEPS_KEY, "Max steps", FieldType.NUMBER, default = "8"),
+        ConfigField(
+            MAX_STEPS_INFO_KEY,
+            "Step budget notes",
+            FieldType.INFO,
+            note = "Maximum model requests. If a non-final response reaches this limit, the Agent fails before " +
+                "running that response's pending tools because no next request could use their results. " +
+                "Raise Max steps to allow another tool round and a final answer.",
+        ),
         ConfigField(
             TIMEOUT_KEY,
             "Timeout (ms, max 720000)",
@@ -171,7 +180,7 @@ class AgentNodeExecutor(
             StopReason.TIMEOUT -> failIncompleteRun(
                 settings,
                 result,
-                "configured timeoutMs was ${settings.budget.timeoutMs}ms",
+                "effective timeoutMs was ${settings.budget.timeoutMs}ms",
                 log,
             )
         }
@@ -189,8 +198,9 @@ class AgentNodeExecutor(
                     log("agent non-structured final text withheld (${result.finalText.length} chars)")
                 }
                 throw ExecError(
-                    "Agent stopped: COMPLETED after ${result.steps} completed step(s), " +
-                        "${result.toolCalls} attempted tool call(s); no valid structured output was produced",
+                    "Agent contract violation: runtime reported COMPLETED after ${result.steps} completed step(s), " +
+                        "${result.toolCalls} attempted tool call(s), but returned no valid structured output; " +
+                        usageClause(result),
                 )
             }
             return NodeOutput.single(listOf(Item(structured)))
@@ -214,12 +224,7 @@ class AgentNodeExecutor(
         if (result.finalText.isNotBlank()) {
             log("agent partial text withheld (${result.finalText.length} chars)")
         }
-        val usage = if (result.usageReported) {
-            "provider-reported usage was ${result.usage.total} token(s) " +
-                "(input ${result.usage.input} + output ${result.usage.output})"
-        } else {
-            "provider-reported usage was unavailable"
-        }
+        val usage = usageClause(result)
         val missingOutput = if (settings.outputSchema == null) {
             "no final response was completed"
         } else {
@@ -229,6 +234,13 @@ class AgentNodeExecutor(
             "Agent stopped: ${result.stopReason} after ${result.steps} completed step(s), " +
                 "${result.toolCalls} attempted tool call(s); $configuredLimit; $usage; $missingOutput",
         )
+    }
+
+    private fun usageClause(result: AgentResult): String = if (result.usageReported) {
+        "provider-reported usage was ${result.usage.total} token(s) " +
+            "(input ${result.usage.input} + output ${result.usage.output})"
+    } else {
+        "provider-reported usage was unavailable"
     }
 
     private suspend fun resolveSystem(settings: AgentSettings): String {
