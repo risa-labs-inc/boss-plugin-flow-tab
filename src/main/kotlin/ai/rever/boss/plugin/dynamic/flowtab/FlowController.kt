@@ -412,9 +412,20 @@ class FlowController(
      * the headless [FlowExecutor]; poll [runStatus]/[runResult] for progress. A missing
      * flow or an executor throw becomes a [RunJobState.FAILED] job (never a crash); a
      * run in which any node errors is FAILED too, but always reaches a terminal state.
+     * An already-disposed controller returns a terminal failure without dispatching work.
      */
     fun startRun(tabId: String, depth: Int = 0, ancestry: Set<String> = emptySet()): String {
         val runId = "run-${UUID.randomUUID()}"
+        val disposalError = "Flow controller disposed"
+        if (synchronized(toolSyncLock) { disposed }) {
+            jobs[runId] = RunJob(
+                runId = runId,
+                tabId = tabId,
+                state = RunJobState.FAILED,
+                error = disposalError,
+            )
+            return runId
+        }
         jobs[runId] = RunJob(runId, tabId, RunJobState.RUNNING)
         val states = ConcurrentHashMap<String, NodeRun>()
         runStates[runId] = states
@@ -466,22 +477,25 @@ class FlowController(
             persistRun(published)
         }
         executions[runId] = execution
+        // Install before rechecking under the lock: either this check cancels the run,
+        // or a later dispose transition observes the already-present map entry in its sweep.
         execution.invokeOnCompletion { cause ->
             if (cause is CancellationException) {
+                val message = cause.message?.let { "Flow run cancelled: $it" }
+                    ?: "Flow run cancelled before dispatch"
                 transitionToFailed(
                     runId,
                     tabId,
                     states,
-                    cause.message ?: "Flow run cancelled before dispatch",
+                    message,
                 )
             }
             executions.remove(runId, execution)
             runStates.remove(runId, states)
         }
         if (synchronized(toolSyncLock) { disposed }) {
-            val message = "Flow controller disposed"
-            transitionToFailed(runId, tabId, states, message)
-            execution.cancel(CancellationException(message))
+            transitionToFailed(runId, tabId, states, disposalError)
+            execution.cancel(CancellationException(disposalError))
         }
 
         // This monitor is deliberately not a child of execution. join() is cancellable,

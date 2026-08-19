@@ -83,7 +83,10 @@ class FlowControllerTest {
         tabUpdates: TabUpdateProviderFactory? = null,
     ) = FlowController(context(storage, tabUpdates), { scope }, registry, runTimeoutMs)
 
-    private fun hangingRegistry(kind: String): NodeRegistry = builtinNodeRegistry().also {
+    private fun hangingRegistry(
+        kind: String,
+        onStart: () -> Unit = {},
+    ): NodeRegistry = builtinNodeRegistry().also {
         it.register(
             NodeSpec(
                 id = kind,
@@ -93,7 +96,10 @@ class FlowControllerTest {
                 accent = 0,
                 description = "test only",
                 runMode = RunMode.ONCE,
-                executor = NodeExecutor { _, _, _, _ -> awaitCancellation() },
+                executor = NodeExecutor { _, _, _, _ ->
+                    onStart()
+                    awaitCancellation()
+                },
             ),
         )
     }
@@ -942,8 +948,17 @@ class FlowControllerTest {
     }
 
     @Test
-    fun `start after disposal is promptly failed without a second dispose`() = runBlocking {
-        val fc = controller(registry = hangingRegistry("POST_DISPOSE_HANG"))
+    fun `start after disposal fails without resolving scope or invoking executor`() = runBlocking {
+        var scopeResolved = false
+        var executorInvoked = false
+        val fc = FlowController(
+            context = context(DesktopStorage()),
+            scopeProvider = {
+                scopeResolved = true
+                scope
+            },
+            registry = hangingRegistry("POST_DISPOSE_HANG") { executorInvoked = true },
+        )
         val tabId = fc.createFlow()
         fc.addNode(tabId, "POST_DISPOSE_HANG")
 
@@ -953,6 +968,8 @@ class FlowControllerTest {
             val terminal = fc.runStatus(runId)!!
             assertEquals(RunJobState.FAILED, terminal.state)
             assertEquals("Flow controller disposed", terminal.error)
+            assertFalse(scopeResolved, "a disposed controller must not resolve the host execution scope")
+            assertFalse(executorInvoked, "a disposed controller must not dispatch host work")
         } finally {
             fc.dispose()
         }
@@ -988,6 +1005,32 @@ class FlowControllerTest {
             assertEquals("Flow controller disposed", terminal.error)
         } finally {
             releaseProvider.countDown()
+            fc.dispose()
+            runScope.cancel()
+        }
+    }
+
+    @Test
+    fun `scope cancellation uses stable flow cancellation wording`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val fc = FlowController(
+            context = context(DesktopStorage()),
+            scopeProvider = { runScope },
+            registry = hangingRegistry("SCOPE_CANCEL_HANG") { entered.complete(Unit) },
+        )
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "SCOPE_CANCEL_HANG")
+        val runId = fc.startRun(tabId)
+
+        try {
+            withTimeout(5_000) { entered.await() }
+            runScope.cancel(CancellationException("sandbox scope replaced"))
+
+            val terminal = awaitTerminal(fc, runId)
+            assertEquals(RunJobState.FAILED, terminal.state)
+            assertEquals("Flow run cancelled: sandbox scope replaced", terminal.error)
+        } finally {
             fc.dispose()
             runScope.cancel()
         }
