@@ -1,7 +1,8 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
-import kotlinx.coroutines.CompletableDeferred
+import ai.rever.boss.plugin.api.PluginStorageProvider
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -12,6 +13,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -79,6 +81,7 @@ class ExternalMcpTest {
         secrets: SecretResolver = SecretResolver.constant(null),
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
         log: (String) -> Unit = {},
+        serverOperationTimeoutMs: Long = ExternalMcpManager.DEFAULT_SERVER_OPERATION_TIMEOUT_MS,
         factory: McpTransportFactory,
     ) = ExternalMcpManager(
         storage = storage,
@@ -87,6 +90,7 @@ class ExternalMcpTest {
         transportFactory = factory,
         log = log,
         ioDispatcher = ioDispatcher,
+        serverOperationTimeoutMs = serverOperationTimeoutMs,
     )
 
     private suspend fun seedEnabledServer(storage: TestStorage, config: McpServerConfig) {
@@ -202,6 +206,35 @@ class ExternalMcpTest {
         val raw = storage.map[ExternalMcpManager.CONFIG_KEY]!!
         assertTrue(raw.contains("MY_TOKEN"))
         assertFalse(raw.contains("s3cr3t"))
+    }
+
+    @Test
+    fun `legacy stdio secret reference is normalized and never resolved`() = runBlocking {
+        val storage = TestStorage()
+        seedEnabledServer(
+            storage,
+            McpServerConfig(
+                "legacy",
+                McpTransportKind.STDIO,
+                command = "x",
+                enabled = true,
+                secretRef = "ORPHANED_TOKEN",
+            ),
+        )
+        var secretReads = 0
+        val m = manager(
+            storage = storage,
+            secrets = SecretResolver { secretReads++; "unused-secret" },
+        ) { _, secret ->
+            assertNull(secret)
+            FakeTransport(emptyList())
+        }
+
+        m.start()
+
+        assertNull(m.listConfigs().single().secretRef)
+        assertEquals(0, secretReads)
+        m.disposeAll()
     }
 
     // ---- persistence --------------------------------------------------------
@@ -371,6 +404,94 @@ class ExternalMcpTest {
     }
 
     @Test
+    fun `hung connect times out cleans transport and lets queued remove settle`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        val logged = mutableListOf<String>()
+        seedEnabledServer(
+            storage,
+            McpServerConfig("hung", McpTransportKind.STDIO, command = "x", enabled = true),
+        )
+        val connectStarted = CompletableDeferred<Unit>()
+        var closed = false
+        val m = manager(
+            storage = storage,
+            ioDispatcher = dispatcher,
+            log = logged::add,
+            serverOperationTimeoutMs = 1_000,
+        ) { _, _ ->
+            object : McpTransport {
+                override suspend fun connect() {
+                    connectStarted.complete(Unit)
+                    CompletableDeferred<Unit>().await()
+                }
+                override suspend fun listTools(): List<RemoteTool> = emptyList()
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() { closed = true }
+            }
+        }
+
+        val startup = m.requestStart()
+        connectStarted.await()
+        val queuedRemove = m.requestRemoveConfig("hung")
+        assertFalse(queuedRemove.isCompleted)
+
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        startup.await()
+        assertTrue(queuedRemove.await())
+        assertTrue(closed)
+        assertTrue(m.listConfigs().isEmpty())
+        assertTrue(logged.any { "timed out while connecting" in it })
+        m.disposeAll()
+    }
+
+    @Test
+    fun `hung discovery times out cleans live transport and lets queued remove settle`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        val logged = mutableListOf<String>()
+        seedEnabledServer(
+            storage,
+            McpServerConfig("hung", McpTransportKind.STDIO, command = "x", enabled = true),
+        )
+        val discoveryStarted = CompletableDeferred<Unit>()
+        var closed = false
+        val m = manager(
+            storage = storage,
+            ioDispatcher = dispatcher,
+            log = logged::add,
+            serverOperationTimeoutMs = 1_000,
+        ) { _, _ ->
+            object : McpTransport {
+                override suspend fun connect() = Unit
+                override suspend fun listTools(): List<RemoteTool> {
+                    discoveryStarted.complete(Unit)
+                    return CompletableDeferred<List<RemoteTool>>().await()
+                }
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() { closed = true }
+            }
+        }
+
+        val startup = m.requestStart()
+        discoveryStarted.await()
+        val queuedRemove = m.requestRemoveConfig("hung")
+        assertFalse(queuedRemove.isCompleted)
+
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        startup.await()
+        assertTrue(queuedRemove.await())
+        assertTrue(closed)
+        assertTrue(m.descriptors.value.isEmpty())
+        assertTrue(logged.any { "timed out while listing tools" in it })
+        m.disposeAll()
+    }
+
+    @Test
     fun `caller cancellation does not cancel an accepted manager mutation`() = runTest {
         val dispatcher = UnconfinedTestDispatcher(testScheduler)
         val storage = TestStorage()
@@ -447,7 +568,7 @@ class ExternalMcpTest {
     }
 
     @Test
-    fun `successful rediscovery clears a transient error status`() = runBlocking {
+    fun `later start retries transient startup discovery failure and clears error`() = runBlocking {
         val storage = TestStorage()
         seedEnabledServer(
             storage,
@@ -461,7 +582,7 @@ class ExternalMcpTest {
         assertTrue(m.descriptors.value.isEmpty())
 
         transport.failList = false
-        m.refresh()
+        m.start()
 
         assertEquals(ExternalMcpServerState.CONNECTED, m.serverStatuses.value.getValue("s").state)
         assertEquals(listOf("s/recovered"), m.descriptors.value.map { it.ref.name })
@@ -554,9 +675,10 @@ class ExternalMcpTest {
             storage,
             McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = true),
         )
-        val rawPayload = "fatal-provider-payload"
+        val rawPayload = "fatal-provider-secret\nforged line"
+        val logged = mutableListOf<String>()
         var closed = false
-        val m = manager(storage, ioDispatcher = dispatcher) { _, _ ->
+        val m = manager(storage, ioDispatcher = dispatcher, log = logged::add) { _, _ ->
             object : McpTransport {
                 override suspend fun connect(): Unit = throw NoClassDefFoundError(rawPayload)
                 override suspend fun listTools(): List<RemoteTool> = emptyList()
@@ -568,12 +690,52 @@ class ExternalMcpTest {
         val failedStart = m.requestStart()
         runCurrent()
         val failure = assertFailsWith<IllegalStateException> { failedStart.await() }
+        assertEquals("External MCP manager crashed; reload the plugin to retry", failure.message)
         assertFalse(rawPayload in failure.message.orEmpty())
         assertTrue(closed)
+        assertTrue(logged.any { "crashed; reload the plugin" in it && "NoClassDefFoundError" in it })
+        assertTrue(logged.none { "fatal-provider-secret" in it || "forged line" in it || '\n' in it })
+        assertTrue(logged.all { it.length <= ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH })
 
         val next = m.requestAddConfig(McpServerConfig("later", McpTransportKind.STDIO, command = "y"))
         assertTrue(next.isCompleted)
-        assertFailsWith<IllegalStateException> { next.await() }
+        val rejection = assertFailsWith<IllegalStateException> { next.await() }
+        assertEquals("External MCP manager crashed; reload the plugin to retry", rejection.message)
+        val rejectionChain = generateSequence<Throwable>(rejection) { it.cause }.toList()
+        assertTrue(rejectionChain.none { "fatal-provider-secret" in it.message.orEmpty() || '\n' in it.message.orEmpty() })
+    }
+
+    @Test
+    fun `generic actor failure logs bounded type but exposes no provider payload`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val backing = TestStorage()
+        val rawPayload = "storage-provider-secret\nforged line"
+        val storage = object : PluginStorageProvider by backing {
+            override suspend fun putJson(key: String, jsonValue: String) {
+                throw IllegalStateException(rawPayload)
+            }
+        }
+        val logged = mutableListOf<String>()
+        val m = ExternalMcpManager(
+            storage = storage,
+            secrets = SecretResolver.constant(null),
+            settings = SettingsStore(storage),
+            transportFactory = { _, _ -> FakeTransport(emptyList()) },
+            log = logged::add,
+            ioDispatcher = dispatcher,
+        )
+
+        val failure = assertFailsWith<IllegalStateException> {
+            m.addConfig(McpServerConfig("s", McpTransportKind.STDIO, command = "x"))
+        }
+
+        assertEquals("External MCP operation failed", failure.message)
+        val failureChain = generateSequence<Throwable>(failure) { it.cause }.toList()
+        assertTrue(failureChain.none { "storage-provider-secret" in it.message.orEmpty() || '\n' in it.message.orEmpty() })
+        assertTrue(logged.any { "operation failed" in it && "IllegalStateException" in it })
+        assertTrue(logged.none { "storage-provider-secret" in it || "forged line" in it || '\n' in it })
+        assertTrue(logged.all { it.length <= ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH })
+        m.cancelNow()
     }
 
     @Test
@@ -726,11 +888,14 @@ class ExternalMcpTest {
         assertEquals("External MCP operation cancelled", activeFailure.message)
         assertTrue(closed)
         assertTrue(queued.isCompleted)
-        assertFailsWith<IllegalStateException> { queued.await() }
+        val queuedFailure = assertFailsWith<IllegalStateException> { queued.await() }
+        assertEquals("External MCP manager is disposed", queuedFailure.message)
         val late = m.requestRefresh()
         assertTrue(late.isCompleted)
-        assertFailsWith<IllegalStateException> { late.await() }
-        assertFailsWith<IllegalStateException> { m.disposeAll() }
+        val lateFailure = assertFailsWith<IllegalStateException> { late.await() }
+        assertEquals("External MCP manager is disposed", lateFailure.message)
+        val disposalFailure = assertFailsWith<IllegalStateException> { m.disposeAll() }
+        assertEquals("External MCP manager is disposed", disposalFailure.message)
     }
 
     // ---- settings store -----------------------------------------------------

@@ -98,6 +98,7 @@ fun McpServerConfigPanel(
         if (busy) return
         busy = true
         operationError = null
+        val submittedAtTick = manager.changeTick.value
         val request = submit()
         scope.launch {
             try {
@@ -109,7 +110,10 @@ fun McpServerConfigPanel(
                 operationError = boundedExternalMcpDiagnostic(failure.message)
             } finally {
                 try {
-                    reloadSafely()
+                    // A settled reconcile publishes a tick and the panel collector owns
+                    // that reload. Only fall back to a direct reload when the request was
+                    // rejected/no-op/failed before publishing one.
+                    if (manager.changeTick.value == submittedAtTick) reloadSafely()
                 } finally {
                     busy = false
                 }
@@ -352,6 +356,8 @@ internal data class McpServerDraft(
             },
             url = if (kind == McpTransportKind.HTTP_SSE) url.trim() else "",
             enabled = false,
+            // Stdio child-process environment injection is not implemented; only the
+            // HTTP/SSE transport consumes a resolved secret reference.
             secretRef = if (kind == McpTransportKind.HTTP_SSE) secretRef.trim().ifBlank { null } else null,
         )
     }
