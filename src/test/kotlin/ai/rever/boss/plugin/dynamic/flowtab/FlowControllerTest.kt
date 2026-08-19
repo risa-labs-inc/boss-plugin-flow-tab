@@ -21,6 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -38,6 +39,8 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
@@ -45,6 +48,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -78,6 +82,27 @@ class FlowControllerTest {
         runTimeoutMs: Long = FlowController.DEFAULT_RUN_TIMEOUT_MS,
         tabUpdates: TabUpdateProviderFactory? = null,
     ) = FlowController(context(storage, tabUpdates), { scope }, registry, runTimeoutMs)
+
+    private fun hangingRegistry(
+        kind: String,
+        onStart: () -> Unit = {},
+    ): NodeRegistry = builtinNodeRegistry().also {
+        it.register(
+            NodeSpec(
+                id = kind,
+                label = "Hang",
+                inputs = 0,
+                outputs = 1,
+                accent = 0,
+                description = "test only",
+                runMode = RunMode.ONCE,
+                executor = NodeExecutor { _, _, _, _ ->
+                    onStart()
+                    awaitCancellation()
+                },
+            ),
+        )
+    }
 
     // ---- authoring ----------------------------------------------------------
 
@@ -923,6 +948,95 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `start after disposal fails without resolving scope or invoking executor`() = runBlocking {
+        var scopeResolved = false
+        var executorInvoked = false
+        val fc = FlowController(
+            context = context(DesktopStorage()),
+            scopeProvider = {
+                scopeResolved = true
+                scope
+            },
+            registry = hangingRegistry("POST_DISPOSE_HANG") { executorInvoked = true },
+        )
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "POST_DISPOSE_HANG")
+
+        try {
+            fc.dispose()
+            val runId = fc.startRun(tabId)
+            val terminal = fc.runStatus(runId)!!
+            assertEquals(RunJobState.FAILED, terminal.state)
+            assertEquals("Flow controller disposed", terminal.error)
+            assertFalse(scopeResolved, "a disposed controller must not resolve the host execution scope")
+            assertFalse(executorInvoked, "a disposed controller must not dispatch host work")
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `start racing disposal is failed after execution installation`() = runBlocking {
+        val storage = DesktopStorage()
+        val providerEntered = CountDownLatch(1)
+        val releaseProvider = CountDownLatch(1)
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val fc = FlowController(
+            context = context(storage),
+            scopeProvider = {
+                providerEntered.countDown()
+                check(releaseProvider.await(5, TimeUnit.SECONDS)) { "test did not release scope provider" }
+                runScope
+            },
+            registry = hangingRegistry("RACING_DISPOSE_HANG"),
+        )
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "RACING_DISPOSE_HANG")
+        val start = async(Dispatchers.Default) { fc.startRun(tabId) }
+
+        try {
+            assertTrue(providerEntered.await(5, TimeUnit.SECONDS), "start must reach the scope provider")
+            fc.dispose()
+            releaseProvider.countDown()
+
+            val runId = withTimeout(5_000) { start.await() }
+            val terminal = fc.runStatus(runId)!!
+            assertEquals(RunJobState.FAILED, terminal.state)
+            assertEquals("Flow controller disposed", terminal.error)
+        } finally {
+            releaseProvider.countDown()
+            fc.dispose()
+            runScope.cancel()
+        }
+    }
+
+    @Test
+    fun `scope cancellation uses stable flow cancellation wording`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val fc = FlowController(
+            context = context(DesktopStorage()),
+            scopeProvider = { runScope },
+            registry = hangingRegistry("SCOPE_CANCEL_HANG") { entered.complete(Unit) },
+        )
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "SCOPE_CANCEL_HANG")
+        val runId = fc.startRun(tabId)
+
+        try {
+            withTimeout(5_000) { entered.await() }
+            runScope.cancel(CancellationException("sandbox scope replaced"))
+
+            val terminal = awaitTerminal(fc, runId)
+            assertEquals(RunJobState.FAILED, terminal.state)
+            assertEquals("Flow run cancelled: sandbox scope replaced", terminal.error)
+        } finally {
+            fc.dispose()
+            runScope.cancel()
+        }
+    }
+
+    @Test
     fun `headless runs use the replacement sandbox scope after watchdog restart`() = runBlocking {
         val storage = DesktopStorage()
         var sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -935,27 +1049,49 @@ class FlowControllerTest {
             }
         }
         val fc = buildHeadlessController(ctx, PromptRegistry(storage), external = null)
-        val tabId = fc.createFlow()
-        fc.addNode(tabId, "TRIGGER")
+        try {
+            val tabId = fc.createFlow()
+            fc.addNode(tabId, "TRIGGER")
 
-        sandboxScope.cancel()
-        sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            sandboxScope.cancel()
+            sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-        val job = awaitTerminal(fc, fc.startRun(tabId))
-        assertEquals(RunJobState.SUCCEEDED, job.state)
+            val job = awaitTerminal(fc, fc.startRun(tabId))
+            assertEquals(RunJobState.SUCCEEDED, job.state)
+        } finally {
+            fc.dispose()
+            sandboxScope.cancel()
+        }
     }
 
     @Test
-    fun `dispatch into an already cancelled scope fails instead of staying running`() = runBlocking {
+    fun `dispatch into an already cancelled scope fails and persists without raw coroutine text`() = runBlocking {
         val cancelledScope = CoroutineScope(Dispatchers.Default + SupervisorJob()).also { it.cancel() }
         val storage = DesktopStorage()
         val fc = FlowController(context(storage), { cancelledScope })
         val tabId = fc.createFlow()
         fc.addNode(tabId, "TRIGGER")
 
-        val job = awaitTerminal(fc, fc.startRun(tabId))
+        val runId = fc.startRun(tabId)
+        val job = awaitTerminal(fc, runId)
         assertEquals(RunJobState.FAILED, job.state)
-        assertTrue(job.error!!.contains("cancel", ignoreCase = true))
+        assertEquals("Flow run cancelled before dispatch", job.error)
+
+        val reloaded = FlowController(context(storage), { scope })
+        try {
+            val persisted = withTimeout(5_000) {
+                while (true) {
+                    reloaded.runStatus(runId)?.let { return@withTimeout it }
+                    delay(10)
+                }
+                error("unreachable")
+            }
+            assertEquals(RunJobState.FAILED, persisted.state)
+            assertEquals("Flow run cancelled before dispatch", persisted.error)
+        } finally {
+            reloaded.dispose()
+            fc.dispose()
+        }
     }
 
     @Test
@@ -995,21 +1131,34 @@ class FlowControllerTest {
 
     /** Minimal fake registry exposing one boss tool so syncBossTools has something to sync. */
     private class FakeBossRegistry(name: String) : McpToolRegistry {
-        private val _tools = MutableStateFlow(
-            listOf(RegisteredMcpTool("prov", McpToolDefinition(name, "d", """{"type":"object"}""", true) { McpToolResult("ok", false) }))
-        )
+        private val _tools = MutableStateFlow(listOf(registeredTool(name)))
         override val tools: StateFlow<List<RegisteredMcpTool>> get() = _tools
         override val allTools: StateFlow<List<RegisteredMcpTool>> get() = _tools
         override val disabledToolNames: StateFlow<Set<String>> = MutableStateFlow(emptySet())
         override fun setToolEnabled(toolName: String, enabled: Boolean) {}
         override suspend fun invoke(toolName: String, arguments: String): McpToolResult = McpToolResult("ok", false)
+
+        fun replaceWith(name: String) {
+            _tools.value = listOf(registeredTool(name))
+        }
+
+        companion object {
+            private fun registeredTool(name: String) = RegisteredMcpTool(
+                "prov",
+                McpToolDefinition(name, "d", """{"type":"object"}""", true) { McpToolResult("ok", false) },
+            )
+        }
     }
 
-    private fun contextWithBossTool(storage: PluginStorageProvider, tool: String): PluginContext = object : PluginContext {
+    private fun contextWithBossTool(
+        storage: PluginStorageProvider,
+        bossRegistry: McpToolRegistry,
+        scopeProvider: () -> CoroutineScope = { scope },
+    ): PluginContext = object : PluginContext {
         override val panelRegistry = PanelRegistry()
         override val tabRegistry = TabRegistry()
-        override val pluginScope = scope
-        override val mcpToolRegistry: McpToolRegistry? = FakeBossRegistry(tool)
+        override val pluginScope: CoroutineScope get() = scopeProvider()
+        override val mcpToolRegistry: McpToolRegistry = bossRegistry
         override val pluginStorageFactory = object : PluginStorageFactory {
             override fun createStorage(pluginId: String): PluginStorageProvider = storage
         }
@@ -1018,14 +1167,124 @@ class FlowControllerTest {
     @Test
     fun `headless controller resolves boss tool node kinds so MCP flow_run can use them`() = runBlocking {
         val storage = DesktopStorage()
-        val ctx = contextWithBossTool(storage, "demo")
+        val ctx = contextWithBossTool(storage, FakeBossRegistry("demo"))
         val controller = buildHeadlessController(ctx, PromptRegistry(storage), external = null, scope = scope)
-        // The tools StateFlow collector registers the kind asynchronously; wait for it.
-        withTimeout(2_000) {
-            while (controller.registry.resolve("tool:boss:demo").isUnavailable) delay(10)
+        try {
+            // The tools StateFlow collector registers the kind asynchronously; wait for it.
+            withTimeout(2_000) {
+                while (controller.registry.resolve("tool:boss:demo").isUnavailable) delay(10)
+            }
+            val spec = controller.registry.resolve("tool:boss:demo")
+            assertTrue(!spec.isUnavailable, "boss tool kind must be registered on the headless registry")
+            assertNotNull(spec.executor, "boss tool node must be runnable via flow_run")
+        } finally {
+            controller.dispose()
         }
-        val spec = controller.registry.resolve("tool:boss:demo")
-        assertTrue(!spec.isUnavailable, "boss tool kind must be registered on the headless registry")
-        assertNotNull(spec.executor, "boss tool node must be runnable via flow_run")
+    }
+
+    @Test
+    fun `headless tool sync is idempotent`() = runBlocking {
+        val storage = DesktopStorage()
+        val ctx = contextWithBossTool(storage, FakeBossRegistry("demo"))
+        val controller = FlowController(ctx)
+        try {
+            val first = controller.startToolRegistrySync(external = null)
+            val second = controller.startToolRegistrySync(external = null)
+
+            assertSame(first, second, "restarting sync must return the existing jobs")
+            assertEquals(1, first.size, "only one host registry collector should be installed")
+        } finally {
+            controller.dispose()
+        }
+    }
+
+    @Test
+    fun `external-only sync does not block later host registry startup`() = runBlocking {
+        val storage = DesktopStorage()
+        var bossRegistry: McpToolRegistry? = null
+        val ctx = object : PluginContext {
+            override val panelRegistry = PanelRegistry()
+            override val tabRegistry = TabRegistry()
+            override val pluginScope: CoroutineScope get() = scope
+            override val mcpToolRegistry: McpToolRegistry? get() = bossRegistry
+            override val pluginStorageFactory = object : PluginStorageFactory {
+                override fun createStorage(pluginId: String): PluginStorageProvider = storage
+            }
+        }
+        val controller = FlowController(ctx)
+        val external = ExternalMcpManager(
+            storage,
+            SecretResolver.constant(null),
+            SettingsStore(storage),
+        )
+
+        try {
+            val externalOnly = controller.startToolRegistrySync(external)
+            assertEquals(1, externalOnly.size, "the external job should start without a host registry")
+
+            bossRegistry = FakeBossRegistry("late")
+            val both = controller.startToolRegistrySync(external)
+            assertEquals(2, both.size, "a later host registry should add its collector")
+            assertTrue(externalOnly.single() in both, "the existing external job must not be duplicated")
+            assertSame(both, controller.startToolRegistrySync(external), "a stable retry must remain idempotent")
+            withTimeout(2_000) {
+                while (controller.registry.resolve("tool:boss:late").isUnavailable) delay(10)
+            }
+        } finally {
+            controller.dispose()
+        }
+    }
+
+    @Test
+    fun `tool sync startup after controller disposal fails explicitly`() {
+        val storage = DesktopStorage()
+        val ctx = contextWithBossTool(storage, FakeBossRegistry("demo"))
+        val controller = FlowController(ctx)
+        controller.dispose()
+
+        val failure = assertFailsWith<IllegalStateException> {
+            controller.startToolRegistrySync(external = null)
+        }
+        assertContains(failure.message.orEmpty(), "after controller disposal")
+    }
+
+    @Test
+    fun `headless tool sync survives sandbox scope replacement and stops on dispose`() = runBlocking {
+        val storage = DesktopStorage()
+        val bossRegistry = FakeBossRegistry("before-restart")
+        var sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val ctx = contextWithBossTool(storage, bossRegistry) { sandboxScope }
+        val controller = buildHeadlessController(ctx, PromptRegistry(storage), external = null)
+        val syncJobs = controller.startToolRegistrySync(external = null)
+
+        try {
+            withTimeout(2_000) {
+                while (controller.registry.resolve("tool:boss:before-restart").isUnavailable) delay(10)
+            }
+
+            sandboxScope.cancel()
+            sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+            bossRegistry.replaceWith("after-restart")
+
+            withTimeout(2_000) {
+                while (controller.registry.resolve("tool:boss:after-restart").isUnavailable) delay(10)
+            }
+            assertTrue(
+                controller.registry.resolve("tool:boss:before-restart").isUnavailable,
+                "a removed pre-restart tool must be unregistered",
+            )
+
+            controller.dispose()
+            withTimeout(2_000) { syncJobs.forEach { it.join() } }
+            assertTrue(syncJobs.all { it.isCancelled }, "dispose must cancel every live sync job")
+            bossRegistry.replaceWith("after-dispose")
+            assertTrue(
+                controller.registry.resolve("tool:boss:after-dispose").isUnavailable,
+                "disposed synchronization must not apply later registry updates",
+            )
+        } finally {
+            controller.dispose()
+            sandboxScope.cancel()
+        }
     }
 }

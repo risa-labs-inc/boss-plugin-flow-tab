@@ -169,6 +169,9 @@ class FlowTabComponent(
 
     init {
         FlowPersistenceCoordinator.registerLiveCanvas(config.id, liveCanvas)
+        // The visible UI intentionally owns sync with the tab scope; only the headless
+        // controller uses its independent lifecycle so watchdog scope replacement cannot
+        // freeze MCP-authored flows. Do not unify these two different lifetimes.
         // Surface the host registry's tools as live palette nodes, re-deriving whenever
         // the RBAC-filtered tool set changes. A null registry (older/sandboxed host)
         // degrades cleanly to built-ins only. The collector is tied to [coroutineScope]

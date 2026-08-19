@@ -1,8 +1,11 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.boss.plugin.api.RegisteredMcpTool
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -117,38 +120,86 @@ class ToolNodeExecutor(
  * into [NodeSpec.defaultConfig] so a spawned node keeps them for the absent-tool
  * case (F4).
  */
-fun toolNodeSpec(desc: ToolDescriptor, source: ToolSource): NodeSpec = NodeSpec(
-    id = desc.ref.kindId,
-    label = desc.name,
-    inputs = 1,
-    outputs = 1,
-    accent = ToolNode.ACCENT,
-    description = desc.description.ifBlank { "Tool: ${desc.name}" },
-    runMode = RunMode.PER_ITEM,
-    configFields = JsonSchemaToConfig.convert(desc.inputSchema),
-    executor = ToolNodeExecutor(source, desc.ref, desc.inputSchema),
-    defaultConfig = buildJsonObject {
-        put(ToolNode.REF_KEY, desc.ref.kindId)
-        put(ToolNode.SCHEMA_KEY, desc.inputSchema)
-    },
-)
+fun toolNodeSpec(desc: ToolDescriptor, source: ToolSource): NodeSpec {
+    require(desc.ref.name.isNotBlank()) { "Tool reference name must not be blank" }
+    require(desc.name.isNotBlank()) { "Tool display name must not be blank" }
+    return NodeSpec(
+        id = desc.ref.kindId,
+        label = desc.name,
+        inputs = 1,
+        outputs = 1,
+        accent = ToolNode.ACCENT,
+        description = desc.description.ifBlank { "Tool: ${desc.name}" },
+        runMode = RunMode.PER_ITEM,
+        configFields = JsonSchemaToConfig.convert(desc.inputSchema),
+        executor = ToolNodeExecutor(source, desc.ref, desc.inputSchema),
+        defaultConfig = buildJsonObject {
+            put(ToolNode.REF_KEY, desc.ref.kindId)
+            put(ToolNode.SCHEMA_KEY, desc.inputSchema)
+        },
+    )
+}
 
 /**
  * Keeps a [NodeRegistry]'s tool specs in sync with a [ToolSource]: registers a spec
  * per descriptor and unregisters ones that have disappeared, leaving built-ins and
- * other kinds untouched. Not thread-safe by itself; drive it from one scope.
+ * other kinds untouched. A malformed descriptor retains its last-known-good spec; an
+ * all-malformed update retains the full prior set until a valid emission can distinguish
+ * stale tools from a transient provider failure. A valid empty emission remains authoritative
+ * and removes every previously synchronized tool. Not thread-safe; drive it from one scope.
  */
-class ToolNodeSync(
+internal class ToolNodeSync(
     private val source: ToolSource,
     private val registry: NodeRegistry,
+    private val reportFailure: (String) -> Unit = ::println,
 ) {
+    private data class Failure(val toolId: String, val exception: Exception)
+
     private var current: Set<String> = emptySet()
+    private var previousFailureKeys: Set<String> = emptySet()
 
     fun apply(descriptors: List<ToolDescriptor>) {
-        val next = descriptors.map { it.ref.kindId }.toSet()
-        (current - next).forEach { registry.unregister(it) }
-        descriptors.forEach { registry.register(toolNodeSpec(it, source)) }
+        val failures = mutableListOf<Failure>()
+        val specs = descriptors.mapNotNull { descriptor ->
+            try {
+                toolNodeSpec(descriptor, source)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                failures += Failure(descriptor.ref.kindId, failure)
+                null
+            }
+        }
+        reportNewFailures(failures)
+
+        // If the entire non-empty update is malformed, treat it as transient and retain
+        // the complete last-known-good registry. With partial success, preserve only the
+        // previous entries whose incoming descriptors failed while applying healthy peers.
+        if (specs.isEmpty() && failures.isNotEmpty()) return
+        val failedIds = failures.mapTo(mutableSetOf()) { it.toolId }
+        val next = specs.mapTo(mutableSetOf()) { it.id }.apply {
+            addAll(current.intersect(failedIds))
+        }
+        specs.forEach(registry::register)
+        (current - next).forEach(registry::unregister)
         current = next
+    }
+
+    private fun reportNewFailures(failures: List<Failure>) {
+        val keyed = failures.associateBy { failure ->
+            val id = toolSyncIdentifier(failure.toolId)
+            "$id:${failure.exception.javaClass.name}:${toolSyncFailureMessage(failure.exception)}"
+        }
+        keyed
+            .filterKeys { it !in previousFailureKeys }
+            .values
+            .forEach { failure ->
+                reportFailure(
+                    "[flow-tab] failed to synchronize tool '${toolSyncIdentifier(failure.toolId)}': " +
+                        toolSyncFailureMessage(failure.exception),
+                )
+            }
+        previousFailureKeys = keyed.keys.toSet()
     }
 }
 
@@ -163,6 +214,39 @@ fun syncBossTools(context: PluginContext, registry: NodeRegistry, scope: Corouti
     val source = BossRegistryToolSource(reg)
     val sync = ToolNodeSync(source, registry)
     return scope.launch {
-        reg.tools.collect { tools -> sync.apply(tools.map { it.toDescriptor() }) }
+        collectBossToolUpdates(reg.tools, sync)
     }
 }
+
+/** Keep a bad host-tool update from permanently terminating the live registry collector. */
+internal suspend fun collectBossToolUpdates(
+    updates: Flow<List<RegisteredMcpTool>>,
+    sync: ToolNodeSync,
+) {
+    updates.collect { tools ->
+        try {
+            sync.apply(tools.map { it.toDescriptor() })
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            println("[flow-tab] failed to synchronize host tools: ${toolSyncFailureMessage(failure)}")
+        }
+    }
+}
+
+internal const val MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH = 200
+internal const val MAX_TOOL_SYNC_IDENTIFIER_LENGTH = 100
+
+internal fun toolSyncIdentifier(identifier: String): String =
+    sanitizeToolSyncText(identifier, MAX_TOOL_SYNC_IDENTIFIER_LENGTH)
+
+internal fun toolSyncFailureMessage(failure: Exception): String =
+    sanitizeToolSyncText(failure.message ?: "unknown error", MAX_TOOL_SYNC_FAILURE_MESSAGE_LENGTH)
+
+private fun sanitizeToolSyncText(value: String, maxLength: Int): String =
+    value
+        .take(maxLength)
+        .map { char ->
+            if (char.isISOControl() || char == '\u2028' || char == '\u2029') ' ' else char
+        }
+        .joinToString("")

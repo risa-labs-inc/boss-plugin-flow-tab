@@ -81,9 +81,49 @@ class FlowController(
     private val executions = ConcurrentHashMap<String, Job>()
     private val runStates = ConcurrentHashMap<String, ConcurrentHashMap<String, NodeRun>>()
     private val persistMutex = Mutex()
-    /** Independent from pluginScope so it can observe that scope being replaced, but
-     * still explicitly owned by this controller and cancelled from [dispose]. */
-    private val monitorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    /** Independent from pluginScope so controller-owned work survives a sandbox watchdog
+     * replacing that scope. Everything launched here is cancelled from [dispose]. */
+    private val lifecycleScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val toolSyncLock = Any()
+    private var bossToolSyncJob: Job? = null
+    private var externalToolSyncJob: Job? = null
+    private var toolSyncJobs: List<Job> = emptyList()
+    private var disposed = false
+
+    /**
+     * Keep the headless registry synchronized for this controller's whole lifetime.
+     * These collectors deliberately do not belong to [scopeProvider]: that scope may be
+     * replaced by the host while the controller and its registry remain registered. The
+     * Boss and external jobs are memoized independently, so either missing source remains
+     * retryable without duplicating the collector that did start. The first external start
+     * fixes that manager for this controller; calls that start nothing return the same jobs.
+     */
+    internal fun startToolRegistrySync(external: ExternalMcpManager?): List<Job> {
+        return synchronized(toolSyncLock) {
+            check(!disposed) { "Cannot start tool registry synchronization after controller disposal" }
+            val previousBoss = bossToolSyncJob
+            val previousExternal = externalToolSyncJob
+            val previousJobs = toolSyncJobs
+            try {
+                if (bossToolSyncJob == null) {
+                    bossToolSyncJob = syncBossTools(context, registry, lifecycleScope)
+                }
+                if (externalToolSyncJob == null && external != null) {
+                    externalToolSyncJob = syncExternalMcpTools(external, registry, lifecycleScope)
+                }
+                val jobs = listOfNotNull(bossToolSyncJob, externalToolSyncJob)
+                if (jobs != toolSyncJobs) toolSyncJobs = jobs
+                toolSyncJobs
+            } catch (failure: Throwable) {
+                if (bossToolSyncJob !== previousBoss) bossToolSyncJob?.cancel()
+                if (externalToolSyncJob !== previousExternal) externalToolSyncJob?.cancel()
+                bossToolSyncJob = previousBoss
+                externalToolSyncJob = previousExternal
+                toolSyncJobs = previousJobs
+                throw failure
+            }
+        }
+    }
 
     // ---- authoring (storage-seated) -----------------------------------------
 
@@ -372,9 +412,20 @@ class FlowController(
      * the headless [FlowExecutor]; poll [runStatus]/[runResult] for progress. A missing
      * flow or an executor throw becomes a [RunJobState.FAILED] job (never a crash); a
      * run in which any node errors is FAILED too, but always reaches a terminal state.
+     * An already-disposed controller returns a terminal failure without dispatching work.
      */
     fun startRun(tabId: String, depth: Int = 0, ancestry: Set<String> = emptySet()): String {
         val runId = "run-${UUID.randomUUID()}"
+        val disposalError = "Flow controller disposed"
+        if (synchronized(toolSyncLock) { disposed }) {
+            jobs[runId] = RunJob(
+                runId = runId,
+                tabId = tabId,
+                state = RunJobState.FAILED,
+                error = disposalError,
+            )
+            return runId
+        }
         jobs[runId] = RunJob(runId, tabId, RunJobState.RUNNING)
         val states = ConcurrentHashMap<String, NodeRun>()
         runStates[runId] = states
@@ -405,7 +456,7 @@ class FlowController(
                     }
                     // Serialize storage writes through persistRun so a delayed live
                     // snapshot can never overwrite a terminal watchdog verdict.
-                    monitorScope.launch { jobs[runId]?.let { persistRun(it) } }
+                    lifecycleScope.launch { jobs[runId]?.let { persistRun(it) } }
                 }
                 val firstError = states.values.firstOrNull { it.status == RunStatus.ERROR }
                 RunJob(
@@ -426,14 +477,20 @@ class FlowController(
             persistRun(published)
         }
         executions[runId] = execution
+        // Install before rechecking under the lock: either this check cancels the run,
+        // or a later dispose transition observes the already-present map entry in its sweep.
         execution.invokeOnCompletion {
             executions.remove(runId, execution)
             runStates.remove(runId, states)
         }
+        if (synchronized(toolSyncLock) { disposed }) {
+            transitionToFailed(runId, tabId, states, disposalError)
+            execution.cancel(CancellationException(disposalError))
+        }
 
         // This monitor is deliberately not a child of execution. join() is cancellable,
         // so its timeout fires even if execution is stuck in a non-suspending host call.
-        monitorScope.launch {
+        lifecycleScope.launch {
             val completed = withTimeoutOrNull(runTimeoutMs) {
                 execution.join()
                 true
@@ -474,10 +531,21 @@ class FlowController(
         return stopped
     }
 
-    /** Release independent run monitors when the owning tab/plugin is destroyed. */
+    /** Cancel current executions on every call; release lifecycle work on first teardown. */
     fun dispose() {
+        val cancelLifecycle = synchronized(toolSyncLock) {
+            if (disposed) {
+                false
+            } else {
+                disposed = true
+                true
+            }
+        }
+        // Keep this outside the one-time lifecycle transition. startRun intentionally
+        // retains its historical dispatch contract, so a later dispose call must still
+        // cancel any execution installed after an earlier disposal pass.
         executions.values.forEach { it.cancel(CancellationException("Flow controller disposed")) }
-        monitorScope.cancel()
+        if (cancelLifecycle) lifecycleScope.cancel()
     }
 
     private fun publishTerminalIfRunning(runId: String, candidate: RunJob): RunJob =
@@ -658,6 +726,10 @@ class FlowController(
  * [syncBossTools], so `flow_run` on a `tool:boss:*` node authored over MCP failed with
  * "Unknown node kind" while the identical UI-authored flow ran fine. Keep every kind the
  * UI can resolve resolvable here too.
+ *
+ * The optional [scope] controls run dispatch only. Registry synchronization belongs to
+ * the returned controller's independent lifecycle, so every caller owns and must invoke
+ * [FlowController.dispose] when that controller is no longer needed.
  */
 fun buildHeadlessController(
     context: PluginContext,
@@ -665,19 +737,17 @@ fun buildHeadlessController(
     external: ExternalMcpManager?,
     scope: CoroutineScope? = null,
 ): FlowController {
-    val initialScope = scope ?: context.pluginScope
     val scopeProvider: () -> CoroutineScope = { scope ?: context.pluginScope }
     val controller = FlowController(
         context = context,
         scopeProvider = scopeProvider,
     )
-    // Host tools -> tool:boss:* kinds (the fix): reactively synced onto this registry.
-    syncBossTools(context, controller.registry, initialScope)
     // Make agent + lanager kinds runnable in headless (MCP-driven) runs too, sharing
     // the controller's registry so a lanager's sub-run resolves the same kinds.
     controller.registry.register(defaultAgentNodeSpec(context, prompts, external))
     controller.registry.register(lanagerNodeSpec(controller))
-    // Surface external MCP tools (flag-gated inside) as tool:ext:<server>/* kinds.
-    external?.let { syncExternalMcpTools(it, controller.registry, initialScope) }
+    // Start controller-owned background work only after construction can no longer fail.
+    // Host sync remains live across pluginScope replacement; external sync is one-shot.
+    controller.startToolRegistrySync(external)
     return controller
 }

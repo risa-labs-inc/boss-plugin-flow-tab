@@ -51,7 +51,10 @@ class FlowTabDynamicPluginTest {
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     /** Captures MCP provider register/unregister so we can assert the wiring. */
-    private class CapturingContext(scope: CoroutineScope, storage: PluginStorageProvider) : PluginContext {
+    private class CapturingContext(
+        scope: CoroutineScope,
+        storage: PluginStorageProvider,
+    ) : PluginContext {
         override val panelRegistry = PanelRegistry()
         override val tabRegistry = TabRegistry()
         override val pluginScope = scope
