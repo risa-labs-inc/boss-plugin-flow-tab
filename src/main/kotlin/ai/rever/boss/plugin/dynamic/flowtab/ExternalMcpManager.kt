@@ -122,12 +122,16 @@ class ExternalMcpManager(
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     /** Cooperative deadline applied independently to each server connect, discovery, and close. */
     private val serverOperationTimeoutMs: Long = DEFAULT_SERVER_OPERATION_TIMEOUT_MS,
+    /** Minimum delay between automatic, headless retries after an unsettled pass. */
+    private val implicitRetryCooldownMs: Long = DEFAULT_IMPLICIT_RETRY_COOLDOWN_MS,
+    private val nowMillis: () -> Long = System::currentTimeMillis,
 ) : ToolSource {
 
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; encodeDefaults = true }
     private val listSerializer = ListSerializer(McpServerConfig.serializer())
 
     private class Live(
+        val config: McpServerConfig,
         val transport: McpTransport,
         val source: ExternalMcpToolSource,
         val resolvedSecret: String?,
@@ -152,6 +156,7 @@ class ExternalMcpManager(
 
     private val open = ConcurrentHashMap<String, Live>()
     private val configMutex = Mutex()
+    private val implicitRetryMutex = Mutex()
     private val mutableChangeTick = MutableStateFlow(0L)
     private val mutableServerStatuses = MutableStateFlow<Map<String, ExternalMcpServerStatus>>(emptyMap())
     private val mutableDescriptors = MutableStateFlow<List<ToolDescriptor>>(emptyList())
@@ -163,6 +168,8 @@ class ExternalMcpManager(
     private var terminalState = TerminalState.ACTIVE
     @Volatile
     private var initialized = false
+    @Volatile
+    private var lastReconcileFinishedAtMs = Long.MIN_VALUE
     private var disposeResult: CompletableDeferred<Unit>? = null
 
     /** Advances once after each settled reconcile/discovery and after disposal. */
@@ -196,6 +203,7 @@ class ExternalMcpManager(
 
     init {
         require(serverOperationTimeoutMs > 0) { "External MCP server operation timeout must be positive" }
+        require(implicitRetryCooldownMs >= 0) { "External MCP implicit retry cooldown must not be negative" }
         worker.start()
     }
 
@@ -355,12 +363,12 @@ class ExternalMcpManager(
         return try {
             when (request) {
                 is ManagerRequest.Start -> {
-                    if (!initialized) reconcileAndDiscover()
+                    if (!initialized) reconcileAndDiscoverRecorded()
                     request.result.complete(Unit)
                     true
                 }
                 is ManagerRequest.Refresh -> {
-                    reconcileAndDiscover()
+                    reconcileAndDiscoverRecorded()
                     request.result.complete(Unit)
                     true
                 }
@@ -377,7 +385,7 @@ class ExternalMcpManager(
                             true
                         }
                     }
-                    if (changed) reconcileAndDiscover()
+                    if (changed) reconcileAndDiscoverRecorded()
                     request.result.complete(Unit)
                     true
                 }
@@ -389,7 +397,7 @@ class ExternalMcpManager(
                             true
                         }
                     }
-                    if (added) reconcileAndDiscover()
+                    if (added) reconcileAndDiscoverRecorded()
                     request.result.complete(added)
                     true
                 }
@@ -408,7 +416,7 @@ class ExternalMcpManager(
                         }
                         if (changed) writeConfigs(next)
                     }
-                    if (changed) reconcileAndDiscover()
+                    if (changed) reconcileAndDiscoverRecorded()
                     request.result.complete(found)
                     true
                 }
@@ -421,12 +429,12 @@ class ExternalMcpManager(
                             true
                         }
                     }
-                    if (removed) reconcileAndDiscover()
+                    if (removed) reconcileAndDiscoverRecorded()
                     request.result.complete(removed)
                     true
                 }
                 is ManagerRequest.SetSettings -> {
-                    if (settings.setExternalMcpEnabled(request.enabled)) reconcileAndDiscover()
+                    if (settings.setExternalMcpEnabled(request.enabled)) reconcileAndDiscoverRecorded()
                     request.result.complete(Unit)
                     true
                 }
@@ -472,6 +480,14 @@ class ExternalMcpManager(
 
     // ---- manager-owned reconcile/discovery ---------------------------------
 
+    private suspend fun reconcileAndDiscoverRecorded() {
+        try {
+            reconcileAndDiscover()
+        } finally {
+            lastReconcileFinishedAtMs = nowMillis()
+        }
+    }
+
     private suspend fun reconcileAndDiscover() {
         val configs = configMutex.withLock { readConfigs() }
         val featureEnabled = settings.isExternalMcpEnabled()
@@ -498,16 +514,21 @@ class ExternalMcpManager(
 
         for ((name, cfg) in enabled) {
             if (!isAcceptingRequests()) break
-            if (open.containsKey(name)) continue
-            setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.CONNECTING))
             var transport: McpTransport? = null
             var resolvedSecret: String? = null
             try {
                 resolvedSecret = cfg.secretRef?.let { secrets.get(it) }
+                val current = open[name]
+                if (current != null) {
+                    if (current.config == cfg && current.resolvedSecret == resolvedSecret) continue
+                    closeOne(name)
+                    if (!isAcceptingRequests()) break
+                }
+                setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.CONNECTING))
                 val opened = transportFactory(cfg, resolvedSecret)
                 transport = opened
                 withTimeout(serverOperationTimeoutMs) { opened.connect() }
-                open[name] = Live(opened, ExternalMcpToolSource(name, opened), resolvedSecret)
+                open[name] = Live(cfg, opened, ExternalMcpToolSource(name, opened), resolvedSecret)
             } catch (_: TimeoutCancellationException) {
                 transport?.let { closeFailedOpen(it) }
                 val detail = timeoutDetail("Connection")
@@ -621,8 +642,27 @@ class ExternalMcpManager(
      * submit and await the manager-owned idempotent retry so headless callers self-heal.
      */
     override suspend fun list(): List<ToolDescriptor> {
-        if (!initialized) requestStart().await()
+        if (!initialized && implicitRetryDue()) {
+            implicitRetryMutex.withLock {
+                if (!initialized && implicitRetryDue()) {
+                    try {
+                        requestStart().await()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        // External MCP is an optional tool lane. Preserve the last
+                        // published cache rather than failing unrelated Agent tools.
+                        lastReconcileFinishedAtMs = nowMillis()
+                    }
+                }
+            }
+        }
         return descriptors.value
+    }
+
+    private fun implicitRetryDue(): Boolean {
+        val last = lastReconcileFinishedAtMs
+        return last == Long.MIN_VALUE || nowMillis() - last >= implicitRetryCooldownMs
     }
 
     override suspend fun invoke(name: String, argsJson: String): ToolResult {
@@ -759,6 +799,7 @@ class ExternalMcpManager(
     companion object {
         const val CONFIG_KEY = "mcpservers:config"
         internal const val DEFAULT_SERVER_OPERATION_TIMEOUT_MS = 15_000L
+        internal const val DEFAULT_IMPLICIT_RETRY_COOLDOWN_MS = 30_000L
         internal const val MAX_STATUS_DETAIL_LENGTH = 240
         internal const val MAX_TRANSPORT_CLEANUP_TIMEOUT_MS = 2_000L
         private const val DISPOSED_MESSAGE = "External MCP manager is disposed"

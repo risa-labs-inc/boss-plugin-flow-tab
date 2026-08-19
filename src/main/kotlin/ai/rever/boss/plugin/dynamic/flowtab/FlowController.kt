@@ -747,7 +747,7 @@ fun buildHeadlessController(
     controller.registry.register(defaultAgentNodeSpec(context, prompts, external))
     controller.registry.register(lanagerNodeSpec(controller))
     // Start controller-owned background work only after construction can no longer fail.
-    // Host sync remains live across pluginScope replacement; external sync is one-shot.
+    // Both collectors remain live across pluginScope replacement for the controller lifetime.
     controller.startToolRegistrySync(external)
     return controller
 }

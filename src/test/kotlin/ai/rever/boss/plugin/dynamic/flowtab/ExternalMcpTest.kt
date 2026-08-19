@@ -82,6 +82,8 @@ class ExternalMcpTest {
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
         log: (String) -> Unit = {},
         serverOperationTimeoutMs: Long = ExternalMcpManager.DEFAULT_SERVER_OPERATION_TIMEOUT_MS,
+        implicitRetryCooldownMs: Long = ExternalMcpManager.DEFAULT_IMPLICIT_RETRY_COOLDOWN_MS,
+        nowMillis: () -> Long = System::currentTimeMillis,
         factory: McpTransportFactory,
     ) = ExternalMcpManager(
         storage = storage,
@@ -91,6 +93,8 @@ class ExternalMcpTest {
         log = log,
         ioDispatcher = ioDispatcher,
         serverOperationTimeoutMs = serverOperationTimeoutMs,
+        implicitRetryCooldownMs = implicitRetryCooldownMs,
+        nowMillis = nowMillis,
     )
 
     private suspend fun seedEnabledServer(storage: TestStorage, config: McpServerConfig) {
@@ -341,6 +345,32 @@ class ExternalMcpTest {
         assertEquals(tick, m.changeTick.value)
         assertEquals(1, transports.getValue("first").listCalls.get())
         assertEquals(1, transports.getValue("second").listCalls.get())
+        m.disposeAll()
+    }
+
+    @Test
+    fun `changing a connected server config closes and reopens its transport`() = runBlocking {
+        val storage = TestStorage()
+        val opened = mutableListOf<Pair<McpServerConfig, FakeTransport>>()
+        val m = manager(storage) { cfg, _ ->
+            FakeTransport(listOf(remote(cfg.url))).also { opened += cfg to it }
+        }
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        val original = McpServerConfig(
+            "remote",
+            McpTransportKind.HTTP_SSE,
+            url = "https://old.example/sse",
+            enabled = true,
+        )
+        val changed = original.copy(url = "https://new.example/sse")
+
+        m.upsertConfig(original)
+        m.upsertConfig(changed)
+
+        assertEquals(listOf(original, changed), opened.map { it.first })
+        assertTrue(opened.first().second.closed.get())
+        assertTrue(opened.last().second.connected.get())
+        assertEquals(listOf("remote/https://new.example/sse"), m.descriptors.value.map { it.ref.name })
         m.disposeAll()
     }
 
@@ -663,18 +693,69 @@ class ExternalMcpTest {
             McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = true),
         )
         val transport = FakeTransport(listOf(remote("recovered")), failList = true)
-        val m = manager(storage) { _, _ -> transport }
+        var now = 1_000L
+        val m = manager(storage, nowMillis = { now }) { _, _ -> transport }
 
         m.start()
         assertEquals(ExternalMcpServerState.ERROR, m.serverStatuses.value.getValue("s").state)
         assertTrue(m.descriptors.value.isEmpty())
 
         transport.failList = false
+        now += ExternalMcpManager.DEFAULT_IMPLICIT_RETRY_COOLDOWN_MS
         val recovered = m.list()
 
         assertEquals(ExternalMcpServerState.CONNECTED, m.serverStatuses.value.getValue("s").state)
         assertEquals(listOf("s/recovered"), recovered.map { it.ref.name })
         assertEquals(2, transport.listCalls.get())
+    }
+
+    @Test
+    fun `headless list coalesces retries and serves cache during cooldown`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        seedEnabledServer(
+            storage,
+            McpServerConfig("broken", McpTransportKind.STDIO, command = "x", enabled = true),
+        )
+        var now = 1_000L
+        val connectCalls = AtomicInteger(0)
+        val m = manager(
+            storage = storage,
+            ioDispatcher = dispatcher,
+            nowMillis = { now },
+        ) { _, _ ->
+            object : McpTransport {
+                override suspend fun connect() {
+                    connectCalls.incrementAndGet()
+                    error("permanently unavailable")
+                }
+                override suspend fun listTools(): List<RemoteTool> = emptyList()
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() = Unit
+            }
+        }
+
+        val first = async { m.list() }
+        val second = async { m.list() }
+        first.await()
+        second.await()
+        assertEquals(1, connectCalls.get())
+
+        m.list()
+        assertEquals(1, connectCalls.get())
+
+        now += ExternalMcpManager.DEFAULT_IMPLICIT_RETRY_COOLDOWN_MS
+        m.list()
+        assertEquals(2, connectCalls.get())
+        m.disposeAll()
+    }
+
+    @Test
+    fun `headless list returns its cache after terminal manager failure`() = runBlocking {
+        val m = manager { _, _ -> FakeTransport(emptyList()) }
+        m.cancelNow()
+
+        assertTrue(m.list().isEmpty())
     }
 
     @Test
