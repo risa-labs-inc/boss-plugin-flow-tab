@@ -261,10 +261,12 @@ and tool discovery; accepted mutations must survive dialog/tab composition cance
 settled change performs one discovery pass and publishes cached descriptor and per-server status
 `StateFlow`s. Every UI/headless registry may collect the descriptor snapshot and apply it through
 its own `ToolNodeSync`, but collectors must never call transport `listTools` or cancel shared MCP
-requests. Server configs persist only secret references; resolved values stay in the host vault /
+requests. The dialog remains dismissible during manager work and exposes an explicit refresh/retry.
+Server configs persist only secret references; resolved values stay in the host vault /
 transport boundary and must be redacted from bounded, single-line UI and log diagnostics. Disposal
 stops accepting requests, drains accepted work, reaps transports and publishes the terminal empty
-snapshot before terminating the manager actor.
+snapshot before terminating the manager actor; a terminal actor failure or forced `cancelNow` must
+also stop acceptance and fail every queued request instead of leaving work without a consumer.
 
 ### Runtime secret templates
 

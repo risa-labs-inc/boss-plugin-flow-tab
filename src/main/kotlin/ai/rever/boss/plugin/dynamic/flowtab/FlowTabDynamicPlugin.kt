@@ -100,7 +100,13 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         // Reap any external MCP child processes / sockets (red-team F9), bounded so a
         // hung server can't block plugin teardown.
         externalMcp?.let { mgr ->
-            runCatching { runBlocking { withTimeoutOrNull(5_000) { mgr.disposeAll() } } }
+            try {
+                runCatching { runBlocking { withTimeoutOrNull(5_000) { mgr.disposeAll() } } }
+            } finally {
+                // If graceful disposal timed out, synchronously reject queued/new work
+                // and cancel the manager scope so hot unload cannot retain the plugin.
+                mgr.cancelNow()
+            }
         }
         externalMcp = null
         // Unregister host surfaces independently so one faulty callback cannot skip the rest.

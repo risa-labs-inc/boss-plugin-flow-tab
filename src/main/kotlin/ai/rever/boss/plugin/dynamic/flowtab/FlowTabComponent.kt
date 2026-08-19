@@ -601,7 +601,6 @@ class FlowTabComponent(
         var confirmClear by remember { mutableStateOf(false) }
         var showGallery by remember { mutableStateOf(false) }
         var showMcpConfig by remember { mutableStateOf(false) }
-        var mcpConfigBusy by remember { mutableStateOf(false) }
         var showRename by remember { mutableStateOf(false) }
         var renameInProgress by remember { mutableStateOf(false) }
         val renameEnabled = initialized && !renameInProgress
@@ -744,19 +743,15 @@ class FlowTabComponent(
             val mcpManager = externalMcp
             if (showMcpConfig && mcpManager != null) {
                 AlertDialog(
-                    onDismissRequest = { if (!mcpConfigBusy) showMcpConfig = false },
+                    onDismissRequest = { showMcpConfig = false },
                     text = {
                         McpServerConfigPanel(
                             manager = mcpManager,
                             modifier = Modifier.heightIn(max = 480.dp),
-                            onBusyChanged = { mcpConfigBusy = it },
                         )
                     },
                     confirmButton = {
-                        TextButton(
-                            enabled = !mcpConfigBusy,
-                            onClick = { showMcpConfig = false },
-                        ) {
+                        TextButton(onClick = { showMcpConfig = false }) {
                             Text("Close", color = FlowTheme.TextPrimary)
                         }
                     },

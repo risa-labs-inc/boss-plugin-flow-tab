@@ -10,6 +10,7 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -150,12 +151,15 @@ class ExternalMcpManager(
     /** Cached descriptor snapshot from the manager's single discovery pass. */
     val descriptors: StateFlow<List<ToolDescriptor>> = mutableDescriptors.asStateFlow()
 
-    private val worker = managerScope.launch {
-        for (request in requests) {
-            if (!process(request)) break
+    private val worker = managerScope.async {
+        try {
+            for (request in requests) {
+                if (!process(request)) break
+            }
+        } finally {
+            stopAcceptanceAndDrain()
+            managerJob.cancel()
         }
-        requests.close()
-        managerJob.cancel()
     }
 
     // ---- caller-facing requests --------------------------------------------
@@ -218,10 +222,31 @@ class ExternalMcpManager(
         val accepted = synchronized(requestLock) {
             acceptingRequests && requests.trySend(request).isSuccess
         }
-        if (!accepted) result.completeExceptionally(IllegalStateException(DISPOSED_MESSAGE))
+        if (!accepted) result.completeExceptionally(publicFailure(DISPOSED_MESSAGE))
         // This completion has no caller Job parent. Cancelling an awaiter does not cancel
         // the synchronously accepted actor request or its write/reconcile/discovery work.
         return result
+    }
+
+    /**
+     * Synchronous, idempotent teardown escape hatch for plugin unload. It rejects new
+     * work immediately, fails queued requests, and cancels the actor even when a bounded
+     * [disposeAll] attempt could not finish.
+     */
+    fun cancelNow() {
+        stopAcceptanceAndDrain()
+        managerJob.cancel(CancellationException(DISPOSED_MESSAGE))
+    }
+
+    private fun stopAcceptanceAndDrain() {
+        synchronized(requestLock) {
+            acceptingRequests = false
+            requests.close()
+            while (true) {
+                val pending = requests.tryReceive().getOrNull() ?: break
+                pending.fail(publicFailure(DISPOSED_MESSAGE))
+            }
+        }
     }
 
     // ---- config/settings reads ---------------------------------------------
@@ -262,7 +287,11 @@ class ExternalMcpManager(
                 is ManagerRequest.Upsert -> {
                     val changed = configMutex.withLock {
                         val current = readConfigs()
-                        val next = current.filter { it.name != request.config.name } + request.config
+                        val next = if (current.any { it.name == request.config.name }) {
+                            current.map { if (it.name == request.config.name) request.config else it }
+                        } else {
+                            current + request.config
+                        }
                         if (next == current) false else {
                             writeConfigs(next)
                             true
@@ -329,23 +358,19 @@ class ExternalMcpManager(
             }
         } catch (cancelled: CancellationException) {
             if (!currentCoroutineContext().isActive) {
-                request.fail(cancelled)
+                request.fail(publicCancellation())
                 throw cancelled
             }
             // A transport can originate CancellationException while the actor remains
-            // healthy. Fail only that request with a sanitized cancellation; manager
-            // disposal is the sole worker stop.
-            request.fail(sanitizedCancellation(cancelled))
+            // healthy. Fail only that request with a payload-free public cancellation;
+            // manager disposal is the sole worker stop.
+            request.fail(publicCancellation())
             true
-        } catch (failure: Exception) {
-            request.fail(
-                IllegalStateException(
-                    boundedExternalMcpDiagnostic(failure.message),
-                ),
-            )
+        } catch (_: Exception) {
+            request.fail(publicFailure())
             true
         } catch (fatal: Error) {
-            request.fail(fatal)
+            request.fail(publicFailure())
             throw fatal
         }
     }
@@ -400,7 +425,7 @@ class ExternalMcpManager(
                 open[name] = Live(transport, ExternalMcpToolSource(name, transport), resolvedSecret)
             } catch (cancelled: CancellationException) {
                 transport?.let { opened ->
-                    runCatching { withContext(NonCancellable) { opened.close() } }
+                    closeFailedOpen(opened)
                 }
                 setStatus(
                     name,
@@ -412,10 +437,19 @@ class ExternalMcpManager(
                 if (!currentCoroutineContext().isActive) throw cancelled
                 throw sanitizedCancellation(cancelled, resolvedSecret)
             } catch (failure: Exception) {
-                transport?.let { runCatching { it.close() } }
+                transport?.let { closeFailedOpen(it) }
                 val detail = failureDetail("Connection failed", failure, resolvedSecret)
                 setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
                 logFailure("external MCP server", name, "failed to connect", detail)
+            } catch (fatal: Error) {
+                transport?.let { opened ->
+                    try {
+                        closeFailedOpen(opened)
+                    } catch (cleanupFatal: Error) {
+                        fatal.addSuppressed(cleanupFatal)
+                    }
+                }
+                throw fatal
             }
         }
 
@@ -451,14 +485,14 @@ class ExternalMcpManager(
         try {
             live.transport.close()
         } catch (cancelled: CancellationException) {
-            if (!currentCoroutineContext().isActive) throw cancelled
-            val detail = failureDetail("Close cancelled", cancelled)
+            val detail = failureDetail("Close cancelled", cancelled, live.resolvedSecret)
             if (name in mutableServerStatuses.value) {
                 setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
             }
             logFailure("external MCP server", name, "failed to close", detail)
+            if (!currentCoroutineContext().isActive) throw cancelled
         } catch (failure: Exception) {
-            val detail = failureDetail("Close failed", failure)
+            val detail = failureDetail("Close failed", failure, live.resolvedSecret)
             if (name in mutableServerStatuses.value) {
                 setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
             }
@@ -491,7 +525,7 @@ class ExternalMcpManager(
                 acceptingRequests = false
                 disposeResult = completion
                 if (requests.trySend(ManagerRequest.Dispose(completion)).isFailure) {
-                    completion.completeExceptionally(IllegalStateException("External MCP disposal could not be queued"))
+                    completion.completeExceptionally(publicFailure(DISPOSED_MESSAGE))
                 }
             }
         }
@@ -539,6 +573,20 @@ class ExternalMcpManager(
         ),
     )
 
+    private fun publicCancellation(): CancellationException = CancellationException(CANCELLED_MESSAGE)
+
+    private fun publicFailure(message: String = OPERATION_FAILED_MESSAGE): IllegalStateException =
+        IllegalStateException(message)
+
+    private suspend fun closeFailedOpen(transport: McpTransport) {
+        try {
+            withContext(NonCancellable) { transport.close() }
+        } catch (_: Exception) {
+            // The primary connect failure is reported; cleanup diagnostics may contain
+            // provider payloads, so they are intentionally not exposed or logged.
+        }
+    }
+
     private fun logFailure(subject: String, serverName: String, action: String, detail: String) {
         val safeName = boundedExternalMcpDiagnostic(serverName, fallback = "unnamed server")
         log(boundedExternalMcpDiagnostic("$subject '$safeName' $action: $detail"))
@@ -548,6 +596,8 @@ class ExternalMcpManager(
         const val CONFIG_KEY = "mcpservers:config"
         internal const val MAX_STATUS_DETAIL_LENGTH = 240
         private const val DISPOSED_MESSAGE = "External MCP manager is disposed"
+        private const val CANCELLED_MESSAGE = "External MCP operation cancelled"
+        private const val OPERATION_FAILED_MESSAGE = "External MCP operation failed"
     }
 }
 

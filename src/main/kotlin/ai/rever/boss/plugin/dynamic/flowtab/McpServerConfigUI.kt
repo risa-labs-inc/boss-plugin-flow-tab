@@ -58,7 +58,6 @@ import kotlinx.coroutines.launch
 fun McpServerConfigPanel(
     manager: ExternalMcpManager,
     modifier: Modifier = Modifier,
-    onBusyChanged: (Boolean) -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     var enabled by remember { mutableStateOf(false) }
@@ -80,14 +79,24 @@ fun McpServerConfigPanel(
         servers = manager.listConfigs()
     }
 
+    suspend fun reloadSafely() {
+        try {
+            reload()
+        } catch (cancelled: CancellationException) {
+            if (!currentCoroutineContext().isActive) throw cancelled
+            operationError = boundedExternalMcpDiagnostic(null, fallback = "Could not reload external MCP settings")
+        } catch (_: Exception) {
+            operationError = boundedExternalMcpDiagnostic(null, fallback = "Could not reload external MCP settings")
+        }
+    }
+
     LaunchedEffect(manager) {
-        manager.changeTick.collect { reload() }
+        manager.changeTick.collect { reloadSafely() }
     }
 
     fun <T> mutate(submit: () -> Deferred<T>, onResult: (T) -> Unit = {}) {
         if (busy) return
         busy = true
-        onBusyChanged(true)
         operationError = null
         val request = submit()
         scope.launch {
@@ -100,10 +109,9 @@ fun McpServerConfigPanel(
                 operationError = boundedExternalMcpDiagnostic(failure.message)
             } finally {
                 try {
-                    reload()
+                    reloadSafely()
                 } finally {
                     busy = false
-                    onBusyChanged(false)
                 }
             }
         }
@@ -117,7 +125,18 @@ fun McpServerConfigPanel(
             .verticalScroll(rememberScrollState()),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Text("External MCP servers", color = FlowTheme.TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+        Row(Modifier.fillMaxWidth(), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            Text(
+                "External MCP servers",
+                color = FlowTheme.TextPrimary,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f),
+            )
+            Pill("Refresh / retry", enabledLook = !busy) {
+                mutate({ manager.requestRefresh() })
+            }
+        }
         if (busy) {
             Text("Updating connections…", color = FlowTheme.TextMuted, fontSize = 11.sp)
         }

@@ -241,6 +241,32 @@ class ExternalMcpTest {
         assertEquals(original, m.listConfigs().single())
     }
 
+    @Test
+    fun `identical upsert preserves position and does not rediscover`() = runBlocking {
+        val storage = TestStorage()
+        val first = McpServerConfig("first", McpTransportKind.STDIO, command = "x", enabled = true)
+        val second = McpServerConfig("second", McpTransportKind.STDIO, command = "y", enabled = true)
+        storage.putJson(
+            ExternalMcpManager.CONFIG_KEY,
+            Json.encodeToString(ListSerializer(McpServerConfig.serializer()), listOf(first, second)),
+        )
+        storage.putJson(SettingsStore.KEY, Json.encodeToString(FlowSettings.serializer(), FlowSettings(true)))
+        val transports = mutableMapOf<String, FakeTransport>()
+        val m = manager(storage) { cfg, _ ->
+            FakeTransport(listOf(remote(cfg.name))).also { transports[cfg.name] = it }
+        }
+        m.start()
+        val tick = m.changeTick.value
+
+        m.upsertConfig(first)
+
+        assertEquals(listOf(first, second), m.listConfigs())
+        assertEquals(tick, m.changeTick.value)
+        assertEquals(1, transports.getValue("first").listCalls.get())
+        assertEquals(1, transports.getValue("second").listCalls.get())
+        m.disposeAll()
+    }
+
     // ---- lifecycle / reaping ------------------------------------------------
 
     @Test
@@ -481,6 +507,76 @@ class ExternalMcpTest {
     }
 
     @Test
+    fun `close diagnostics redact resolved secrets before status and logging`() = runBlocking {
+        val storage = TestStorage()
+        val logged = mutableListOf<String>()
+        val secret = "close-super-secret"
+        seedEnabledServer(
+            storage,
+            McpServerConfig(
+                "s",
+                McpTransportKind.HTTP_SSE,
+                url = "https://example.test/sse",
+                enabled = true,
+                secretRef = "TOKEN",
+            ),
+        )
+        val m = manager(
+            storage = storage,
+            secrets = SecretResolver.constant(secret),
+            log = logged::add,
+        ) { _, _ ->
+            object : McpTransport {
+                override suspend fun connect() = Unit
+                override suspend fun listTools(): List<RemoteTool> = emptyList()
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() = error("close leaked $secret\nprovider payload")
+            }
+        }
+        m.start()
+
+        assertTrue(m.setConfigEnabled("s", false))
+
+        val detail = m.serverStatuses.value.getValue("s").detail.orEmpty()
+        assertEquals(ExternalMcpServerState.ERROR, m.serverStatuses.value.getValue("s").state)
+        assertFalse(secret in detail)
+        assertTrue("***" in detail)
+        assertFalse('\n' in detail)
+        assertFalse(secret in logged.joinToString())
+        assertTrue(logged.all { '\n' !in it })
+    }
+
+    @Test
+    fun `fatal connect error terminates actor and later requests fail fast`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        seedEnabledServer(
+            storage,
+            McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = true),
+        )
+        val rawPayload = "fatal-provider-payload"
+        var closed = false
+        val m = manager(storage, ioDispatcher = dispatcher) { _, _ ->
+            object : McpTransport {
+                override suspend fun connect(): Unit = throw NoClassDefFoundError(rawPayload)
+                override suspend fun listTools(): List<RemoteTool> = emptyList()
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() { closed = true }
+            }
+        }
+
+        val failedStart = m.requestStart()
+        runCurrent()
+        val failure = assertFailsWith<IllegalStateException> { failedStart.await() }
+        assertFalse(rawPayload in failure.message.orEmpty())
+        assertTrue(closed)
+
+        val next = m.requestAddConfig(McpServerConfig("later", McpTransportKind.STDIO, command = "y"))
+        assertTrue(next.isCompleted)
+        assertFailsWith<IllegalStateException> { next.await() }
+    }
+
+    @Test
     fun `transport cancellation fails one request cleans up and leaves actor usable`() = runTest {
         val dispatcher = UnconfinedTestDispatcher(testScheduler)
         val storage = TestStorage()
@@ -525,8 +621,8 @@ class ExternalMcpTest {
         }
         assertTrue(firstClosed)
         assertTrue(cleanupWasActive)
+        assertEquals("External MCP operation cancelled", failure.message)
         assertFalse(secret in failure.message.orEmpty())
-        assertTrue("***" in failure.message.orEmpty())
         assertFalse('\n' in failure.message.orEmpty())
         val requestFailureChain = generateSequence<Throwable>(failure) { it.cause }.toList()
         assertTrue(requestFailureChain.none { secret in it.message.orEmpty() })
@@ -595,6 +691,46 @@ class ExternalMcpTest {
         assertTrue(m.descriptors.value.isEmpty())
         assertEquals(ExternalMcpServerState.DISCONNECTED, m.serverStatuses.value.getValue("s").state)
         assertEquals(before + 1, m.changeTick.value)
+    }
+
+    @Test
+    fun `cancelNow fails queued work rejects terminal work and is idempotent`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        seedEnabledServer(
+            storage,
+            McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = true),
+        )
+        val connectStarted = CompletableDeferred<Unit>()
+        var closed = false
+        val m = manager(storage, ioDispatcher = dispatcher) { _, _ ->
+            object : McpTransport {
+                override suspend fun connect() {
+                    connectStarted.complete(Unit)
+                    CompletableDeferred<Unit>().await()
+                }
+                override suspend fun listTools(): List<RemoteTool> = emptyList()
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() { closed = true }
+            }
+        }
+        val active = m.requestStart()
+        connectStarted.await()
+        val queued = m.requestAddConfig(McpServerConfig("queued", McpTransportKind.STDIO, command = "q"))
+
+        m.cancelNow()
+        m.cancelNow()
+        runCurrent()
+
+        val activeFailure = assertFailsWith<CancellationException> { active.await() }
+        assertEquals("External MCP operation cancelled", activeFailure.message)
+        assertTrue(closed)
+        assertTrue(queued.isCompleted)
+        assertFailsWith<IllegalStateException> { queued.await() }
+        val late = m.requestRefresh()
+        assertTrue(late.isCompleted)
+        assertFailsWith<IllegalStateException> { late.await() }
+        assertFailsWith<IllegalStateException> { m.disposeAll() }
     }
 
     // ---- settings store -----------------------------------------------------
