@@ -253,6 +253,19 @@ key. Controller/MCP mutations and open-tab autosave therefore serialize through
 loads before acknowledging the revision; autosaves captured against an older revision are skipped.
 In-canvas rename additionally uses a temporary name guard that clears after convergence.
 
+### External MCP lifecycle
+
+External MCP is plugin-wide, OFF by default, and configured from the Flow toolbar. The
+`ExternalMcpManager` owns one supervised IO request actor for config writes, connection lifecycle,
+and tool discovery; accepted mutations must survive dialog/tab composition cancellation. Each
+settled change performs one discovery pass and publishes cached descriptor and per-server status
+`StateFlow`s. Every UI/headless registry may collect the descriptor snapshot and apply it through
+its own `ToolNodeSync`, but collectors must never call transport `listTools` or cancel shared MCP
+requests. Server configs persist only secret references; resolved values stay in the host vault /
+transport boundary and must be redacted from bounded, single-line UI and log diagnostics. Disposal
+stops accepting requests, drains accepted work, reaps transports and publishes the terminal empty
+snapshot before terminating the manager actor.
+
 ### Runtime secret templates
 
 HTTP node URL, headers, and body fields plus Type text and Inject scripts accept

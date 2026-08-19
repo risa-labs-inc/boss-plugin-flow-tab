@@ -46,7 +46,12 @@ class FlowTabDynamicPlugin : DynamicPlugin {
         // the tab UI and the headless MCP path share it and dispose() reaps its children.
         val external = runCatching {
             val storage = context.pluginStorageFactory?.createStorage(FlowController.STORAGE_NAMESPACE)
-            ExternalMcpManager(storage, SecretResolver.fromSecrets(context), SettingsStore(storage))
+            ExternalMcpManager(
+                storage,
+                SecretResolver.fromSecrets(context),
+                SettingsStore(storage),
+                log = { message -> println("[flow-tab] ${boundedExternalMcpDiagnostic(message)}") },
+            )
         }.getOrNull()
         externalMcp = external
 

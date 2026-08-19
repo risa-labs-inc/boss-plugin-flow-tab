@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -22,7 +23,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -37,17 +37,18 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.foundation.clickable
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
  * Minimal connection-manager UI for external MCP servers (P7). It edits the master
  * feature flag (OFF by default) and the per-server [McpServerConfig] list held by
- * [manager]; every mutation persists through the manager (config JSON at
- * [ExternalMcpManager.CONFIG_KEY], flag in [SettingsStore]) and then calls
- * [ExternalMcpManager.refresh] to reconcile live connections. Every Flow tab observes
- * the manager's change tick independently, so this panel does not own palette updates.
+ * [manager]. Each mutation is submitted to the manager-owned actor, which atomically
+ * persists, reconciles, discovers, and publishes snapshots even if this composition is
+ * later cancelled. Every Flow tab observes descriptor snapshots independently.
  *
  * Secrets are never entered/stored here as values — a server references a secret by its
  * logical *name* ([McpServerConfig.secretRef]), resolved from the host vault at connect
@@ -57,12 +58,13 @@ import kotlinx.coroutines.launch
 fun McpServerConfigPanel(
     manager: ExternalMcpManager,
     modifier: Modifier = Modifier,
+    onBusyChanged: (Boolean) -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     var enabled by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var operationError by remember { mutableStateOf<String?>(null) }
-    val servers = remember { mutableStateListOf<McpServerConfig>() }
+    var servers by remember { mutableStateOf<List<McpServerConfig>>(emptyList()) }
     val statuses by manager.serverStatuses.collectAsState()
 
     // New-server form fields.
@@ -75,31 +77,33 @@ fun McpServerConfigPanel(
 
     suspend fun reload() {
         enabled = manager.settingsEnabled()
-        servers.clear()
-        servers.addAll(manager.listConfigs())
+        servers = manager.listConfigs()
     }
 
     LaunchedEffect(manager) {
         manager.changeTick.collect { reload() }
     }
 
-    fun mutate(change: suspend () -> Unit) {
+    fun <T> mutate(submit: () -> Deferred<T>, onResult: (T) -> Unit = {}) {
         if (busy) return
         busy = true
+        onBusyChanged(true)
         operationError = null
+        val request = submit()
         scope.launch {
             try {
-                change()
-                manager.refresh()
+                onResult(request.await())
             } catch (cancelled: CancellationException) {
-                throw cancelled
+                if (!currentCoroutineContext().isActive) throw cancelled
+                operationError = boundedExternalMcpDiagnostic(cancelled.message)
             } catch (failure: Exception) {
-                operationError = failure.message ?: "External MCP settings could not be updated"
+                operationError = boundedExternalMcpDiagnostic(failure.message)
             } finally {
                 try {
                     reload()
                 } finally {
                     busy = false
+                    onBusyChanged(false)
                 }
             }
         }
@@ -118,14 +122,14 @@ fun McpServerConfigPanel(
             Text("Updating connections…", color = FlowTheme.TextMuted, fontSize = 11.sp)
         }
         operationError?.let { message ->
-            Text(message.take(ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH), color = FlowTheme.Error, fontSize = 11.sp)
+            Text(message, color = FlowTheme.Error, fontSize = 11.sp)
         }
 
         // Master feature flag.
         Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             Switch(
                 checked = enabled,
-                onCheckedChange = { on -> mutate { manager.setSettingsEnabled(on) } },
+                onCheckedChange = { on -> mutate({ manager.requestSetSettingsEnabled(on) }) },
                 enabled = !busy,
                 colors = SwitchDefaults.colors(checkedThumbColor = FlowTheme.Primary),
             )
@@ -150,8 +154,20 @@ fun McpServerConfigPanel(
                 cfg = cfg,
                 status = statuses[cfg.name],
                 enabled = !busy,
-                onToggle = { on -> mutate { manager.upsertConfig(cfg.copy(enabled = on)) } },
-                onRemove = { mutate { manager.removeConfig(cfg.name) } },
+                onToggle = { on ->
+                    mutate({ manager.requestSetConfigEnabled(cfg.name, on) }) { found ->
+                        if (!found) {
+                            operationError = "That server was removed in another tab."
+                        }
+                    }
+                },
+                onRemove = {
+                    mutate({ manager.requestRemoveConfig(cfg.name) }) { removed ->
+                        if (!removed) {
+                            operationError = "That server was already removed."
+                        }
+                    }
+                },
             )
         }
 
@@ -166,8 +182,8 @@ fun McpServerConfigPanel(
             Field("Args (space-separated)", args) { args = it }
         } else {
             Field("URL", url) { url = it }
+            Field("Secret name (optional, HTTP/SSE only)", secretRef) { secretRef = it }
         }
-        Field("Secret name (optional)", secretRef) { secretRef = it }
         val draft = McpServerDraft(name, kind, command, args, url, secretRef)
         val newConfig = draft.toConfigOrNull()
         val duplicateName = newConfig != null && servers.any { it.name == newConfig.name }
@@ -176,12 +192,12 @@ fun McpServerConfigPanel(
         }
         Pill("Add server", enabledLook = newConfig != null && !duplicateName && !busy) {
             val cfg = newConfig ?: return@Pill
-            mutate {
-                if (!manager.addConfig(cfg)) {
+            mutate({ manager.requestAddConfig(cfg) }) { added ->
+                if (!added) {
                     operationError = "A server named '${cfg.name}' already exists."
-                    return@mutate
+                } else {
+                    name = ""; command = ""; args = ""; url = ""; secretRef = ""
                 }
-                name = ""; command = ""; args = ""; url = ""; secretRef = ""
             }
         }
     }
@@ -317,7 +333,7 @@ internal data class McpServerDraft(
             },
             url = if (kind == McpTransportKind.HTTP_SSE) url.trim() else "",
             enabled = false,
-            secretRef = secretRef.trim().ifBlank { null },
+            secretRef = if (kind == McpTransportKind.HTTP_SSE) secretRef.trim().ifBlank { null } else null,
         )
     }
 }

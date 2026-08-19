@@ -179,8 +179,8 @@ class FlowTabComponent(
         // degrades cleanly to built-ins only. The collector is tied to [coroutineScope]
         // and cancelled on destroy.
         runCatching { syncBossTools(context, registry, coroutineScope) }
-        // Surface external MCP tools (P7) as palette nodes too. Each open tab has one
-        // latest-wins collector, while the plugin-wide manager owns connection I/O.
+        // Surface external MCP tools (P7) as palette nodes too. Each open tab applies
+        // cached snapshots, while the plugin-wide manager owns connection/discovery I/O.
         externalMcp?.let { manager ->
             runCatching { syncExternalMcpTools(manager, registry, coroutineScope) }
         }
@@ -601,6 +601,7 @@ class FlowTabComponent(
         var confirmClear by remember { mutableStateOf(false) }
         var showGallery by remember { mutableStateOf(false) }
         var showMcpConfig by remember { mutableStateOf(false) }
+        var mcpConfigBusy by remember { mutableStateOf(false) }
         var showRename by remember { mutableStateOf(false) }
         var renameInProgress by remember { mutableStateOf(false) }
         val renameEnabled = initialized && !renameInProgress
@@ -743,15 +744,19 @@ class FlowTabComponent(
             val mcpManager = externalMcp
             if (showMcpConfig && mcpManager != null) {
                 AlertDialog(
-                    onDismissRequest = { showMcpConfig = false },
+                    onDismissRequest = { if (!mcpConfigBusy) showMcpConfig = false },
                     text = {
                         McpServerConfigPanel(
                             manager = mcpManager,
                             modifier = Modifier.heightIn(max = 480.dp),
+                            onBusyChanged = { mcpConfigBusy = it },
                         )
                     },
                     confirmButton = {
-                        TextButton(onClick = { showMcpConfig = false }) {
+                        TextButton(
+                            enabled = !mcpConfigBusy,
+                            onClick = { showMcpConfig = false },
+                        ) {
                             Text("Close", color = FlowTheme.TextPrimary)
                         }
                     },

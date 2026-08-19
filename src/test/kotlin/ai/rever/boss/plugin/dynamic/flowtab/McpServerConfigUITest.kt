@@ -27,7 +27,7 @@ class McpServerConfigUITest {
         assertEquals("slack", config.name)
         assertEquals("npx", config.command)
         assertEquals(listOf("-y", "@modelcontextprotocol/server-slack"), config.args)
-        assertEquals("SLACK_TOKEN", config.secretRef)
+        assertNull(config.secretRef)
         assertEquals(false, config.enabled)
     }
 
@@ -52,5 +52,13 @@ class McpServerConfigUITest {
         assertEquals("", config.command)
         assertTrue(config.args.isEmpty())
         assertNull(config.secretRef)
+    }
+
+    @Test
+    fun `operation diagnostics are single-line and bounded`() {
+        val diagnostic = boundedExternalMcpDiagnostic("  first line\nsecond line  " + "x".repeat(500))
+
+        assertTrue(diagnostic.startsWith("first line second line"))
+        assertTrue(diagnostic.length <= ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH)
     }
 }
