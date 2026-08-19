@@ -1065,16 +1065,33 @@ class FlowControllerTest {
     }
 
     @Test
-    fun `dispatch into an already cancelled scope fails instead of staying running`() = runBlocking {
+    fun `dispatch into an already cancelled scope fails and persists without raw coroutine text`() = runBlocking {
         val cancelledScope = CoroutineScope(Dispatchers.Default + SupervisorJob()).also { it.cancel() }
         val storage = DesktopStorage()
         val fc = FlowController(context(storage), { cancelledScope })
         val tabId = fc.createFlow()
         fc.addNode(tabId, "TRIGGER")
 
-        val job = awaitTerminal(fc, fc.startRun(tabId))
+        val runId = fc.startRun(tabId)
+        val job = awaitTerminal(fc, runId)
         assertEquals(RunJobState.FAILED, job.state)
-        assertTrue(job.error!!.contains("cancel", ignoreCase = true))
+        assertEquals("Flow run cancelled before dispatch", job.error)
+
+        val reloaded = FlowController(context(storage), { scope })
+        try {
+            val persisted = withTimeout(5_000) {
+                while (true) {
+                    reloaded.runStatus(runId)?.let { return@withTimeout it }
+                    delay(10)
+                }
+                error("unreachable")
+            }
+            assertEquals(RunJobState.FAILED, persisted.state)
+            assertEquals("Flow run cancelled before dispatch", persisted.error)
+        } finally {
+            reloaded.dispose()
+            fc.dispose()
+        }
     }
 
     @Test

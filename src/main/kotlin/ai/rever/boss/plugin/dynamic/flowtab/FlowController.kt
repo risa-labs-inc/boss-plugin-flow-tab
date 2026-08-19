@@ -479,17 +479,7 @@ class FlowController(
         executions[runId] = execution
         // Install before rechecking under the lock: either this check cancels the run,
         // or a later dispose transition observes the already-present map entry in its sweep.
-        execution.invokeOnCompletion { cause ->
-            if (cause is CancellationException) {
-                val message = cause.message?.let { "Flow run cancelled: $it" }
-                    ?: "Flow run cancelled before dispatch"
-                transitionToFailed(
-                    runId,
-                    tabId,
-                    states,
-                    message,
-                )
-            }
+        execution.invokeOnCompletion {
             executions.remove(runId, execution)
             runStates.remove(runId, states)
         }
