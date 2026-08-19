@@ -262,13 +262,16 @@ settled change performs one discovery pass and publishes cached descriptor and p
 `StateFlow`s. Every UI/headless registry may collect the descriptor snapshot and apply it through
 its own `ToolNodeSync`, but collectors must never call transport `listTools` or cancel shared MCP
 requests. Each server connect, discovery, and close has an independent cooperative 15-second deadline;
-timeouts must attempt bounded reaping and let queued mutations continue. A startup pass with any
-server error is not latched as initialized, so a later tab/headless `start()` retries discovery. The
-dialog remains dismissible during manager work and exposes an explicit refresh/retry.
+timeouts must attempt bounded reaping and let queued mutations continue. Reconciliation is deliberately
+serial for deterministic ordering, so its worst-case bound is the sum of per-server deadlines; the
+dialog stays dismissible and Remove/refresh actions remain queueable behind the pass. A startup pass
+with any server error is not latched as initialized, and an uncached headless `list()` submits the same
+idempotent retry. Server names are one routing segment: `/` and control characters are invalid.
 Server configs persist only secret references; resolved values stay in the host vault /
 transport boundary and must be redacted from bounded, single-line UI and log diagnostics. Disposal
-stops accepting requests, drains accepted work, reaps transports and publishes the terminal empty
-snapshot before terminating the manager actor; a terminal actor failure or forced `cancelNow` must
+stops accepting requests, drains accepted work, concurrently attempts every live close under the
+two-second NonCancellable cleanup bound, and publishes the terminal empty snapshot before terminating
+the manager actor; a terminal actor failure or forced `cancelNow` must
 also stop acceptance and fail every queued request instead of leaving work without a consumer. Fatal
 actor failure is logged without provider payloads and rejects later requests as crashed with plugin
 reload guidance, distinct from normal disposal.

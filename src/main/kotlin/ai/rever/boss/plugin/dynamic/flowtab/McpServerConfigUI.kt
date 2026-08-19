@@ -61,7 +61,8 @@ fun McpServerConfigPanel(
 ) {
     val scope = rememberCoroutineScope()
     var enabled by remember { mutableStateOf(false) }
-    var busy by remember { mutableStateOf(false) }
+    var pendingOperations by remember { mutableStateOf(0) }
+    val busy = pendingOperations > 0
     var operationError by remember { mutableStateOf<String?>(null) }
     var servers by remember { mutableStateOf<List<McpServerConfig>>(emptyList()) }
     val statuses by manager.serverStatuses.collectAsState()
@@ -94,9 +95,13 @@ fun McpServerConfigPanel(
         manager.changeTick.collect { reloadSafely() }
     }
 
-    fun <T> mutate(submit: () -> Deferred<T>, onResult: (T) -> Unit = {}) {
-        if (busy) return
-        busy = true
+    fun <T> mutate(
+        submit: () -> Deferred<T>,
+        allowWhileBusy: Boolean = false,
+        onResult: (T) -> Unit = {},
+    ) {
+        if (busy && !allowWhileBusy) return
+        pendingOperations += 1
         operationError = null
         val submittedAtTick = manager.changeTick.value
         val request = submit()
@@ -115,7 +120,7 @@ fun McpServerConfigPanel(
                     // rejected/no-op/failed before publishing one.
                     if (manager.changeTick.value == submittedAtTick) reloadSafely()
                 } finally {
-                    busy = false
+                    pendingOperations = (pendingOperations - 1).coerceAtLeast(0)
                 }
             }
         }
@@ -137,8 +142,8 @@ fun McpServerConfigPanel(
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.weight(1f),
             )
-            Pill("Refresh / retry", enabledLook = !busy) {
-                mutate({ manager.requestRefresh() })
+            Pill("Refresh / retry", enabledLook = true) {
+                mutate({ manager.requestRefresh() }, allowWhileBusy = true)
             }
         }
         if (busy) {
@@ -176,7 +181,8 @@ fun McpServerConfigPanel(
             ServerRow(
                 cfg = cfg,
                 status = statuses[cfg.name],
-                enabled = !busy,
+                toggleEnabled = !busy,
+                removeEnabled = true,
                 onToggle = { on ->
                     mutate({ manager.requestSetConfigEnabled(cfg.name, on) }) { found ->
                         if (!found) {
@@ -185,10 +191,11 @@ fun McpServerConfigPanel(
                     }
                 },
                 onRemove = {
-                    mutate({ manager.requestRemoveConfig(cfg.name) }) { removed ->
-                        if (!removed) {
-                            operationError = "That server was already removed."
-                        }
+                    mutate(
+                        submit = { manager.requestRemoveConfig(cfg.name) },
+                        allowWhileBusy = true,
+                    ) { removed ->
+                        if (!removed) operationError = "That server was already removed."
                     }
                 },
             )
@@ -209,7 +216,11 @@ fun McpServerConfigPanel(
         }
         val draft = McpServerDraft(name, kind, command, args, url, secretRef)
         val newConfig = draft.toConfigOrNull()
+        val invalidServerName = name.isNotBlank() && normalizedExternalMcpServerName(name) == null
         val duplicateName = newConfig != null && servers.any { it.name == newConfig.name }
+        if (invalidServerName) {
+            Text("Server name cannot contain '/' or control characters.", color = FlowTheme.Error, fontSize = 11.sp)
+        }
         if (duplicateName) {
             Text("A server named '${newConfig.name}' already exists.", color = FlowTheme.Error, fontSize = 11.sp)
         }
@@ -230,7 +241,8 @@ fun McpServerConfigPanel(
 private fun ServerRow(
     cfg: McpServerConfig,
     status: ExternalMcpServerStatus?,
-    enabled: Boolean,
+    toggleEnabled: Boolean,
+    removeEnabled: Boolean,
     onToggle: (Boolean) -> Unit,
     onRemove: () -> Unit,
 ) {
@@ -262,13 +274,13 @@ private fun ServerRow(
         }
         Switch(
             checked = cfg.enabled, onCheckedChange = onToggle,
-            enabled = enabled,
+            enabled = toggleEnabled,
             colors = SwitchDefaults.colors(checkedThumbColor = FlowTheme.Success),
         )
         Spacer(Modifier.width(8.dp))
         Text(
-            "Remove", color = if (enabled) FlowTheme.Error else FlowTheme.TextFaint, fontSize = 12.sp,
-            modifier = Modifier.pointerHoverIcon(PointerIcon.Hand).clickable(enabled = enabled) { onRemove() },
+            "Remove", color = if (removeEnabled) FlowTheme.Error else FlowTheme.TextFaint, fontSize = 12.sp,
+            modifier = Modifier.pointerHoverIcon(PointerIcon.Hand).clickable(enabled = removeEnabled) { onRemove() },
         )
     }
 }
@@ -342,11 +354,11 @@ internal data class McpServerDraft(
     val secretRef: String,
 ) {
     fun toConfigOrNull(): McpServerConfig? {
-        if (name.isBlank()) return null
+        val normalizedName = normalizedExternalMcpServerName(name) ?: return null
         if (kind == McpTransportKind.STDIO && command.isBlank()) return null
         if (kind == McpTransportKind.HTTP_SSE && url.isBlank()) return null
         return McpServerConfig(
-            name = name.trim(),
+            name = normalizedName,
             kind = kind,
             command = if (kind == McpTransportKind.STDIO) command.trim() else "",
             args = if (kind == McpTransportKind.STDIO) {

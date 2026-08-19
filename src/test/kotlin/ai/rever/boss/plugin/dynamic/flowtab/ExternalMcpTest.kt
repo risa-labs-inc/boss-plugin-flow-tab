@@ -234,6 +234,16 @@ class ExternalMcpTest {
 
         assertNull(m.listConfigs().single().secretRef)
         assertEquals(0, secretReads)
+        m.upsertConfig(
+            McpServerConfig(
+                "legacy",
+                McpTransportKind.STDIO,
+                command = "updated",
+                enabled = true,
+                secretRef = "ORPHANED_TOKEN",
+            ),
+        )
+        assertFalse("ORPHANED_TOKEN" in storage.map.getValue(ExternalMcpManager.CONFIG_KEY))
         m.disposeAll()
     }
 
@@ -272,6 +282,40 @@ class ExternalMcpTest {
         assertTrue(m.addConfig(original))
         assertFalse(m.addConfig(duplicate))
         assertEquals(original, m.listConfigs().single())
+    }
+
+    @Test
+    fun `manager rejects invalid requested names and ignores invalid stored names`() = runBlocking {
+        val storage = TestStorage()
+        var factoryCalls = 0
+        val m = manager(storage) { _, _ ->
+            factoryCalls++
+            FakeTransport(emptyList())
+        }
+
+        val slashFailure = assertFailsWith<IllegalArgumentException> {
+            m.addConfig(McpServerConfig("team/server", McpTransportKind.STDIO, command = "x"))
+        }
+        assertTrue("must not contain" in slashFailure.message.orEmpty())
+        assertFailsWith<IllegalArgumentException> {
+            m.upsertConfig(McpServerConfig("forged\nserver", McpTransportKind.STDIO, command = "x"))
+        }
+
+        storage.putJson(
+            ExternalMcpManager.CONFIG_KEY,
+            Json.encodeToString(
+                ListSerializer(McpServerConfig.serializer()),
+                listOf(McpServerConfig("bad/name", McpTransportKind.STDIO, command = "x", enabled = true)),
+            ),
+        )
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        assertTrue(m.listConfigs().isEmpty())
+        m.start()
+        assertEquals(0, factoryCalls)
+
+        assertTrue(m.addConfig(McpServerConfig("  safe  ", McpTransportKind.STDIO, command = "x")))
+        assertEquals("safe", m.listConfigs().single().name)
+        m.disposeAll()
     }
 
     @Test
@@ -332,6 +376,50 @@ class ExternalMcpTest {
         assertEquals(2, opened.size)
         assertTrue(opened.all { it.closed.get() })
         assertTrue(m.list().isEmpty())
+    }
+
+    @Test
+    fun `dispose invokes every close concurrently and bounds a hung server`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        val configs = listOf("first", "second", "third").map { name ->
+            McpServerConfig(name, McpTransportKind.STDIO, command = "x", enabled = true)
+        }
+        storage.putJson(
+            ExternalMcpManager.CONFIG_KEY,
+            Json.encodeToString(ListSerializer(McpServerConfig.serializer()), configs),
+        )
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        val closeInvoked = configs.associate { it.name to AtomicBoolean(false) }
+        val closeCompleted = configs.associate { it.name to AtomicBoolean(false) }
+        val m = manager(storage, ioDispatcher = dispatcher) { cfg, _ ->
+            object : McpTransport {
+                override suspend fun connect() = Unit
+                override suspend fun listTools(): List<RemoteTool> = emptyList()
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() {
+                    closeInvoked.getValue(cfg.name).set(true)
+                    if (cfg.name == "first") CompletableDeferred<Unit>().await()
+                    closeCompleted.getValue(cfg.name).set(true)
+                }
+            }
+        }
+        m.start()
+
+        val disposal = async { m.disposeAll() }
+        runCurrent()
+
+        assertTrue(closeInvoked.values.all(AtomicBoolean::get))
+        assertTrue(closeCompleted.getValue("second").get())
+        assertTrue(closeCompleted.getValue("third").get())
+        assertFalse(disposal.isCompleted)
+
+        advanceTimeBy(ExternalMcpManager.MAX_TRANSPORT_CLEANUP_TIMEOUT_MS)
+        runCurrent()
+        disposal.await()
+
+        assertFalse(closeCompleted.getValue("first").get())
+        assertTrue(m.descriptors.value.isEmpty())
     }
 
     @Test
@@ -568,7 +656,7 @@ class ExternalMcpTest {
     }
 
     @Test
-    fun `later start retries transient startup discovery failure and clears error`() = runBlocking {
+    fun `headless list retries transient startup discovery failure and clears error`() = runBlocking {
         val storage = TestStorage()
         seedEnabledServer(
             storage,
@@ -582,10 +670,10 @@ class ExternalMcpTest {
         assertTrue(m.descriptors.value.isEmpty())
 
         transport.failList = false
-        m.start()
+        val recovered = m.list()
 
         assertEquals(ExternalMcpServerState.CONNECTED, m.serverStatuses.value.getValue("s").state)
-        assertEquals(listOf("s/recovered"), m.descriptors.value.map { it.ref.name })
+        assertEquals(listOf("s/recovered"), recovered.map { it.ref.name })
         assertEquals(2, transport.listCalls.get())
     }
 
@@ -594,7 +682,7 @@ class ExternalMcpTest {
         val storage = TestStorage()
         val logged = mutableListOf<String>()
         val secret = "resolved-super-secret"
-        val serverName = "s\nforged"
+        val serverName = "safe-server"
         val m = manager(
             storage = storage,
             secrets = SecretResolver.constant(secret),
@@ -739,7 +827,7 @@ class ExternalMcpTest {
     }
 
     @Test
-    fun `transport cancellation fails one request cleans up and leaves actor usable`() = runTest {
+    fun `active transport cancellation marks error cleans up and leaves actor usable`() = runTest {
         val dispatcher = UnconfinedTestDispatcher(testScheduler)
         val storage = TestStorage()
         SettingsStore(storage).setExternalMcpEnabled(true)
@@ -770,7 +858,7 @@ class ExternalMcpTest {
             }
         }
 
-        val failure = assertFailsWith<CancellationException> {
+        assertTrue(
             m.addConfig(
                 McpServerConfig(
                     "s",
@@ -779,21 +867,84 @@ class ExternalMcpTest {
                     enabled = true,
                     secretRef = "TOKEN",
                 ),
-            )
-        }
+            ),
+        )
         assertTrue(firstClosed)
         assertTrue(cleanupWasActive)
-        assertEquals("External MCP operation cancelled", failure.message)
-        assertFalse(secret in failure.message.orEmpty())
-        assertFalse('\n' in failure.message.orEmpty())
-        val requestFailureChain = generateSequence<Throwable>(failure) { it.cause }.toList()
-        assertTrue(requestFailureChain.none { secret in it.message.orEmpty() })
-        assertTrue(requestFailureChain.none { '\n' in it.message.orEmpty() })
+        val status = m.serverStatuses.value.getValue("s")
+        assertEquals(ExternalMcpServerState.ERROR, status.state)
+        assertFalse(secret in status.detail.orEmpty())
+        assertFalse('\n' in status.detail.orEmpty())
 
         m.refresh()
 
         assertEquals(2, attempts)
         assertEquals(listOf("s/later"), m.descriptors.value.map { it.ref.name })
+    }
+
+    @Test
+    fun `active connect cancellation does not prevent later servers`() = runBlocking {
+        val storage = TestStorage()
+        val cancelled = McpServerConfig("cancelled", McpTransportKind.STDIO, command = "x", enabled = true)
+        val good = McpServerConfig("good", McpTransportKind.STDIO, command = "y", enabled = true)
+        storage.putJson(
+            ExternalMcpManager.CONFIG_KEY,
+            Json.encodeToString(ListSerializer(McpServerConfig.serializer()), listOf(cancelled, good)),
+        )
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        var cancelledClosed = false
+        val m = manager(storage) { cfg, _ ->
+            if (cfg.name == "cancelled") {
+                object : McpTransport {
+                    override suspend fun connect(): Unit = throw CancellationException("provider cancelled")
+                    override suspend fun listTools(): List<RemoteTool> = emptyList()
+                    override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                    override suspend fun close() { cancelledClosed = true }
+                }
+            } else {
+                FakeTransport(listOf(remote("tool")))
+            }
+        }
+
+        m.start()
+
+        assertTrue(cancelledClosed)
+        assertEquals(ExternalMcpServerState.ERROR, m.serverStatuses.value.getValue("cancelled").state)
+        assertEquals(listOf("good/tool"), m.descriptors.value.map { it.ref.name })
+        m.disposeAll()
+    }
+
+    @Test
+    fun `active discovery cancellation does not prevent later servers`() = runBlocking {
+        val storage = TestStorage()
+        val cancelled = McpServerConfig("cancelled", McpTransportKind.STDIO, command = "x", enabled = true)
+        val good = McpServerConfig("good", McpTransportKind.STDIO, command = "y", enabled = true)
+        storage.putJson(
+            ExternalMcpManager.CONFIG_KEY,
+            Json.encodeToString(ListSerializer(McpServerConfig.serializer()), listOf(cancelled, good)),
+        )
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        var cancelledClosed = false
+        val m = manager(storage) { cfg, _ ->
+            if (cfg.name == "cancelled") {
+                object : McpTransport {
+                    override suspend fun connect() = Unit
+                    override suspend fun listTools(): List<RemoteTool> =
+                        throw CancellationException("provider cancelled")
+                    override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                    override suspend fun close() { cancelledClosed = true }
+                }
+            } else {
+                FakeTransport(listOf(remote("tool")))
+            }
+        }
+
+        m.start()
+
+        assertTrue(cancelledClosed)
+        assertEquals(ExternalMcpServerState.ERROR, m.serverStatuses.value.getValue("cancelled").state)
+        assertEquals(listOf("good/tool"), m.descriptors.value.map { it.ref.name })
+        m.disposeAll()
     }
 
     @Test

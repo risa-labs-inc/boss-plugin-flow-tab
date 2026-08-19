@@ -13,6 +13,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -92,6 +93,20 @@ internal fun boundedExternalMcpDiagnostic(
     return safe.take(ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH)
 }
 
+/** Names are embedded in the `<server>/<tool>` routing key and must be one safe segment. */
+internal fun normalizedExternalMcpServerName(raw: String): String? {
+    val name = raw.trim()
+    return name.takeIf { it.isNotEmpty() && '/' !in it && it.none { char -> char.isISOControl() } }
+}
+
+internal fun normalizedExternalMcpConfig(config: McpServerConfig): McpServerConfig? {
+    val name = normalizedExternalMcpServerName(config.name) ?: return null
+    return config.copy(
+        name = name,
+        secretRef = if (config.kind == McpTransportKind.STDIO) null else config.secretRef,
+    )
+}
+
 /**
  * Plugin-wide owner of external-MCP persistence, lifecycle, and discovery. Every write,
  * reconcile, and live `listTools` request runs on one manager-owned IO actor. Callers only
@@ -146,6 +161,7 @@ class ExternalMcpManager(
     private val requestLock = Any()
     private var acceptingRequests = true
     private var terminalState = TerminalState.ACTIVE
+    @Volatile
     private var initialized = false
     private var disposeResult: CompletableDeferred<Unit>? = null
 
@@ -193,32 +209,40 @@ class ExternalMcpManager(
     suspend fun refresh() = requestRefresh().await()
 
     fun requestUpsertConfig(config: McpServerConfig): Deferred<Unit> {
+        val normalized = normalizedExternalMcpConfig(config)
+            ?: return rejectedRequest(INVALID_SERVER_NAME_MESSAGE)
         val result = CompletableDeferred<Unit>()
-        return enqueue(ManagerRequest.Upsert(config, result), result)
+        return enqueue(ManagerRequest.Upsert(normalized, result), result)
     }
 
     suspend fun upsertConfig(config: McpServerConfig) = requestUpsertConfig(config).await()
 
     /** Add only when [McpServerConfig.name] is unused; never silently replaces a server. */
     fun requestAddConfig(config: McpServerConfig): Deferred<Boolean> {
+        val normalized = normalizedExternalMcpConfig(config)
+            ?: return rejectedRequest(INVALID_SERVER_NAME_MESSAGE)
         val result = CompletableDeferred<Boolean>()
-        return enqueue(ManagerRequest.Add(config, result), result)
+        return enqueue(ManagerRequest.Add(normalized, result), result)
     }
 
     suspend fun addConfig(config: McpServerConfig): Boolean = requestAddConfig(config).await()
 
     /** Toggle the latest stored config by name; false means it was removed meanwhile. */
     fun requestSetConfigEnabled(name: String, enabled: Boolean): Deferred<Boolean> {
+        val normalizedName = normalizedExternalMcpServerName(name)
+            ?: return rejectedRequest(INVALID_SERVER_NAME_MESSAGE)
         val result = CompletableDeferred<Boolean>()
-        return enqueue(ManagerRequest.SetEnabled(name, enabled, result), result)
+        return enqueue(ManagerRequest.SetEnabled(normalizedName, enabled, result), result)
     }
 
     suspend fun setConfigEnabled(name: String, enabled: Boolean): Boolean =
         requestSetConfigEnabled(name, enabled).await()
 
     fun requestRemoveConfig(name: String): Deferred<Boolean> {
+        val normalizedName = normalizedExternalMcpServerName(name)
+            ?: return rejectedRequest(INVALID_SERVER_NAME_MESSAGE)
         val result = CompletableDeferred<Boolean>()
-        return enqueue(ManagerRequest.Remove(name, result), result)
+        return enqueue(ManagerRequest.Remove(normalizedName, result), result)
     }
 
     suspend fun removeConfig(name: String): Boolean = requestRemoveConfig(name).await()
@@ -229,6 +253,9 @@ class ExternalMcpManager(
     }
 
     suspend fun setSettingsEnabled(on: Boolean) = requestSetSettingsEnabled(on).await()
+
+    private fun <T> rejectedRequest(message: String): Deferred<T> =
+        CompletableDeferred<T>().also { it.completeExceptionally(IllegalArgumentException(message)) }
 
     private fun <T> enqueue(request: ManagerRequest, result: CompletableDeferred<T>): Deferred<T> {
         val rejection = synchronized(requestLock) {
@@ -298,20 +325,12 @@ class ExternalMcpManager(
         val raw = storage?.getJson(CONFIG_KEY) ?: return emptyList()
         return runCatching { json.decodeFromString(listSerializer, raw) }
             .getOrDefault(emptyList())
-            .map { config ->
-                // Legacy stdio secret references were never consumed by the transport.
-                // Normalize them at the manager boundary so they are neither resolved
-                // nor exposed as a silent, uneditable credential reference.
-                if (config.kind == McpTransportKind.STDIO && config.secretRef != null) {
-                    config.copy(secretRef = null)
-                } else {
-                    config
-                }
-            }
+            .mapNotNull(::normalizedExternalMcpConfig)
     }
 
     private suspend fun writeConfigs(configs: List<McpServerConfig>) {
-        storage?.putJson(CONFIG_KEY, json.encodeToString(listSerializer, configs))
+        val normalized = configs.mapNotNull(::normalizedExternalMcpConfig)
+        storage?.putJson(CONFIG_KEY, json.encodeToString(listSerializer, normalized))
     }
 
     // ---- single actor -------------------------------------------------------
@@ -481,15 +500,21 @@ class ExternalMcpManager(
                 transport?.let { opened ->
                     closeFailedOpen(opened)
                 }
+                val detail = failureDetail("Connection cancelled", cancelled, resolvedSecret)
                 setStatus(
                     name,
                     ExternalMcpServerStatus(
                         ExternalMcpServerState.ERROR,
-                        failureDetail("Connection cancelled", cancelled, resolvedSecret),
+                        detail,
                     ),
                 )
                 if (!currentCoroutineContext().isActive) throw cancelled
-                throw sanitizedCancellation(cancelled, resolvedSecret)
+                logFailure(
+                    "external MCP server",
+                    name,
+                    "cancelled while connecting",
+                    detail,
+                )
             } catch (failure: Exception) {
                 transport?.let { closeFailedOpen(it) }
                 val detail = failureDetail("Connection failed", failure, resolvedSecret)
@@ -519,15 +544,18 @@ class ExternalMcpManager(
                     setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
                     logFailure("external MCP server", name, "timed out while listing tools", detail)
                 } catch (cancelled: CancellationException) {
+                    open.remove(name, live)
+                    closeFailedOpen(live.transport)
+                    val detail = failureDetail("Tool discovery cancelled", cancelled, live.resolvedSecret)
                     setStatus(
                         name,
                         ExternalMcpServerStatus(
                             ExternalMcpServerState.ERROR,
-                            failureDetail("Tool discovery cancelled", cancelled, live.resolvedSecret),
+                            detail,
                         ),
                     )
                     if (!currentCoroutineContext().isActive) throw cancelled
-                    throw sanitizedCancellation(cancelled, live.resolvedSecret)
+                    logFailure("external MCP server", name, "cancelled while listing tools", detail)
                 } catch (failure: Exception) {
                     val detail = failureDetail("Tool discovery failed", failure, live.resolvedSecret)
                     setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
@@ -570,8 +598,14 @@ class ExternalMcpManager(
 
     // ---- cached ToolSource --------------------------------------------------
 
-    /** Cached manager-owned discovery; never performs transport I/O for a tab/agent. */
-    override suspend fun list(): List<ToolDescriptor> = descriptors.value
+    /**
+     * Return the settled cache cheaply. When startup/discovery has not settled cleanly,
+     * submit and await the manager-owned idempotent retry so headless callers self-heal.
+     */
+    override suspend fun list(): List<ToolDescriptor> {
+        if (!initialized) requestStart().await()
+        return descriptors.value
+    }
 
     override suspend fun invoke(name: String, argsJson: String): ToolResult {
         val server = name.substringBefore('/', "")
@@ -603,7 +637,24 @@ class ExternalMcpManager(
     }
 
     private suspend fun disposeOwnedState() {
-        for (name in open.keys.toList()) closeOne(name)
+        val lives = open.entries.map { it.key to it.value }
+        lives.forEach { (name, live) -> open.remove(name, live) }
+        val fatalCloseFailures = withContext(NonCancellable) {
+            lives.map { (_, live) ->
+                async {
+                    try {
+                        closeFailedOpen(live.transport)
+                        null
+                    } catch (fatal: Error) {
+                        fatal
+                    }
+                }
+            }.awaitAll().filterNotNull()
+        }
+        fatalCloseFailures.firstOrNull()?.let { first ->
+            fatalCloseFailures.drop(1).forEach(first::addSuppressed)
+            throw first
+        }
         mutableDescriptors.value = emptyList()
         replaceStatuses(
             mutableServerStatuses.value.mapValues { _ ->
@@ -630,17 +681,6 @@ class ExternalMcpManager(
             fallback = prefix,
             redactions = listOfNotNull(resolvedSecret),
         )
-
-    private fun sanitizedCancellation(
-        cancelled: CancellationException,
-        resolvedSecret: String? = null,
-    ): CancellationException = CancellationException(
-        boundedExternalMcpDiagnostic(
-            cancelled.message,
-            fallback = "External MCP operation cancelled",
-            redactions = listOfNotNull(resolvedSecret),
-        ),
-    )
 
     private fun publicCancellation(): CancellationException = CancellationException(CANCELLED_MESSAGE)
 
@@ -680,8 +720,10 @@ class ExternalMcpManager(
         const val CONFIG_KEY = "mcpservers:config"
         internal const val DEFAULT_SERVER_OPERATION_TIMEOUT_MS = 15_000L
         internal const val MAX_STATUS_DETAIL_LENGTH = 240
-        private const val MAX_TRANSPORT_CLEANUP_TIMEOUT_MS = 2_000L
+        internal const val MAX_TRANSPORT_CLEANUP_TIMEOUT_MS = 2_000L
         private const val DISPOSED_MESSAGE = "External MCP manager is disposed"
+        private const val INVALID_SERVER_NAME_MESSAGE =
+            "External MCP server name must not contain '/' or control characters"
         private const val CRASHED_MESSAGE = "External MCP manager crashed; reload the plugin to retry"
         private const val CANCELLED_MESSAGE = "External MCP operation cancelled"
         private const val OPERATION_FAILED_MESSAGE = "External MCP operation failed"

@@ -55,6 +55,22 @@ class McpServerConfigUITest {
     }
 
     @Test
+    fun `draft rejects names that break routing or contain controls`() {
+        assertNull(
+            McpServerDraft("team/server", McpTransportKind.STDIO, "npx", "", "", "")
+                .toConfigOrNull(),
+        )
+        assertNull(
+            McpServerDraft("forged\nserver", McpTransportKind.STDIO, "npx", "", "", "")
+                .toConfigOrNull(),
+        )
+        assertNull(
+            McpServerDraft("tab\tserver", McpTransportKind.HTTP_SSE, "", "", "https://example.test", "")
+                .toConfigOrNull(),
+        )
+    }
+
+    @Test
     fun `operation diagnostics are single-line and bounded`() {
         val diagnostic = boundedExternalMcpDiagnostic("  first line\nsecond line  " + "x".repeat(500))
 
