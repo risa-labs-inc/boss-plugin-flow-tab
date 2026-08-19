@@ -145,7 +145,8 @@ fun toolNodeSpec(desc: ToolDescriptor, source: ToolSource): NodeSpec {
  * per descriptor and unregisters ones that have disappeared, leaving built-ins and
  * other kinds untouched. A malformed descriptor retains its last-known-good spec; an
  * all-malformed update retains the full prior set until a valid emission can distinguish
- * stale tools from a transient provider failure. Not thread-safe; drive it from one scope.
+ * stale tools from a transient provider failure. A valid empty emission remains authoritative
+ * and removes every previously synchronized tool. Not thread-safe; drive it from one scope.
  */
 internal class ToolNodeSync(
     private val source: ToolSource,

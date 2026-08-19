@@ -92,8 +92,9 @@ class FlowController(
      * Keep the headless registry synchronized for this controller's whole lifetime.
      * These collectors deliberately do not belong to [scopeProvider]: that scope may be
      * replaced by the host while the controller and its registry remain registered. The
-     * first call fixes the external manager for this controller; later calls return the
-     * same jobs without installing duplicate collectors.
+     * first non-empty start fixes the external manager for this controller; later calls
+     * return the same jobs without installing duplicate collectors. An attempt that cannot
+     * start either collector is not memoized, so a host registry that appears later can retry.
      */
     internal fun startToolRegistrySync(external: ExternalMcpManager?): List<Job> {
         return synchronized(toolSyncLock) {
@@ -103,7 +104,9 @@ class FlowController(
             try {
                 syncBossTools(context, registry, lifecycleScope)?.let(started::add)
                 external?.let { started += syncExternalMcpTools(it, registry, lifecycleScope) }
-                started.toList().also { toolSyncJobs = it }
+                started.toList().also { jobs ->
+                    if (jobs.isNotEmpty()) toolSyncJobs = jobs
+                }
             } catch (failure: Throwable) {
                 started.forEach { it.cancel() }
                 throw failure
@@ -500,9 +503,9 @@ class FlowController(
         return stopped
     }
 
-    /** Release controller-owned registry sync and run monitors on tab/plugin teardown. */
+    /** Cancel current executions on every call; release lifecycle work on first teardown. */
     fun dispose() {
-        val shouldDispose = synchronized(toolSyncLock) {
+        val cancelLifecycle = synchronized(toolSyncLock) {
             if (disposed) {
                 false
             } else {
@@ -510,9 +513,11 @@ class FlowController(
                 true
             }
         }
-        if (!shouldDispose) return
+        // Keep this outside the one-time lifecycle transition. startRun intentionally
+        // retains its historical dispatch contract, so a later dispose call must still
+        // cancel any execution installed after an earlier disposal pass.
         executions.values.forEach { it.cancel(CancellationException("Flow controller disposed")) }
-        lifecycleScope.cancel()
+        if (cancelLifecycle) lifecycleScope.cancel()
     }
 
     private fun publishTerminalIfRunning(runId: String, candidate: RunJob): RunJob =

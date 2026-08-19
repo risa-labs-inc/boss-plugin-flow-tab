@@ -21,6 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
@@ -924,6 +925,51 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `repeat dispose cancels a run started after initial disposal`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val cancelled = CompletableDeferred<Unit>()
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "POST_DISPOSE_HANG",
+                    label = "Post-dispose Hang",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, _, _ ->
+                        entered.complete(Unit)
+                        try {
+                            awaitCancellation()
+                        } finally {
+                            cancelled.complete(Unit)
+                        }
+                    },
+                ),
+            )
+        }
+        val fc = controller(registry = registry)
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "POST_DISPOSE_HANG")
+
+        try {
+            fc.dispose()
+            val runId = fc.startRun(tabId)
+            withTimeout(5_000) { entered.await() }
+            assertEquals(RunJobState.RUNNING, fc.runStatus(runId)?.state)
+
+            fc.dispose()
+            withTimeout(5_000) { cancelled.await() }
+            val terminal = awaitTerminal(fc, runId)
+            assertEquals(RunJobState.FAILED, terminal.state)
+            assertContains(terminal.error.orEmpty(), "Flow controller disposed")
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
     fun `headless runs use the replacement sandbox scope after watchdog restart`() = runBlocking {
         val storage = DesktopStorage()
         var sandboxScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
@@ -1063,6 +1109,35 @@ class FlowControllerTest {
 
             assertSame(first, second, "restarting sync must return the existing jobs")
             assertEquals(1, first.size, "only one host registry collector should be installed")
+        } finally {
+            controller.dispose()
+        }
+    }
+
+    @Test
+    fun `empty tool sync startup remains retryable when host registry appears`() = runBlocking {
+        val storage = DesktopStorage()
+        var bossRegistry: McpToolRegistry? = null
+        val ctx = object : PluginContext {
+            override val panelRegistry = PanelRegistry()
+            override val tabRegistry = TabRegistry()
+            override val pluginScope: CoroutineScope get() = scope
+            override val mcpToolRegistry: McpToolRegistry? get() = bossRegistry
+            override val pluginStorageFactory = object : PluginStorageFactory {
+                override fun createStorage(pluginId: String): PluginStorageProvider = storage
+            }
+        }
+        val controller = FlowController(ctx)
+
+        try {
+            assertTrue(controller.startToolRegistrySync(external = null).isEmpty())
+
+            bossRegistry = FakeBossRegistry("late")
+            val started = controller.startToolRegistrySync(external = null)
+            assertEquals(1, started.size, "a later host registry should start one collector")
+            withTimeout(2_000) {
+                while (controller.registry.resolve("tool:boss:late").isUnavailable) delay(10)
+            }
         } finally {
             controller.dispose()
         }
