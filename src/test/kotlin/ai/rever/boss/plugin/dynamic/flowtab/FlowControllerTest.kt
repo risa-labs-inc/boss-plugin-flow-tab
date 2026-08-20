@@ -176,6 +176,40 @@ class FlowControllerTest {
         FlowPersistenceCoordinator.forget(tabId)
     }
 
+    @Test
+    fun `late running update cannot overwrite the same run terminal state`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        val running = RunJob("run-terminal-guard", tabId, RunJobState.RUNNING, startedAtMs = 10L)
+        val terminal = running.copy(state = RunJobState.SUCCEEDED)
+
+        FlowPersistenceCoordinator.publishRunUpdate(running)
+        FlowPersistenceCoordinator.publishRunUpdate(terminal)
+        FlowPersistenceCoordinator.publishRunUpdate(running.copy(nodeCount = 99))
+
+        assertEquals(RunJobState.SUCCEEDED, fc.runStatus(running.runId)?.state)
+        assertEquals(RunJobState.SUCCEEDED, FlowPersistenceCoordinator.latestRunUpdate(tabId)?.job?.state)
+        FlowPersistenceCoordinator.forget(tabId)
+    }
+
+    @Test
+    fun `controller disposal forgets its static run snapshots`() {
+        val fc = controller()
+        val job = RunJob(
+            runId = "run-dispose-history",
+            tabId = "flow-dispose-history",
+            state = RunJobState.SUCCEEDED,
+            startedAtMs = 1L,
+        )
+        fc.publishCanvasRun(job, persist = false)
+        assertNotNull(FlowPersistenceCoordinator.runUpdate(job.runId))
+
+        fc.dispose()
+
+        assertNull(FlowPersistenceCoordinator.runUpdate(job.runId))
+    }
+
     private fun hangingRegistry(
         kind: String,
         onStart: () -> Unit = {},

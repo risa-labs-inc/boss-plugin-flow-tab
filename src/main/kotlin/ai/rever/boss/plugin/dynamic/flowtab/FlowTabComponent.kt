@@ -193,7 +193,7 @@ class FlowTabComponent(
     private val visibleTabId = AtomicReference<String?>(null)
     private val currentCanvasHistoryRunId = AtomicReference<String?>(null)
     private val lastCanvasHistoryRunId = AtomicReference<String?>(null)
-    private val suppressedCanvasRunIds = ConcurrentHashMap.newKeySet<String>()
+    private val suppressedRunId = AtomicReference<String?>(null)
 
     init {
         FlowPersistenceCoordinator.registerLiveCanvas(config.id, liveCanvas)
@@ -303,8 +303,12 @@ class FlowTabComponent(
             while (!initialized) delay(20)
             FlowPersistenceCoordinator.runUpdates.collect { updates ->
                 updates[config.id]?.let { update ->
-                    if (update.revision > displayedRunRevision &&
-                        update.job.runId !in suppressedCanvasRunIds &&
+                    val suppressed = suppressedRunId.get() == update.job.runId
+                    if (suppressed && update.job.isTerminal) {
+                        suppressedRunId.compareAndSet(update.job.runId, null)
+                    }
+                    if (currentCanvasHistoryRunId.get() == null && !suppressed &&
+                        update.revision > displayedRunRevision &&
                         update.job.runId != lastCanvasHistoryRunId.get()
                     ) {
                         displayedRunRevision = update.revision
@@ -593,10 +597,10 @@ class FlowTabComponent(
             // Invalidate before cancelling or mutating state so late executor callbacks
             // and the run finalizer cannot repopulate the cleared snapshot.
             val invalidation = runStatePersistence.invalidateRun()
-            currentCanvasHistoryRunId.get()?.let(suppressedCanvasRunIds::add)
-            lastCanvasHistoryRunId.get()?.let(suppressedCanvasRunIds::add)
-            FlowPersistenceCoordinator.latestRunUpdate(config.id)?.job?.runId
-                ?.let(suppressedCanvasRunIds::add)
+            suppressedRunId.set(
+                FlowPersistenceCoordinator.latestRunUpdate(config.id)?.job?.runId
+                    ?: lastCanvasHistoryRunId.get()
+            )
             runJobs.cancelAll()
             state.isRunning = false
             state.notice = null

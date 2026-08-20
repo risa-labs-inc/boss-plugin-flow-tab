@@ -133,18 +133,20 @@ internal object FlowPersistenceCoordinator {
 
     fun publishRunUpdate(job: RunJob): ExternalRunUpdate {
         val update = ExternalRunUpdate(revisionCounter.incrementAndGet(), job)
-        runUpdatesById[job.runId] = update
+        val effective = runUpdatesById.compute(job.runId) { _, previous ->
+            if (previous?.job?.isTerminal == true) previous else update
+        } ?: update
         mutableRunUpdates.update { current ->
-            val previous = current[job.tabId]
-            if (previous == null || previous.job.runId == job.runId ||
-                job.startedAtMs >= previous.job.startedAtMs
+            val previous = current[effective.job.tabId]
+            if (previous == null || previous.job.runId == effective.job.runId ||
+                effective.job.startedAtMs >= previous.job.startedAtMs
             ) {
-                current + (job.tabId to update)
+                current + (effective.job.tabId to effective)
             } else {
                 current
             }
         }
-        return update
+        return effective
     }
 
     fun latestRunUpdate(tabId: String): ExternalRunUpdate? = mutableRunUpdates.value[tabId]

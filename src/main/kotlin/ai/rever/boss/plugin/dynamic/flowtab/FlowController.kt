@@ -90,6 +90,7 @@ class FlowController(
         context.pluginStorageFactory?.createStorage(STORAGE_NAMESPACE)
     }.getOrNull()
     private val jobs = ConcurrentHashMap<String, RunJob>()
+    private val ownedRunIds = ConcurrentHashMap.newKeySet<String>()
     private val executions = ConcurrentHashMap<String, Job>()
     private val runStates = ConcurrentHashMap<String, ConcurrentHashMap<String, NodeRun>>()
     private val persistMutex = Mutex()
@@ -412,9 +413,11 @@ class FlowController(
         withContext(NonCancellable) {
             store.removeJsonValue(graphKey(tabId))
             store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
-            runIdsFor(tabId).forEach { runId ->
+            storedRuns().filter { it.second.tabId == tabId }.forEach { (runId, _) ->
                 store.removeJsonValue(runKey(runId))
                 jobs.remove(runId)
+                ownedRunIds.remove(runId)
+                FlowPersistenceCoordinator.forgetRun(runId)
             }
         }
         FlowPersistenceCoordinator.forget(tabId)
@@ -445,6 +448,7 @@ class FlowController(
             return runId
         }
         jobs[runId] = RunJob(runId, tabId, RunJobState.RUNNING, startedAtMs = startedAtMs)
+        ownedRunIds += runId
         val states = ConcurrentHashMap<String, NodeRun>()
         runStates[runId] = states
         val execution = scopeProvider().launch(Dispatchers.Default) {
@@ -484,7 +488,7 @@ class FlowController(
                     runId = runId,
                     tabId = tabId,
                     state = if (firstError != null) RunJobState.FAILED else RunJobState.SUCCEEDED,
-                    startedAtMs = jobs[runId]?.startedAtMs ?: nowMillis(),
+                    startedAtMs = jobs[runId]?.startedAtMs ?: startedAtMs,
                     nodeCount = snap.nodes.size,
                     error = firstError?.error,
                     nodes = states.toRunSnapshot().states,
@@ -568,9 +572,8 @@ class FlowController(
         // retains its historical dispatch contract, so a later dispose call must still
         // cancel any execution installed after an earlier disposal pass.
         executions.values.forEach { it.cancel(CancellationException("Flow controller disposed")) }
-        jobs.values.asSequence()
-            .filter { it.state == RunJobState.RUNNING }
-            .forEach { FlowPersistenceCoordinator.forgetRun(it.runId) }
+        ownedRunIds.forEach(FlowPersistenceCoordinator::forgetRun)
+        ownedRunIds.clear()
         if (cancelLifecycle) lifecycleScope.cancel()
     }
 
@@ -613,6 +616,7 @@ class FlowController(
 
     /** Record a canvas-owned run through the same durable/live channel as MCP runs. */
     internal fun publishCanvasRun(job: RunJob, persist: Boolean = true) {
+        ownedRunIds += job.runId
         jobs.compute(job.runId) { _, current ->
             if (current?.isTerminal == true) current else job
         }
@@ -653,19 +657,29 @@ class FlowController(
 
     private suspend fun evictOldRuns(tabId: String) {
         val retained = listRuns(tabId, DEFAULT_RUN_HISTORY_LIMIT).mapTo(mutableSetOf()) { it.runId }
-        runIdsFor(tabId).forEach { runId ->
-            val loaded = jobs[runId] ?: loadStoredJob(runId)
-            if (loaded != null && runId !in retained &&
+        val stored = storedRuns().filter { it.second.tabId == tabId }
+        stored.forEach { (runId, storedJob) ->
+            val loaded = jobs[runId] ?: storedJob
+            if (runId !in retained &&
                 (loaded.isTerminal || !FlowPersistenceCoordinator.isRunLive(runId))
             ) {
                 storage?.removeJsonValue(runKey(runId))
                 jobs.remove(runId, loaded)
+                ownedRunIds.remove(runId)
                 FlowPersistenceCoordinator.forgetRun(runId)
             }
         }
+        jobs.values.asSequence()
+            .filter { it.tabId == tabId && it.runId !in retained && it.isTerminal }
+            .toList()
+            .forEach { old ->
+                jobs.remove(old.runId, old)
+                ownedRunIds.remove(old.runId)
+                FlowPersistenceCoordinator.forgetRun(old.runId)
+            }
     }
 
-    private suspend fun runIdsFor(tabId: String): List<String> {
+    private suspend fun storedRuns(): List<Pair<String, RunJob>> {
         val candidates = storage?.getAllKeys().orEmpty()
             .asSequence()
             .map { it.removePrefix(JSON_STORAGE_PREFIX) }
@@ -674,7 +688,7 @@ class FlowController(
             .toList()
         return buildList {
             for (runId in candidates) {
-                if ((jobs[runId] ?: loadStoredJob(runId))?.tabId == tabId) add(runId)
+                loadStoredJob(runId)?.let { add(runId to it) }
             }
         }
     }
@@ -761,7 +775,7 @@ class FlowController(
             runId = runId,
             tabId = tabId,
             state = RunJobState.FAILED,
-            startedAtMs = jobs[runId]?.startedAtMs ?: nowMillis(),
+            startedAtMs = jobs[runId]?.startedAtMs ?: nextRunStartedAtMs(),
             nodeCount = jobs[runId]?.nodeCount ?: states.size,
             error = message,
             nodes = terminalNodes,
