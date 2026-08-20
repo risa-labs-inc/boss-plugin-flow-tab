@@ -175,6 +175,24 @@ class FlowMcpToolProvider(
             }
             McpToolResult(json.encodeToString(JsonObject.serializer(), job.toMcpResult(includeOutput, nodeId)), false)
         },
+        def("flow_runs", "List recent runs for a flow, newest first. Returns runId, state, " +
+            "startedAtMs, and nodeCount.",
+            schema(
+                """{"tabId":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":${FlowController.MAX_RUN_HISTORY_LIMIT}}}""",
+                required = listOf("tabId"),
+            ), readOnly = true) { a ->
+            val args = a.obj()
+            val tabId = args.str("tabId") ?: return@def err("flow_runs requires 'tabId'")
+            if (controller.getFlow(tabId) == null) return@def err("No flow '$tabId'")
+            val limit = args["limit"]?.jsonPrimitive?.int ?: FlowController.DEFAULT_RUN_HISTORY_LIMIT
+            val runs = controller.listRuns(tabId, limit)
+            ok(buildJsonObject {
+                put(
+                    "runs",
+                    json.encodeToJsonElement(ListSerializer(RunSummary.serializer()), runs),
+                )
+            })
+        },
         def("flow_list", "List every stored flow's tabId. Pass detail=true to also return " +
             "flowDetails with names, descriptions, node counts, and readability.",
             schema("""{"detail":{"type":"boolean"}}"""), readOnly = true) { a ->

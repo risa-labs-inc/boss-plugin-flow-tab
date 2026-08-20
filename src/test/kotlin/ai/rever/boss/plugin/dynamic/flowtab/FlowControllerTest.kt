@@ -83,6 +83,42 @@ class FlowControllerTest {
         tabUpdates: TabUpdateProviderFactory? = null,
     ) = FlowController(context(storage, tabUpdates), { scope }, registry, runTimeoutMs)
 
+    @Test
+    fun `canvas run history publishes live and retains only the newest twenty per flow`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+
+        repeat(25) { index ->
+            fc.publishCanvasRun(
+                RunJob(
+                    runId = "run-history-${index + 1}",
+                    tabId = tabId,
+                    state = RunJobState.SUCCEEDED,
+                    startedAtMs = (index + 1).toLong(),
+                    nodeCount = 3,
+                )
+            )
+        }
+
+        withTimeout(5_000) {
+            while (storage.map.keys.count { it.startsWith("json:${FlowController.RUN_PREFIX}") } !=
+                FlowController.DEFAULT_RUN_HISTORY_LIMIT ||
+                FlowPersistenceCoordinator.latestRunUpdate(tabId)?.job?.runId != "run-history-25") {
+                delay(10)
+            }
+        }
+        val history = fc.listRuns(tabId)
+        assertEquals(20, history.size)
+        assertEquals("run-history-25", history.first().runId)
+        assertEquals("run-history-6", history.last().runId)
+        assertEquals(3, history.first().nodeCount)
+        assertEquals(
+            "run-history-25",
+            FlowPersistenceCoordinator.latestRunUpdate(tabId)?.job?.runId,
+        )
+    }
+
     private fun hangingRegistry(
         kind: String,
         onStart: () -> Unit = {},
@@ -680,17 +716,25 @@ class FlowControllerTest {
     }
 
     @Test
-    fun `deleteFlow removes graph and persisted UI run state`() = runBlocking {
+    fun `deleteFlow removes graph persisted UI state and run history`() = runBlocking {
         val storage = DesktopStorage()
         val fc = controller(storage)
         val tabId = fc.createFlow(FlowMeta(name = "Disposable"))
         storage.putJson("$RUN_STATE_PREFIX$tabId", "{}")
+        storage.putJson(
+            "${FlowController.RUN_PREFIX}run-delete-me",
+            kotlinx.serialization.json.Json.encodeToString(
+                RunJob.serializer(),
+                RunJob("run-delete-me", tabId, RunJobState.SUCCEEDED, startedAtMs = 1L),
+            ),
+        )
         FlowPersistenceCoordinator.publishRename(tabId, "Disposable renamed")
 
         assertTrue(fc.deleteFlow(tabId))
 
         assertNull(storage.getJson("${FlowController.GRAPH_PREFIX}$tabId"))
         assertNull(storage.getJson("$RUN_STATE_PREFIX$tabId"))
+        assertNull(storage.getJson("${FlowController.RUN_PREFIX}run-delete-me"))
         assertFalse(tabId in fc.listFlows())
         assertNull(FlowPersistenceCoordinator.latestName(tabId))
         assertNull(FlowPersistenceCoordinator.latestGraphUpdate(tabId))

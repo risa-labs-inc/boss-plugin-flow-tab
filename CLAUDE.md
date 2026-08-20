@@ -247,6 +247,13 @@ with `includeOutput: true` to fetch that node's recursively bounded output; expl
 report whether output was omitted or included and whether any content was truncated. Oversized log
 lists retain both their beginning and tail around an omission marker so a terminal Agent stop or
 failure line is not discarded.
+`flow_runs {tabId, limit}` lists that flow's newest runs without requiring a remembered run id.
+Both controller/MCP runs and canvas runs publish the same persisted `run:<runId>` record, including
+start time, terminal/running state, and node count. The newest record is replayed into an open canvas
+through `FlowPersistenceCoordinator`, and the toolbar History dialog can load any retained run back
+into node overlays. Retention is capped at the newest 20 terminal runs per flow; deleting a flow also
+deletes its run records. Legacy `runstate:<tabId>` remains readable for compatibility but is no longer
+the only canvas-visible history channel.
 The launcher/controller and an open tab are independent full-snapshot writers for the same graph
 key. Controller/MCP mutations and open-tab autosave therefore serialize through
 `FlowPersistenceCoordinator`. Controller writes publish revisioned snapshots that an open canvas

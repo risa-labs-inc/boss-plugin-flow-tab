@@ -161,7 +161,7 @@ class FlowMcpToolProviderTest {
             setOf(
                 "flow_create", "flow_rename", "flow_add_node", "flow_update_node",
                 "flow_connect", "flow_delete_node", "flow_delete_edge", "flow_run", "flow_stop",
-                "flow_status", "flow_result", "flow_list", "flow_get", "flow_delete",
+                "flow_status", "flow_result", "flow_runs", "flow_list", "flow_get", "flow_delete",
                 "prompt_upsert", "prompt_get", "prompt_list",
             ),
             names.toSet(),
@@ -306,6 +306,46 @@ class FlowMcpToolProviderTest {
         val result = obj(call(p, "flow_result", """{"runId":"$runId"}"""))
         assertTrue(result.getValue("nodes").jsonObject.containsKey(set))
         assertEquals("false", result.getValue("outputIncluded").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `flow_runs lists only the requested flow newest first with bounded summaries`() = runBlocking {
+        val p = provider()
+        val tabId = obj(call(p, "flow_create", """{"name":"History"}"""))
+            .getValue("tabId").jsonPrimitive.content
+        val otherTabId = obj(call(p, "flow_create", """{"name":"Other"}"""))
+            .getValue("tabId").jsonPrimitive.content
+        call(p, "flow_add_node", """{"tabId":"$tabId","kind":"TRIGGER"}""")
+
+        suspend fun runAndWait(flowId: String): String {
+            val runId = obj(call(p, "flow_run", """{"tabId":"$flowId"}"""))
+                .getValue("runId").jsonPrimitive.content
+            withTimeout(5_000) {
+                while (obj(call(p, "flow_status", """{"runId":"$runId"}"""))
+                        .getValue("state").jsonPrimitive.content == "RUNNING") {
+                    delay(10)
+                }
+            }
+            return runId
+        }
+
+        val first = runAndWait(tabId)
+        delay(2)
+        val second = runAndWait(tabId)
+        runAndWait(otherTabId)
+
+        val runs = obj(call(p, "flow_runs", """{"tabId":"$tabId","limit":1}"""))
+            .getValue("runs").jsonArray
+        assertEquals(1, runs.size)
+        val latest = runs.single().jsonObject
+        assertEquals(second, latest.getValue("runId").jsonPrimitive.content)
+        assertEquals("SUCCEEDED", latest.getValue("state").jsonPrimitive.content)
+        assertTrue(latest.getValue("startedAtMs").jsonPrimitive.content.toLong() > 0L)
+        assertEquals("1", latest.getValue("nodeCount").jsonPrimitive.content)
+        assertTrue(first != second)
+
+        assertTrue(call(p, "flow_runs", """{"tabId":"$tabId","limit":0}""").isError)
+        assertTrue(call(p, "flow_runs", """{"tabId":"missing"}""").isError)
     }
 
     @Test

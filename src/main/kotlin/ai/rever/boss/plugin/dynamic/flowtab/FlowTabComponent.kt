@@ -10,6 +10,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -40,6 +42,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.FitScreen
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.SaveAlt
@@ -92,6 +95,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.coroutineContext
 import kotlin.math.roundToInt
 
@@ -104,6 +108,21 @@ private val ConfirmBg = Color(0xFF3A2E12)
 private val NoticeBg = Color(0xFF26456E)
 private val RunGreen = Color(0xFF2E7D32)
 private const val WAITING_FOR_PREVIOUS_NOTICE = "Waiting for the previous run to stop…"
+
+private fun FlowGraphState.applyRunJob(job: RunJob) {
+    clearRun()
+    runStates.putAll(RunSnapshot(job.nodes).toRuns())
+    isRunning = job.state == RunJobState.RUNNING
+    runError = job.error
+}
+
+private fun formatRunStarted(startedAtMs: Long): String {
+    if (startedAtMs <= 0L) return "Start time unavailable"
+    val formatter = java.time.format.DateTimeFormatter.ofPattern("MMM d, h:mm:ss a")
+    return java.time.Instant.ofEpochMilli(startedAtMs)
+        .atZone(java.time.ZoneId.systemDefault())
+        .format(formatter)
+}
 
 /**
  * Flow tab component: a node-based canvas where nodes are spawned from the left
@@ -157,6 +176,7 @@ class FlowTabComponent(
     private var initialized by mutableStateOf(false)
     private var persistenceSyncRevision by mutableStateOf(0L)
     private var appliedGraphRevision by mutableStateOf(0L)
+    private var displayedRunRevision by mutableStateOf(0L)
     private val liveCanvas = object : LiveFlowCanvas {
         override val isInitialized: Boolean get() = initialized
         override val appliedGraphRevision: Long get() = this@FlowTabComponent.appliedGraphRevision
@@ -168,6 +188,8 @@ class FlowTabComponent(
     // The visible browser tab this flow opened; closed at the start of the next run
     // so each Run opens a fresh tab (no stale reuse, no stacked splits).
     private val visibleTabId = AtomicReference<String?>(null)
+    private val currentCanvasHistoryRunId = AtomicReference<String?>(null)
+    private val suppressedCanvasRunIds = ConcurrentHashMap.newKeySet<String>()
 
     init {
         FlowPersistenceCoordinator.registerLiveCanvas(config.id, liveCanvas)
@@ -236,6 +258,11 @@ class FlowTabComponent(
                         state.runStates.putAll(json.decodeFromString(RunSnapshot.serializer(), rs).toRuns())
                     }
                 }
+                // Prefer the newest durable controller/canvas run over the legacy
+                // one-slot runstate key. This makes an MCP run visible after reopening.
+                runCatching { controller.listRuns(config.id, 1).firstOrNull() }.getOrNull()?.let { summary ->
+                    controller.runSnapshot(summary.runId)?.let(state::applyRunJob)
+                }
                 // A launcher/sidebar rename may have completed while this graph was
                 // loading. The replayed name wins over the older stored snapshot.
                 FlowPersistenceCoordinator.latestName(config.id)?.let { name ->
@@ -258,6 +285,23 @@ class FlowTabComponent(
                     // installed this name before the controller published it. That save
                     // acknowledges convergence and releases the temporary rename guard.
                     persistenceSyncRevision++
+                }
+            }
+        }
+
+        // Headless MCP and other canvas instances publish through the same live channel.
+        // StateFlow replay means a tab opened mid-run immediately catches up.
+        LaunchedEffect(config.id) {
+            while (!initialized) delay(20)
+            FlowPersistenceCoordinator.runUpdates.collect { updates ->
+                updates[config.id]?.let { update ->
+                    if (update.revision > displayedRunRevision &&
+                        update.job.runId !in suppressedCanvasRunIds
+                    ) {
+                        displayedRunRevision = update.revision
+                        state.applyRunJob(update.job)
+                        Snapshot.sendApplyNotifications()
+                    }
                 }
             }
         }
@@ -334,8 +378,12 @@ class FlowTabComponent(
             }
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
+            val historyRunId = "run-${java.util.UUID.randomUUID()}"
+            val historyStartedAtMs = System.currentTimeMillis()
+            currentCanvasHistoryRunId.set(historyRunId)
             val job = runJobs.launch(Dispatchers.Default) {
                 val admitted = AtomicBoolean(false)
+                var runFailure: String? = null
                 try {
                     // Do not erase the preceding run's results or close its browser tab
                     // until the fence actually admits this run. A wedged predecessor
@@ -360,6 +408,15 @@ class FlowTabComponent(
                         Snapshot.sendApplyNotifications()
                     }
                     if (!admissionAccepted) return@launch
+                    controller.publishCanvasRun(
+                        RunJob(
+                            runId = historyRunId,
+                            tabId = config.id,
+                            state = RunJobState.RUNNING,
+                            startedAtMs = historyStartedAtMs,
+                            nodeCount = plan.size,
+                        )
+                    )
                     // Catches Stop arriving while withContext resumes from Main back
                     // onto Default, after the destructive admission reset already ran.
                     coroutineContext.ensureActive()
@@ -403,18 +460,43 @@ class FlowTabComponent(
                         // A check/write can straddle Clear, but orphaned ids do not render
                         // and the separately gated finalizer cannot persist them.
                         if (runStatePersistence.isCurrent(runToken)) state.runStates[id] = run
+                        controller.publishCanvasRun(
+                            RunJob(
+                                runId = historyRunId,
+                                tabId = config.id,
+                                state = RunJobState.RUNNING,
+                                startedAtMs = historyStartedAtMs,
+                                nodeCount = plan.size,
+                                nodes = state.runStates.toRunSnapshot().states,
+                            )
+                        )
                     }
                 } catch (ce: CancellationException) {
                     // stopped by user
+                    runFailure = "Flow run stopped from canvas"
                 } catch (e: Exception) {
+                    runFailure = e.message ?: e.toString()
                     if (runStatePersistence.isCurrent(runToken)) {
-                        state.runError = e.message ?: e.toString()
+                        state.runError = runFailure
                     }
                 } finally {
                     if (admitted.get()) {
                         // Give ordinary Stop immediate feedback. invokeOnCompletion below
                         // remains the fallback for a queued job cancelled before this block.
                         if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
+                        val firstNodeError = state.runStates.values.firstOrNull { it.status == RunStatus.ERROR }?.error
+                        val terminalError = runFailure ?: firstNodeError
+                        controller.publishCanvasRun(
+                            RunJob(
+                                runId = historyRunId,
+                                tabId = config.id,
+                                state = if (terminalError == null) RunJobState.SUCCEEDED else RunJobState.FAILED,
+                                startedAtMs = historyStartedAtMs,
+                                nodeCount = plan.size,
+                                error = terminalError,
+                                nodes = state.runStates.toRunSnapshot().states,
+                            )
+                        )
                         // Persist the run results (capped) so they survive reopening.
                         try {
                             val persisted = persistRunStateOnIo(runStatePersistence, runToken) {
@@ -433,10 +515,12 @@ class FlowTabComponent(
                             // Run-state persistence is best-effort, as before.
                         }
                     }
+                    currentCanvasHistoryRunId.compareAndSet(historyRunId, null)
                 }
             }
             // This also runs when a queued job is cancelled before its block starts.
             job.invokeOnCompletion { cause ->
+                currentCanvasHistoryRunId.compareAndSet(historyRunId, null)
                 if (runStatePersistence.isCurrent(runToken)) {
                     state.isRunning = false
                     state.notice = when {
@@ -496,6 +580,7 @@ class FlowTabComponent(
             // Invalidate before cancelling or mutating state so late executor callbacks
             // and the run finalizer cannot repopulate the cleared snapshot.
             val invalidation = runStatePersistence.invalidateRun()
+            currentCanvasHistoryRunId.get()?.let(suppressedCanvasRunIds::add)
             runJobs.cancelAll()
             state.isRunning = false
             state.notice = null
@@ -601,6 +686,9 @@ class FlowTabComponent(
         var confirmClear by remember { mutableStateOf(false) }
         var showGallery by remember { mutableStateOf(false) }
         var showMcpConfig by remember { mutableStateOf(false) }
+        var showRunHistory by remember { mutableStateOf(false) }
+        var runHistory by remember { mutableStateOf<List<RunSummary>>(emptyList()) }
+        var runHistoryLoading by remember { mutableStateOf(false) }
         var showRename by remember { mutableStateOf(false) }
         var renameInProgress by remember { mutableStateOf(false) }
         val renameEnabled = initialized && !renameInProgress
@@ -629,6 +717,18 @@ class FlowTabComponent(
                 onTemplates = { showGallery = true },
                 externalMcpAvailable = externalMcp != null,
                 onExternalMcp = { showMcpConfig = true },
+                onHistory = {
+                    if (state.isRunning) {
+                        state.notice = "Stop the current run before loading run history"
+                    } else {
+                        showRunHistory = true
+                        runHistoryLoading = true
+                        uiScope.launch {
+                            runHistory = runCatching { controller.listRuns(config.id) }.getOrDefault(emptyList())
+                            runHistoryLoading = false
+                        }
+                    }
+                },
                 onZoomIn = { state.zoomBy(1.2f, viewCenterScreen()) },
                 onZoomOut = { state.zoomBy(1f / 1.2f, viewCenterScreen()) },
                 tidyEnabled = state.nodes.size > 1,
@@ -815,6 +915,56 @@ class FlowTabComponent(
                     },
                 )
             }
+
+            if (showRunHistory) {
+                AlertDialog(
+                    onDismissRequest = { showRunHistory = false },
+                    title = { Text("Run history") },
+                    text = {
+                        Column(
+                            Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 420.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            when {
+                                runHistoryLoading -> Text("Loading…")
+                                runHistory.isEmpty() -> Text("No runs yet")
+                                else -> runHistory.forEach { summary ->
+                                    Row(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .clickable {
+                                                uiScope.launch {
+                                                    controller.runSnapshot(summary.runId)?.let { job ->
+                                                        state.applyRunJob(job)
+                                                        state.notice = "Loaded run ${summary.runId}"
+                                                    }
+                                                    showRunHistory = false
+                                                }
+                                            }
+                                            .padding(vertical = 8.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Column(Modifier.weight(1f)) {
+                                            Text(summary.runId, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                            Text(
+                                                formatRunStarted(summary.startedAtMs),
+                                                color = FlowTheme.TextMuted,
+                                                fontSize = 11.sp,
+                                            )
+                                        }
+                                        Text("${summary.state} · ${summary.nodeCount} nodes", fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = {
+                        TextButton(onClick = { showRunHistory = false }) { Text("Close") }
+                    },
+                )
+            }
         }
     }
 }
@@ -836,6 +986,7 @@ private fun Toolbar(
     onTemplates: () -> Unit,
     externalMcpAvailable: Boolean,
     onExternalMcp: () -> Unit,
+    onHistory: () -> Unit,
     onZoomIn: () -> Unit,
     onZoomOut: () -> Unit,
     tidyEnabled: Boolean,
@@ -874,6 +1025,7 @@ private fun Toolbar(
             modifier = Modifier.weight(1f, fill = false),
         )
         ToolbarButton(Icons.Filled.Edit, "Rename flow", onRename, enabled = renameEnabled)
+        ToolbarButton(Icons.Filled.History, "Run history", onHistory)
 
         Spacer(Modifier.width(4.dp))
         // Run / Stop

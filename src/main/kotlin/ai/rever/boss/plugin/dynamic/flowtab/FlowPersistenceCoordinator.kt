@@ -16,6 +16,12 @@ internal data class ExternalGraphUpdate(
     val snapshot: GraphSnapshot,
 )
 
+/** Newest controller/canvas run snapshot for a flow, consumed by every open canvas. */
+internal data class ExternalRunUpdate(
+    val revision: Long,
+    val job: RunJob,
+)
+
 /** Main-thread view of an open component's graph, including edits not yet autosaved. */
 internal interface LiveFlowCanvas {
     val isInitialized: Boolean
@@ -36,6 +42,7 @@ internal object FlowPersistenceCoordinator {
     private val revisionCounter = AtomicLong()
     private val mutableNames = MutableStateFlow<Map<String, String>>(emptyMap())
     private val mutableGraphUpdates = MutableStateFlow<Map<String, ExternalGraphUpdate>>(emptyMap())
+    private val mutableRunUpdates = MutableStateFlow<Map<String, ExternalRunUpdate>>(emptyMap())
     private val liveCanvases = ConcurrentHashMap<String, MutableSet<LiveFlowCanvas>>()
 
     /** Latest successful rename per tab, used by toolbar/sidebar title synchronization. */
@@ -43,6 +50,9 @@ internal object FlowPersistenceCoordinator {
 
     /** Latest controller-authored snapshot per tab, replayed to an open or newly opened canvas. */
     val graphUpdates = mutableGraphUpdates.asStateFlow()
+
+    /** Latest run snapshot per flow, including headless MCP runs. */
+    val runUpdates = mutableRunUpdates.asStateFlow()
 
     suspend fun <T> withFlowLock(tabId: String, block: suspend () -> T): T =
         locks.computeIfAbsent(tabId) { Mutex() }.withLock { block() }
@@ -119,9 +129,27 @@ internal object FlowPersistenceCoordinator {
 
     fun latestGraphUpdate(tabId: String): ExternalGraphUpdate? = mutableGraphUpdates.value[tabId]
 
+    fun publishRunUpdate(job: RunJob): ExternalRunUpdate {
+        val update = ExternalRunUpdate(revisionCounter.incrementAndGet(), job)
+        mutableRunUpdates.update { current ->
+            val previous = current[job.tabId]
+            if (previous == null || previous.job.runId == job.runId ||
+                job.startedAtMs >= previous.job.startedAtMs
+            ) {
+                current + (job.tabId to update)
+            } else {
+                current
+            }
+        }
+        return update
+    }
+
+    fun latestRunUpdate(tabId: String): ExternalRunUpdate? = mutableRunUpdates.value[tabId]
+
     fun forget(tabId: String) {
         forgetName(tabId)
         mutableGraphUpdates.update { current -> current - tabId }
+        mutableRunUpdates.update { current -> current - tabId }
         // Keep the mutex entry for the plugin lifetime. Removing a held mutex could
         // let an already-waiting writer and a new writer acquire different locks.
     }
