@@ -16,6 +16,12 @@ internal data class ExternalGraphUpdate(
     val snapshot: GraphSnapshot,
 )
 
+/** Newest controller/canvas run snapshot for a flow, consumed by every open canvas. */
+internal data class ExternalRunUpdate(
+    val revision: Long,
+    val job: RunJob,
+)
+
 /** Main-thread view of an open component's graph, including edits not yet autosaved. */
 internal interface LiveFlowCanvas {
     val isInitialized: Boolean
@@ -34,8 +40,11 @@ internal interface LiveFlowCanvas {
 internal object FlowPersistenceCoordinator {
     private val locks = ConcurrentHashMap<String, Mutex>()
     private val revisionCounter = AtomicLong()
+    private val runStartedCounter = AtomicLong()
     private val mutableNames = MutableStateFlow<Map<String, String>>(emptyMap())
     private val mutableGraphUpdates = MutableStateFlow<Map<String, ExternalGraphUpdate>>(emptyMap())
+    private val mutableRunUpdates = MutableStateFlow<Map<String, ExternalRunUpdate>>(emptyMap())
+    private val runUpdatesById = ConcurrentHashMap<String, ExternalRunUpdate>()
     private val liveCanvases = ConcurrentHashMap<String, MutableSet<LiveFlowCanvas>>()
 
     /** Latest successful rename per tab, used by toolbar/sidebar title synchronization. */
@@ -43,6 +52,9 @@ internal object FlowPersistenceCoordinator {
 
     /** Latest controller-authored snapshot per tab, replayed to an open or newly opened canvas. */
     val graphUpdates = mutableGraphUpdates.asStateFlow()
+
+    /** Latest run snapshot per flow, including headless MCP runs. */
+    val runUpdates = mutableRunUpdates.asStateFlow()
 
     suspend fun <T> withFlowLock(tabId: String, block: suspend () -> T): T =
         locks.computeIfAbsent(tabId) { Mutex() }.withLock { block() }
@@ -119,9 +131,65 @@ internal object FlowPersistenceCoordinator {
 
     fun latestGraphUpdate(tabId: String): ExternalGraphUpdate? = mutableGraphUpdates.value[tabId]
 
+    fun publishRunUpdate(job: RunJob): ExternalRunUpdate {
+        // This singleton is only a live-status bus, not the durable result store. In
+        // particular, retaining node output here pins arbitrary JSON for the plugin
+        // lifetime and duplicates the full job already held by its controller/storage.
+        val liveJob = job.copy(
+            error = job.error?.take(MAX_LIVE_MESSAGE_LENGTH),
+            nodes = job.nodes.mapValues { (_, node) ->
+                node.copy(
+                    error = node.error?.take(MAX_LIVE_MESSAGE_LENGTH),
+                    logs = node.logs.takeLast(MAX_LIVE_LOG_LINES).map { it.take(MAX_LIVE_MESSAGE_LENGTH) },
+                    output = emptyList(),
+                    skipReason = node.skipReason?.take(MAX_LIVE_MESSAGE_LENGTH),
+                )
+            },
+            contentComplete = false,
+        )
+        val update = ExternalRunUpdate(revisionCounter.incrementAndGet(), liveJob)
+        val effective = runUpdatesById.compute(job.runId) { _, previous ->
+            if (previous?.job?.isTerminal == true) previous else update
+        } ?: update
+        mutableRunUpdates.update { current ->
+            val previous = current[effective.job.tabId]
+            if (previous == null || previous.job.runId == effective.job.runId ||
+                effective.job.startedAtMs >= previous.job.startedAtMs
+            ) {
+                current + (effective.job.tabId to effective)
+            } else {
+                current
+            }
+        }
+        return effective
+    }
+
+    fun latestRunUpdate(tabId: String): ExternalRunUpdate? = mutableRunUpdates.value[tabId]
+
+    /** Exact in-process run snapshot, allowing separate controller instances to share liveness. */
+    fun runUpdate(runId: String): ExternalRunUpdate? = runUpdatesById[runId]
+
+    fun nextRunStartedAtMs(nowMillis: Long): Long = runStartedCounter.updateAndGet { previous ->
+        maxOf(nowMillis, previous + 1L)
+    }
+
+    fun isRunLive(runId: String): Boolean = runUpdatesById[runId]?.job?.state == RunJobState.RUNNING
+
+    fun forgetRun(runId: String, tabId: String? = null) {
+        val removedTabId = tabId ?: runUpdatesById[runId]?.job?.tabId
+        runUpdatesById.remove(runId)
+        if (tabId != null && removedTabId != null) {
+            mutableRunUpdates.update { current ->
+                if (current[removedTabId]?.job?.runId == runId) current - removedTabId else current
+            }
+        }
+    }
+
     fun forget(tabId: String) {
         forgetName(tabId)
         mutableGraphUpdates.update { current -> current - tabId }
+        mutableRunUpdates.update { current -> current - tabId }
+        runUpdatesById.entries.removeIf { it.value.job.tabId == tabId }
         // Keep the mutex entry for the plugin lifetime. Removing a held mutex could
         // let an already-waiting writer and a new writer acquire different locks.
     }
@@ -135,6 +203,9 @@ internal object FlowPersistenceCoordinator {
             if (current[tabId]?.revision == revision) current - tabId else current
         }
     }
+
+    private const val MAX_LIVE_LOG_LINES = 50
+    private const val MAX_LIVE_MESSAGE_LENGTH = 4_096
 }
 
 /** Apply a newer controller snapshot to live canvas state and return its acknowledged revision. */

@@ -41,6 +41,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
@@ -82,6 +83,260 @@ class FlowControllerTest {
         runTimeoutMs: Long = FlowController.DEFAULT_RUN_TIMEOUT_MS,
         tabUpdates: TabUpdateProviderFactory? = null,
     ) = FlowController(context(storage, tabUpdates), { scope }, registry, runTimeoutMs)
+
+    @Test
+    fun `canvas run history publishes live and retains only the newest twenty per flow`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        try {
+            repeat(25) { index ->
+                fc.publishCanvasRun(
+                    RunJob(
+                        runId = "run-history-$tabId-${index + 1}",
+                        tabId = tabId,
+                        state = RunJobState.SUCCEEDED,
+                        startedAtMs = (index + 1).toLong(),
+                        nodeCount = 3,
+                    )
+                )
+            }
+
+            withTimeout(5_000) {
+                val expected = (6..25).mapTo(mutableSetOf()) {
+                    "json:${FlowController.RUN_PREFIX}run-history-$tabId-$it"
+                }
+                while (storage.map.keys.filterTo(mutableSetOf()) {
+                        it.startsWith("json:${FlowController.RUN_PREFIX}")
+                    } != expected) {
+                    delay(10)
+                }
+            }
+            val history = fc.listRuns(tabId)
+            assertEquals(20, history.size)
+            assertEquals("run-history-$tabId-25", history.first().runId)
+            assertEquals("run-history-$tabId-6", history.last().runId)
+            assertEquals(3, history.first().nodeCount)
+            assertEquals(
+                "run-history-$tabId-25",
+                FlowPersistenceCoordinator.latestRunUpdate(tabId)?.job?.runId,
+            )
+        } finally {
+            fc.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
+    @Test
+    fun `terminal history eviction scans storage once`() = runBlocking {
+        val storage = object : DesktopStorage() {
+            val scans = AtomicInteger()
+            override suspend fun getAllKeys(): Set<String> {
+                scans.incrementAndGet()
+                return super.getAllKeys()
+            }
+        }
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        storage.scans.set(0)
+        try {
+            fc.publishCanvasRun(
+                RunJob(
+                    runId = "run-single-scan-${java.util.UUID.randomUUID()}",
+                    tabId = tabId,
+                    state = RunJobState.SUCCEEDED,
+                    startedAtMs = 1L,
+                )
+            )
+            withTimeout(5_000) {
+                while (storage.scans.get() == 0) delay(10)
+            }
+
+            assertEquals(1, storage.scans.get())
+        } finally {
+            fc.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
+    @Test
+    fun `a second controller observes a live canvas run without orphaning it`() = runBlocking {
+        val storage = DesktopStorage()
+        val owner = controller(storage)
+        val observer = controller(storage)
+        val tabId = owner.createFlow()
+        val running = RunJob(
+            runId = "run-cross-controller-${java.util.UUID.randomUUID()}",
+            tabId = tabId,
+            state = RunJobState.RUNNING,
+            startedAtMs = 10L,
+            nodeCount = 1,
+        )
+        try {
+            owner.publishCanvasRun(running)
+            assertEquals(RunJobState.RUNNING, observer.runStatus(running.runId)?.state)
+
+            owner.publishCanvasRun(running.copy(state = RunJobState.SUCCEEDED))
+            withTimeout(5_000) {
+                while (observer.runStatus(running.runId)?.state != RunJobState.SUCCEEDED) delay(10)
+            }
+        } finally {
+            owner.dispose()
+            observer.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
+    @Test
+    fun `live coordinator drops outputs while owner status keeps the full result`() = runBlocking {
+        val fc = controller()
+        val tabId = "flow-live-lightweight-${java.util.UUID.randomUUID()}"
+        val runId = "run-live-lightweight-${java.util.UUID.randomUUID()}"
+        val output = buildJsonObject { put("payload", "full-result") }
+        val job = RunJob(
+            runId = runId,
+            tabId = tabId,
+            state = RunJobState.RUNNING,
+            startedAtMs = 1L,
+            nodes = mapOf(
+                "node" to NodeRunSnap(status = RunStatus.SUCCESS, output = listOf(output)),
+            ),
+        )
+        try {
+            fc.publishCanvasRun(job, persist = false)
+
+            assertTrue(FlowPersistenceCoordinator.runUpdate(runId)!!.job.nodes["node"]!!.output.isEmpty())
+            assertEquals(listOf(output), fc.runStatus(runId)!!.nodes["node"]!!.output)
+        } finally {
+            fc.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
+    @Test
+    fun `stored running history is repaired after its in-process owner disappears`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        val runId = "run-stale-history-${java.util.UUID.randomUUID()}"
+        storage.putJson(
+            "${FlowController.RUN_PREFIX}$runId",
+            kotlinx.serialization.json.Json.encodeToString(
+                RunJob.serializer(),
+                RunJob(runId, tabId, RunJobState.RUNNING, startedAtMs = 1L),
+            ),
+        )
+        FlowPersistenceCoordinator.forgetRun(runId)
+
+        try {
+            val summary = fc.listRuns(tabId).single()
+            assertEquals(RunJobState.FAILED, summary.state)
+            assertEquals(RunJobState.FAILED, fc.runSnapshot(runId)?.state)
+        } finally {
+            fc.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
+    @Test
+    fun `older run updates cannot replace the newest live flow update`() {
+        val tabId = "flow-run-order-${java.util.UUID.randomUUID()}"
+        val newer = RunJob("run-new", tabId, RunJobState.RUNNING, startedAtMs = 2L)
+        val older = RunJob("run-old", tabId, RunJobState.SUCCEEDED, startedAtMs = 1L)
+
+        FlowPersistenceCoordinator.publishRunUpdate(newer)
+        FlowPersistenceCoordinator.publishRunUpdate(older)
+
+        assertEquals("run-new", FlowPersistenceCoordinator.latestRunUpdate(tabId)?.job?.runId)
+        FlowPersistenceCoordinator.forget(tabId)
+    }
+
+    @Test
+    fun `late running update cannot overwrite the same run terminal state`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        val running = RunJob(
+            "run-terminal-guard-${java.util.UUID.randomUUID()}",
+            tabId,
+            RunJobState.RUNNING,
+            startedAtMs = 10L,
+        )
+        val terminal = running.copy(state = RunJobState.SUCCEEDED)
+
+        FlowPersistenceCoordinator.publishRunUpdate(running)
+        FlowPersistenceCoordinator.publishRunUpdate(terminal)
+        FlowPersistenceCoordinator.publishRunUpdate(running.copy(nodeCount = 99))
+
+        assertEquals(RunJobState.SUCCEEDED, fc.runStatus(running.runId)?.state)
+        assertEquals(RunJobState.SUCCEEDED, FlowPersistenceCoordinator.latestRunUpdate(tabId)?.job?.state)
+        FlowPersistenceCoordinator.forget(tabId)
+    }
+
+    @Test
+    fun `controller disposal forgets its static run snapshots`() {
+        val fc = controller()
+        val tabId = "flow-dispose-history-${java.util.UUID.randomUUID()}"
+        val job = RunJob(
+            runId = "run-dispose-history-${java.util.UUID.randomUUID()}",
+            tabId = tabId,
+            state = RunJobState.SUCCEEDED,
+            startedAtMs = 1L,
+        )
+        fc.publishCanvasRun(job, persist = false)
+        assertNotNull(FlowPersistenceCoordinator.runUpdate(job.runId))
+
+        fc.dispose()
+
+        assertNull(FlowPersistenceCoordinator.runUpdate(job.runId))
+        FlowPersistenceCoordinator.forget(tabId)
+    }
+
+    @Test
+    fun `controller disposal publishes terminal before rejecting late canvas updates`() {
+        val fc = controller()
+        val tabId = "flow-dispose-running-${java.util.UUID.randomUUID()}"
+        val running = RunJob(
+            runId = "run-dispose-running-${java.util.UUID.randomUUID()}",
+            tabId = tabId,
+            state = RunJobState.RUNNING,
+            startedAtMs = 1L,
+        )
+        fc.publishCanvasRun(running, persist = false)
+
+        fc.dispose()
+        fc.publishCanvasRun(running, persist = false)
+
+        assertEquals(RunJobState.FAILED, FlowPersistenceCoordinator.latestRunUpdate(tabId)?.job?.state)
+        assertNull(FlowPersistenceCoordinator.runUpdate(running.runId))
+        FlowPersistenceCoordinator.forget(tabId)
+    }
+
+    @Test
+    fun `missing graph persistence withdraws a mirrored running canvas update`() = runBlocking {
+        val fc = controller(DesktopStorage())
+        val tabId = "flow-missing-graph-${java.util.UUID.randomUUID()}"
+        val running = RunJob(
+            runId = "run-missing-graph-${java.util.UUID.randomUUID()}",
+            tabId = tabId,
+            state = RunJobState.RUNNING,
+            startedAtMs = 1L,
+        )
+        try {
+            fc.publishCanvasRun(running)
+            withTimeout(5_000) {
+                while (FlowPersistenceCoordinator.latestRunUpdate(tabId) != null) delay(10)
+            }
+
+            fc.publishCanvasRun(running.copy(state = RunJobState.SUCCEEDED))
+            delay(100)
+            assertNull(FlowPersistenceCoordinator.latestRunUpdate(tabId))
+            assertNull(FlowPersistenceCoordinator.runUpdate(running.runId))
+        } finally {
+            fc.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
 
     private fun hangingRegistry(
         kind: String,
@@ -680,17 +935,25 @@ class FlowControllerTest {
     }
 
     @Test
-    fun `deleteFlow removes graph and persisted UI run state`() = runBlocking {
+    fun `deleteFlow removes graph persisted UI state and run history`() = runBlocking {
         val storage = DesktopStorage()
         val fc = controller(storage)
         val tabId = fc.createFlow(FlowMeta(name = "Disposable"))
         storage.putJson("$RUN_STATE_PREFIX$tabId", "{}")
+        storage.putJson(
+            "${FlowController.RUN_PREFIX}run-delete-me",
+            kotlinx.serialization.json.Json.encodeToString(
+                RunJob.serializer(),
+                RunJob("run-delete-me", tabId, RunJobState.SUCCEEDED, startedAtMs = 1L),
+            ),
+        )
         FlowPersistenceCoordinator.publishRename(tabId, "Disposable renamed")
 
         assertTrue(fc.deleteFlow(tabId))
 
         assertNull(storage.getJson("${FlowController.GRAPH_PREFIX}$tabId"))
         assertNull(storage.getJson("$RUN_STATE_PREFIX$tabId"))
+        assertNull(storage.getJson("${FlowController.RUN_PREFIX}run-delete-me"))
         assertFalse(tabId in fc.listFlows())
         assertNull(FlowPersistenceCoordinator.latestName(tabId))
         assertNull(FlowPersistenceCoordinator.latestGraphUpdate(tabId))
@@ -704,6 +967,51 @@ class FlowControllerTest {
 
         assertTrue(fc.deleteFlow("flow-corrupt"))
         assertFalse(fc.deleteFlow("flow-missing"))
+    }
+
+    @Test
+    fun `deleteFlow suppresses a terminal persist queued after deletion`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val nodeFinished = CompletableDeferred<Unit>()
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "DELETE_RACE",
+                    label = "Delete race",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, _, _ ->
+                        entered.complete(Unit)
+                        withContext(NonCancellable) { release.await() }
+                        nodeFinished.complete(Unit)
+                        NodeOutput.EMPTY
+                    },
+                )
+            )
+        }
+        val storage = DesktopStorage()
+        val fc = controller(storage, registry, runTimeoutMs = 5_000)
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "DELETE_RACE")
+        val runId = fc.startRun(tabId)
+        try {
+            withTimeout(5_000) { entered.await() }
+            assertTrue(fc.deleteFlow(tabId))
+            release.complete(Unit)
+            withTimeout(5_000) { nodeFinished.await() }
+            delay(100)
+
+            assertNull(storage.getJson("${FlowController.RUN_PREFIX}$runId"))
+            assertNull(FlowPersistenceCoordinator.runUpdate(runId))
+        } finally {
+            release.complete(Unit)
+            fc.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
     }
 
     // ---- async run job ------------------------------------------------------

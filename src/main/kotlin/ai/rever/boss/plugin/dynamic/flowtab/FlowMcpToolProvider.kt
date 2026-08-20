@@ -157,7 +157,8 @@ class FlowMcpToolProvider(
             })
         },
         def("flow_result", "Get a run's per-node status, errors, and bounded logs. " +
-            "Set includeOutput=true with nodeId to include that node's bounded output.",
+            "Set includeOutput=true with nodeId to include that node's bounded output. " +
+            "contentComplete=false means the live snapshot was scrubbed; outputOmitted/truncated will be true.",
             schema(
                 """{"runId":{"type":"string"},"nodeId":{"type":"string"},"includeOutput":{"type":"boolean"}}""",
                 required = listOf("runId"),
@@ -174,6 +175,24 @@ class FlowMcpToolProvider(
                 return@def err("Unknown nodeId '$nodeId' for run '$runId'")
             }
             McpToolResult(json.encodeToString(JsonObject.serializer(), job.toMcpResult(includeOutput, nodeId)), false)
+        },
+        def("flow_runs", "List recent runs for a flow, newest first. Returns runId, state, " +
+            "startedAtMs, and nodeCount.",
+            schema(
+                """{"tabId":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":${FlowController.MAX_RUN_HISTORY_LIMIT}}}""",
+                required = listOf("tabId"),
+            ), readOnly = true) { a ->
+            val args = a.obj()
+            val tabId = args.str("tabId") ?: return@def err("flow_runs requires 'tabId'")
+            if (controller.getFlow(tabId) == null) return@def err("No flow '$tabId'")
+            val limit = args["limit"]?.jsonPrimitive?.int ?: FlowController.DEFAULT_RUN_HISTORY_LIMIT
+            val runs = controller.listRuns(tabId, limit)
+            ok(buildJsonObject {
+                put(
+                    "runs",
+                    json.encodeToJsonElement(ListSerializer(RunSummary.serializer()), runs),
+                )
+            })
         },
         def("flow_list", "List every stored flow's tabId. Pass detail=true to also return " +
             "flowDetails with names, descriptions, node counts, and readability.",
@@ -282,9 +301,10 @@ class FlowMcpToolProvider(
     }
 
     private fun RunJob.toMcpResult(includeOutput: Boolean, nodeId: String?): JsonObject {
-        var contentTruncated = false
+        var contentTruncated = !contentComplete
         val selectedNodes = if (nodeId == null) nodes else mapOf(nodeId to nodes.getValue(nodeId))
-        val outputOmitted = !includeOutput && selectedNodes.values.any { it.output.isNotEmpty() }
+        val outputOmitted = !contentComplete ||
+            (!includeOutput && selectedNodes.values.any { it.output.isNotEmpty() })
         val boundedNodes = selectedNodes.mapValues { (_, node) ->
             val boundedError = node.error?.boundedUtf8(RESULT_ERROR_MAX_BYTES)?.also {
                 contentTruncated = contentTruncated || it.truncated
@@ -324,7 +344,7 @@ class FlowMcpToolProvider(
         ).jsonObject
         return buildJsonObject {
             base.forEach { (key, value) -> put(key, value) }
-            put("outputIncluded", includeOutput)
+            put("outputIncluded", includeOutput && contentComplete)
             put("outputOmitted", outputOmitted)
             put("truncated", contentTruncated)
             nodeId?.let { put("nodeId", it) }

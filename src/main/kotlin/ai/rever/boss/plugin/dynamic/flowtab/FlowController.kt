@@ -34,11 +34,24 @@ data class RunJob(
     val runId: String,
     val tabId: String,
     val state: RunJobState,
+    val startedAtMs: Long = 0L,
+    val nodeCount: Int = 0,
     val error: String? = null,
     val nodes: Map<String, NodeRunSnap> = emptyMap(),
+    /** False only for a scrubbed in-process progress snapshot; durable jobs default to complete. */
+    val contentComplete: Boolean = true,
 ) {
     val isTerminal: Boolean get() = state != RunJobState.RUNNING
 }
+
+/** Bounded run-history record returned by `flow_runs` and rendered by the canvas. */
+@Serializable
+data class RunSummary(
+    val runId: String,
+    val state: RunJobState,
+    val startedAtMs: Long,
+    val nodeCount: Int,
+)
 
 /** Lightweight discovery record used by the launcher and detailed MCP listing. */
 @Serializable
@@ -72,12 +85,14 @@ class FlowController(
     /** Hard ceiling for a headless run. An independent monitor publishes FAILED at
      *  this deadline even when a node is stuck in a non-cooperative host call. */
     private val runTimeoutMs: Long = DEFAULT_RUN_TIMEOUT_MS,
+    private val nowMillis: () -> Long = System::currentTimeMillis,
 ) {
     private val json = Json { ignoreUnknownKeys = true; isLenient = true; encodeDefaults = true }
     private val storage = runCatching {
         context.pluginStorageFactory?.createStorage(STORAGE_NAMESPACE)
     }.getOrNull()
     private val jobs = ConcurrentHashMap<String, RunJob>()
+    private val ownedRunIds = ConcurrentHashMap.newKeySet<String>()
     private val executions = ConcurrentHashMap<String, Job>()
     private val runStates = ConcurrentHashMap<String, ConcurrentHashMap<String, NodeRun>>()
     private val persistMutex = Mutex()
@@ -397,10 +412,25 @@ class FlowController(
         if (store.getJson(graphKey(tabId)) == null) return false
 
         closeOpenFlowTabs(tabId)
+        var deleted = false
         withContext(NonCancellable) {
-            store.removeJsonValue(graphKey(tabId))
-            store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
+            FlowPersistenceCoordinator.withFlowLock(tabId) {
+                persistMutex.withLock {
+                    if (store.getJson(graphKey(tabId)) != null) {
+                        store.removeJsonValue(graphKey(tabId))
+                        store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
+                        storedRuns().filter { it.second.tabId == tabId }.forEach { (runId, _) ->
+                            store.removeJsonValue(runKey(runId))
+                            jobs.remove(runId)
+                            ownedRunIds.remove(runId)
+                            FlowPersistenceCoordinator.forgetRun(runId)
+                        }
+                        deleted = true
+                    }
+                }
+            }
         }
+        if (!deleted) return false
         FlowPersistenceCoordinator.forget(tabId)
         return true
     }
@@ -416,24 +446,29 @@ class FlowController(
      */
     fun startRun(tabId: String, depth: Int = 0, ancestry: Set<String> = emptySet()): String {
         val runId = "run-${UUID.randomUUID()}"
+        val startedAtMs = nextRunStartedAtMs()
         val disposalError = "Flow controller disposed"
         if (synchronized(toolSyncLock) { disposed }) {
             jobs[runId] = RunJob(
                 runId = runId,
                 tabId = tabId,
                 state = RunJobState.FAILED,
+                startedAtMs = startedAtMs,
                 error = disposalError,
             )
             return runId
         }
-        jobs[runId] = RunJob(runId, tabId, RunJobState.RUNNING)
+        jobs[runId] = RunJob(runId, tabId, RunJobState.RUNNING, startedAtMs = startedAtMs)
+        ownedRunIds += runId
         val states = ConcurrentHashMap<String, NodeRun>()
         runStates[runId] = states
         val execution = scopeProvider().launch(Dispatchers.Default) {
             // Persist RUNNING before executing so a reload can still diagnose an in-flight run.
-            persistRun(jobs[runId] ?: RunJob(runId, tabId, RunJobState.RUNNING))
+            persistRun(jobs[runId] ?: RunJob(runId, tabId, RunJobState.RUNNING, startedAtMs = startedAtMs))
             val candidate = try {
                 val snap = getFlow(tabId) ?: throw IllegalStateException("No flow '$tabId'")
+                jobs.computeIfPresent(runId) { _, current -> current.copy(nodeCount = snap.nodes.size) }
+                jobs[runId]?.let { persistRun(it) }
                 val plan = snap.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
                 // This flow is now on the call stack: a nested lanager pointing back at it
                 // is a cycle. Depth is threaded so the nesting bound can be enforced.
@@ -447,22 +482,25 @@ class FlowController(
                     states[id] = r
                     // flow_result must be a non-blocking snapshot even while the
                     // run is active. Do not let late output overwrite a watchdog result.
-                    jobs.computeIfPresent(runId) { _, current ->
+                    val liveJob = jobs.computeIfPresent(runId) { _, current ->
                         if (current.state == RunJobState.RUNNING) {
                             current.copy(nodes = states.toRunSnapshot().states)
                         } else {
                             current
                         }
                     }
+                    liveJob?.let(FlowPersistenceCoordinator::publishRunUpdate)
                     // Serialize storage writes through persistRun so a delayed live
                     // snapshot can never overwrite a terminal watchdog verdict.
-                    lifecycleScope.launch { jobs[runId]?.let { persistRun(it) } }
+                    lifecycleScope.launch { jobs[runId]?.let { persistRun(it, publish = false) } }
                 }
                 val firstError = states.values.firstOrNull { it.status == RunStatus.ERROR }
                 RunJob(
                     runId = runId,
                     tabId = tabId,
                     state = if (firstError != null) RunJobState.FAILED else RunJobState.SUCCEEDED,
+                    startedAtMs = jobs[runId]?.startedAtMs ?: startedAtMs,
+                    nodeCount = snap.nodes.size,
                     error = firstError?.error,
                     nodes = states.toRunSnapshot().states,
                 )
@@ -544,7 +582,33 @@ class FlowController(
         // Keep this outside the one-time lifecycle transition. startRun intentionally
         // retains its historical dispatch contract, so a later dispose call must still
         // cancel any execution installed after an earlier disposal pass.
-        executions.values.forEach { it.cancel(CancellationException("Flow controller disposed")) }
+        val disposalError = "Flow controller disposed"
+        // Publish a terminal snapshot before cancellation/forgetting ownership. A
+        // non-cooperative execution may never reach its finally block, and must not
+        // leave another open canvas showing an eternal external RUNNING state.
+        ownedRunIds.toList().forEach { runId ->
+            val terminal = jobs.computeIfPresent(runId) { _, current ->
+                if (current.state == RunJobState.RUNNING) {
+                    current.copy(
+                        state = RunJobState.FAILED,
+                        error = disposalError,
+                        nodes = current.nodes.mapValues { (_, node) ->
+                            if (node.status == RunStatus.RUNNING) {
+                                node.copy(status = RunStatus.ERROR, error = disposalError)
+                            } else {
+                                node
+                            }
+                        },
+                    )
+                } else {
+                    current
+                }
+            }
+            terminal?.let(FlowPersistenceCoordinator::publishRunUpdate)
+        }
+        executions.values.forEach { it.cancel(CancellationException(disposalError)) }
+        ownedRunIds.forEach(FlowPersistenceCoordinator::forgetRun)
+        ownedRunIds.clear()
         if (cancelLifecycle) lifecycleScope.cancel()
     }
 
@@ -570,15 +634,127 @@ class FlowController(
         return transitioned
     }
 
-    private suspend fun persistRun(job: RunJob) {
+    private suspend fun persistRun(job: RunJob, publish: Boolean = true) {
         withContext(NonCancellable) {
-            persistMutex.withLock {
-                runCatching {
-                    // Always serialize the newest in-memory snapshot. Coroutine
-                    // scheduling may otherwise let an older live write run last.
-                    val safeJob = jobs[job.runId] ?: job
-                    storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), safeJob))
+            // Share the graph lock with deletion across controller instances. Whichever
+            // operation wins is authoritative: delete removes an earlier terminal write,
+            // while a later persist observes the missing graph and cannot recreate it.
+            FlowPersistenceCoordinator.withFlowLock(job.tabId) {
+                persistMutex.withLock {
+                    runCatching {
+                        // Always serialize the newest in-memory snapshot. Coroutine
+                        // scheduling may otherwise let an older live write run last.
+                        val safeJob = jobs[job.runId] ?: job
+                        if (storage != null && storage.getJson(graphKey(safeJob.tabId)) == null) {
+                            jobs.remove(safeJob.runId)
+                            ownedRunIds.remove(safeJob.runId)
+                            FlowPersistenceCoordinator.forgetRun(safeJob.runId, safeJob.tabId)
+                            return@runCatching
+                        }
+                        storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), safeJob))
+                        // dispose() already published a synchronous terminal snapshot and
+                        // forgot the exact entry. A late NonCancellable write remains
+                        // durable but must not repopulate the process-global live cache.
+                        if (publish && !synchronized(toolSyncLock) { disposed }) {
+                            FlowPersistenceCoordinator.publishRunUpdate(safeJob)
+                        }
+                        if (safeJob.isTerminal) evictOldRuns(safeJob.tabId)
+                    }
                 }
+            }
+        }
+    }
+
+    /** Record a canvas-owned run through the same durable/live channel as MCP runs. */
+    internal fun publishCanvasRun(job: RunJob, persist: Boolean = true) {
+        if (synchronized(toolSyncLock) { disposed }) return
+        ownedRunIds += job.runId
+        jobs.compute(job.runId) { _, current ->
+            if (current?.isTerminal == true) current else job
+        }
+        val safeJob = jobs[job.runId] ?: job
+        // A terminal update must not become observable until its complete output is
+        // durable; persistRun writes storage first and then publishes it. Running
+        // updates remain immediate, and only the admission snapshot is persisted.
+        if (!persist || !safeJob.isTerminal) {
+            FlowPersistenceCoordinator.publishRunUpdate(safeJob)
+        }
+        if (persist) lifecycleScope.launch { persistRun(safeJob) }
+    }
+
+    /** Millisecond timestamp made strictly monotonic for deterministic newest-first ordering. */
+    internal fun nextRunStartedAtMs(): Long =
+        FlowPersistenceCoordinator.nextRunStartedAtMs(nowMillis())
+
+    /** Newest persisted/in-memory runs for [tabId], newest first. */
+    suspend fun listRuns(tabId: String, limit: Int = DEFAULT_RUN_HISTORY_LIMIT): List<RunSummary> {
+        require(limit in 1..MAX_RUN_HISTORY_LIMIT) {
+            "limit must be between 1 and $MAX_RUN_HISTORY_LIMIT"
+        }
+        val ids = buildSet {
+            jobs.values.asSequence().filter { it.tabId == tabId }.forEach { add(it.runId) }
+            storage?.getAllKeys().orEmpty()
+                .asSequence()
+                .map { it.removePrefix(JSON_STORAGE_PREFIX) }
+                .filter { it.startsWith(RUN_PREFIX) }
+                .mapTo(this) { it.removePrefix(RUN_PREFIX) }
+        }
+        return ids.mapNotNull { runSnapshot(it) }
+            .filter { it.tabId == tabId }
+            .sortedWith(compareByDescending<RunJob> { it.startedAtMs }.thenByDescending { it.runId })
+            .take(limit)
+            .map { job ->
+                RunSummary(
+                    runId = job.runId,
+                    state = job.state,
+                    startedAtMs = job.startedAtMs,
+                    nodeCount = maxOf(job.nodeCount, job.nodes.size),
+                )
+            }
+    }
+
+    private suspend fun evictOldRuns(tabId: String) {
+        // One storage enumeration/decode pass per terminal persist. listRuns() would
+        // enumerate and decode the same records again before deletion.
+        val stored = storedRuns().filter { it.second.tabId == tabId }
+        val candidates = LinkedHashMap<String, RunJob>()
+        stored.forEach { (runId, job) -> candidates[runId] = job }
+        jobs.values.filter { it.tabId == tabId }.forEach { candidates[it.runId] = it }
+        val retained = candidates.values
+            .sortedWith(compareByDescending<RunJob> { it.startedAtMs }.thenByDescending { it.runId })
+            .take(DEFAULT_RUN_HISTORY_LIMIT)
+            .mapTo(mutableSetOf()) { it.runId }
+        stored.forEach { (runId, storedJob) ->
+            val loaded = jobs[runId] ?: storedJob
+            if (runId !in retained &&
+                (loaded.isTerminal || !FlowPersistenceCoordinator.isRunLive(runId))
+            ) {
+                storage?.removeJsonValue(runKey(runId))
+                jobs.remove(runId, loaded)
+                ownedRunIds.remove(runId)
+                FlowPersistenceCoordinator.forgetRun(runId)
+            }
+        }
+        jobs.values.asSequence()
+            .filter { it.tabId == tabId && it.runId !in retained && it.isTerminal }
+            .toList()
+            .forEach { old ->
+                jobs.remove(old.runId, old)
+                ownedRunIds.remove(old.runId)
+                FlowPersistenceCoordinator.forgetRun(old.runId)
+            }
+    }
+
+    private suspend fun storedRuns(): List<Pair<String, RunJob>> {
+        val candidates = storage?.getAllKeys().orEmpty()
+            .asSequence()
+            .map { it.removePrefix(JSON_STORAGE_PREFIX) }
+            .filter { it.startsWith(RUN_PREFIX) }
+            .map { it.removePrefix(RUN_PREFIX) }
+            .toList()
+        return buildList {
+            for (runId in candidates) {
+                loadStoredJob(runId)?.let { add(runId to it) }
             }
         }
     }
@@ -588,16 +764,31 @@ class FlowController(
      * `run:<runId>` blob when the in-memory map has no entry (e.g. after a plugin
      * reload), so advertised durability is real (red-team S2), then re-caches it.
      */
-    suspend fun runStatus(runId: String): RunJob? =
-        jobs[runId] ?: loadJob(runId)?.also { jobs[runId] = it }
+    suspend fun runStatus(runId: String): RunJob? = resolveRun(runId, cacheStored = true)
+
+    /** Read a history snapshot, sharing in-process liveness before repairing stale storage. */
+    internal suspend fun runSnapshot(runId: String): RunJob? = resolveRun(runId, cacheStored = false)
+
+    /** Resolve full owner/storage data without mistaking the scrubbed live bus for result storage. */
+    private suspend fun resolveRun(runId: String, cacheStored: Boolean): RunJob? {
+        val coordinated = FlowPersistenceCoordinator.runUpdate(runId)?.job
+        if (coordinated?.state == RunJobState.RUNNING) {
+            return if (runId in ownedRunIds) jobs[runId] ?: coordinated else coordinated
+        }
+        if (coordinated != null) {
+            jobs[runId]?.takeIf { runId in ownedRunIds && it.isTerminal }?.let { return it }
+            loadStoredJob(runId)?.takeIf(RunJob::isTerminal)?.let { return it }
+            return coordinated
+        }
+        jobs[runId]?.let { return it }
+        return loadJob(runId)?.also { if (cacheStored) jobs[runId] = it }
+    }
 
     /** Per-node outputs for [runId] (in-memory or read back from storage), or null. */
     suspend fun runResult(runId: String): Map<String, NodeRunSnap>? = runStatus(runId)?.nodes
 
     private suspend fun loadJob(runId: String): RunJob? {
-        val raw = storage?.getJson(runKey(runId)) ?: return null
-        val loaded = runCatching { json.decodeFromString(RunJob.serializer(), raw) }.getOrNull()
-            ?: return null
+        val loaded = loadStoredJob(runId) ?: return null
         if (loaded.state != RunJobState.RUNNING) return loaded
 
         // An in-memory monitor is the only owner capable of completing a RUNNING job.
@@ -629,6 +820,11 @@ class FlowController(
         return failed
     }
 
+    private suspend fun loadStoredJob(runId: String): RunJob? {
+        val raw = storage?.getJson(runKey(runId)) ?: return null
+        return runCatching { json.decodeFromString(RunJob.serializer(), raw) }.getOrNull()
+    }
+
     // ---- internals ----------------------------------------------------------
 
     private suspend fun writeUnlocked(tabId: String, snapshot: GraphSnapshot) {
@@ -654,6 +850,8 @@ class FlowController(
             runId = runId,
             tabId = tabId,
             state = RunJobState.FAILED,
+            startedAtMs = jobs[runId]?.startedAtMs ?: nextRunStartedAtMs(),
+            nodeCount = jobs[runId]?.nodeCount ?: states.size,
             error = message,
             nodes = terminalNodes,
         )
@@ -715,6 +913,8 @@ class FlowController(
         const val GRAPH_PREFIX = "graph:"
         const val RUN_PREFIX = "run:"
         const val DEFAULT_RUN_TIMEOUT_MS = 15 * 60 * 1000L
+        const val DEFAULT_RUN_HISTORY_LIMIT = 20
+        const val MAX_RUN_HISTORY_LIMIT = DEFAULT_RUN_HISTORY_LIMIT
     }
 }
 
