@@ -297,13 +297,19 @@ disables the interval and each scheduled row shows the last scheduled start/resu
 planned start. Runtime cursor data lives separately at `schedule:<tabId>` so normal scheduler ticks
 do not rewrite the graph. `buildHeadlessController` starts the scheduler on the controller-owned
 lifecycle, independent of replaceable host `pluginScope`, and controller disposal cancels it.
-The scheduler persists the next start before subsequent passes, survives plugin reloads, and never
-overlaps two scheduled invocations of the same flow. If an invocation is still running at its next
-deadline, that occurrence waits and starts after the prior run reaches a terminal state. Manual and
-scheduled invocations retain the controller's existing independent-run behavior. Schedule edits
+The scheduler scans on an IO-backed 15-second cadence, persists the next start before subsequent
+passes, survives plugin reloads, and never overlaps two scheduled invocations of the same flow.
+Deadlines advance from the prior deadline to avoid poll-latency drift, skipping missed occurrences
+instead of creating a catch-up burst. If an invocation is still running at its next deadline, that
+occurrence waits and starts after the prior run reaches a terminal state. Scheduled invocations use
+the controller's shared run-history retention policy rather than maintaining a second scheduler-only
+history. Manual and scheduled invocations retain the controller's existing independent-run behavior.
+Schedule edits
 serialize with reconciliation, reset the next start from edit time, and publish a coordinated graph
 update so an open canvas cannot autosave stale metadata over the change. Deleting a flow also removes
-its scheduler cursor.
+its scheduler cursor. Scheduled runs use the headless controller cleanup contract, but nodes such as
+Open Browser and Await Login may still open or focus an interactive tab; the scheduling dialog warns
+about that behavior.
 
 ### Runtime secret templates
 

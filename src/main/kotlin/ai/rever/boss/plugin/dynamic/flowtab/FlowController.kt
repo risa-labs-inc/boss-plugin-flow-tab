@@ -386,16 +386,21 @@ class FlowController(
             }
         }
         val prior = loadScheduleState(tabId)
-        persistScheduleState(
-            FlowScheduleState(
-                tabId = tabId,
-                intervalMinutes = intervalMinutes ?: prior?.intervalMinutes ?: MIN_SCHEDULE_INTERVAL_MINUTES,
-                lastRunAtEpochMs = prior?.lastRunAtEpochMs,
-                nextRunAtEpochMs = intervalMinutes?.let { nowEpochMs + intervalMillis(it) },
-                lastRunId = prior?.lastRunId,
-                lastRunState = prior?.lastRunState,
-            ),
-        )
+        val nextRunAt = intervalMinutes?.let { nowEpochMs + intervalMillis(it) }
+        if (intervalMinutes == null) {
+            storage.removeJsonValue(scheduleKey(tabId))
+        } else {
+            persistScheduleState(
+                FlowScheduleState(
+                    tabId = tabId,
+                    intervalMinutes = intervalMinutes,
+                    lastRunAtEpochMs = prior?.lastRunAtEpochMs,
+                    nextRunAtEpochMs = nextRunAt,
+                    lastRunId = prior?.lastRunId,
+                    lastRunState = prior?.lastRunState,
+                ),
+            )
+        }
         FlowSummary(
             tabId = tabId,
             name = updated.metadata?.name.orEmpty(),
@@ -403,7 +408,7 @@ class FlowController(
             nodeCount = updated.nodes.size,
             schedule = updated.metadata?.schedule,
             lastScheduledRunAtEpochMs = prior?.lastRunAtEpochMs,
-            nextScheduledRunAtEpochMs = intervalMinutes?.let { nowEpochMs + intervalMillis(it) },
+            nextScheduledRunAtEpochMs = nextRunAt,
             lastScheduledRunState = prior?.lastRunState,
         )
     }
@@ -411,7 +416,7 @@ class FlowController(
     internal fun startScheduleRunner(pollIntervalMs: Long = DEFAULT_SCHEDULE_POLL_INTERVAL_MS): Job =
         synchronized(toolSyncLock) {
             check(!disposed) { "Cannot start scheduler after controller disposal" }
-            scheduleJob ?: lifecycleScope.launch {
+            scheduleJob ?: lifecycleScope.launch(Dispatchers.IO) {
                 while (isActive) {
                     try {
                         runSchedulePass()
@@ -465,7 +470,6 @@ class FlowController(
                 // Fixed-interval schedules never overlap. A long run may start the next
                 // invocation immediately after it terminates, but never while active.
                 if (priorJob?.state == RunJobState.RUNNING) return@forEach
-                if (trackedRunId != null) scheduledExecutions.remove(tabId, trackedRunId)
                 if (nowEpochMs < requireNotNull(state.nextRunAtEpochMs)) return@forEach
 
                 val runId = startRun(tabId)
@@ -473,7 +477,11 @@ class FlowController(
                 persistScheduleState(
                     state.copy(
                         lastRunAtEpochMs = nowEpochMs,
-                        nextRunAtEpochMs = nowEpochMs + intervalMs,
+                        nextRunAtEpochMs = nextScheduledDeadline(
+                            previousDeadlineEpochMs = requireNotNull(state.nextRunAtEpochMs),
+                            nowEpochMs = nowEpochMs,
+                            intervalMs = intervalMs,
+                        ),
                         lastRunId = runId,
                         lastRunState = RunJobState.RUNNING,
                     ),
@@ -561,9 +569,9 @@ class FlowController(
      * live tabs with the same id are closed first so their autosave cannot recreate
      * the graph after deletion. Returns false when the graph key does not exist.
      */
-    suspend fun deleteFlow(tabId: String): Boolean {
+    suspend fun deleteFlow(tabId: String): Boolean = schedulePassMutex.withLock {
         val store = storage ?: throw IllegalStateException("Flow storage is unavailable")
-        if (store.getJson(graphKey(tabId)) == null) return false
+        if (store.getJson(graphKey(tabId)) == null) return@withLock false
 
         closeOpenFlowTabs(tabId)
         var deleted = false
@@ -588,7 +596,7 @@ class FlowController(
         if (!deleted) return false
         scheduledExecutions.remove(tabId)
         FlowPersistenceCoordinator.forget(tabId)
-        return true
+        true
     }
 
     // ---- async run jobs (F1) ------------------------------------------------
@@ -1076,6 +1084,16 @@ class FlowController(
 
     private fun intervalMillis(intervalMinutes: Long): Long = intervalMinutes * 60_000L
 
+    private fun nextScheduledDeadline(
+        previousDeadlineEpochMs: Long,
+        nowEpochMs: Long,
+        intervalMs: Long,
+    ): Long {
+        val elapsed = (nowEpochMs - previousDeadlineEpochMs).coerceAtLeast(0L)
+        val intervalsToAdvance = elapsed / intervalMs + 1L
+        return previousDeadlineEpochMs + intervalsToAdvance * intervalMs
+    }
+
     companion object {
         private const val MAX_KINDS_IN_ERROR = 30
         const val MAX_NODE_TITLE_LENGTH = 100
@@ -1086,7 +1104,7 @@ class FlowController(
         const val SCHEDULE_STATE_PREFIX = "schedule:"
         const val MIN_SCHEDULE_INTERVAL_MINUTES = 1L
         const val MAX_SCHEDULE_INTERVAL_MINUTES = 365L * 24L * 60L
-        const val DEFAULT_SCHEDULE_POLL_INTERVAL_MS = 1_000L
+        const val DEFAULT_SCHEDULE_POLL_INTERVAL_MS = 15_000L
         const val DEFAULT_RUN_TIMEOUT_MS = 15 * 60 * 1000L
         const val DEFAULT_RUN_HISTORY_LIMIT = 20
         const val MAX_RUN_HISTORY_LIMIT = DEFAULT_RUN_HISTORY_LIMIT

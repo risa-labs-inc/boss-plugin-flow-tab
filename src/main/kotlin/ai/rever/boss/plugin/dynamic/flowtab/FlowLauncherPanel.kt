@@ -386,7 +386,12 @@ class FlowLauncherComponent(
                 title = { Text("Schedule ${flow.name.ifBlank { "flow" }}") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Run this flow automatically at a fixed interval.")
+                        Text(
+                            "Run this flow automatically at a fixed interval " +
+                                "(${FlowController.MIN_SCHEDULE_INTERVAL_MINUTES}–" +
+                                "${FlowController.MAX_SCHEDULE_INTERVAL_MINUTES} minutes). " +
+                                "Interactive browser steps may open or focus a tab.",
+                        )
                         TextField(
                             value = scheduleMinutesText,
                             onValueChange = { scheduleMinutesText = it.filter(Char::isDigit).take(8) },
@@ -586,7 +591,7 @@ internal fun flowScheduleStatus(flow: FlowSummary): String? {
     return "Every ${schedule.intervalMinutes} $unit · Last: $last · Next: $next"
 }
 
-private const val SCHEDULE_STATUS_REFRESH_MS = 5_000L
+private const val SCHEDULE_STATUS_REFRESH_MS = 30_000L
 
 @Composable
 private fun LauncherMessage(text: String, color: Color = Color(0xFF8C8C96)) {

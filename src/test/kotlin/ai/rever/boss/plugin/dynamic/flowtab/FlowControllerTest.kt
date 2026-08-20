@@ -589,7 +589,37 @@ class FlowControllerTest {
         val disabled = fc.updateSchedule(tabId, intervalMinutes = null, nowEpochMs = 2_000)
         assertNull(fc.getFlow(tabId)?.metadata?.schedule)
         assertNull(disabled.schedule)
-        assertNull(fc.scheduleState(tabId)?.nextRunAtEpochMs)
+        assertNull(fc.scheduleState(tabId))
+        fc.dispose()
+    }
+
+    @Test
+    fun `late schedule pass advances from prior deadline without catch-up burst`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        fc.addNode(tabId, "TRIGGER")
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            fc.runSchedulePass(nowEpochMs = 90_000)
+
+            val state = fc.scheduleState(tabId)!!
+            assertEquals(90_000L, state.lastRunAtEpochMs)
+            assertEquals(120_000L, state.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `deleteFlow removes durable schedule cursor`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(10)))
+        fc.runSchedulePass(nowEpochMs = 0)
+        assertNotNull(fc.scheduleState(tabId))
+
+        assertTrue(fc.deleteFlow(tabId))
+        assertNull(fc.scheduleState(tabId))
         fc.dispose()
     }
 
