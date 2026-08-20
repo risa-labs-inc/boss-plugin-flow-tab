@@ -299,12 +299,13 @@ do not rewrite the graph. `buildHeadlessController` starts the scheduler on the 
 lifecycle, independent of replaceable host `pluginScope`, and controller disposal cancels it.
 The scheduler reconciles durable `schedule:` cursors on an IO-backed 15-second cadence and performs
 a full graph discovery only at startup and every five minutes, so unscheduled graphs are not decoded
-on every tick. It persists the next start before subsequent passes, survives plugin reloads, caps
+on every tick. Its first pass waits 60 seconds for host and external tool registries to populate.
+It persists the next start before subsequent passes, survives plugin reloads, caps
 simultaneous scheduled dispatch at four, and never overlaps another scheduled, MCP, or visible-canvas
 run of the same flow.
 Deadlines advance from the prior deadline to avoid poll-latency drift, skipping missed occurrences
-instead of creating a catch-up burst; a backward wall-clock correction reanchors a cursor that is
-more than one interval ahead. If an invocation is still running at its next deadline, that
+instead of creating a catch-up burst; startup resumes and backward wall-clock corrections reanchor a
+cursor that is more than one interval away. If an invocation is still running at its next deadline, that
 occurrence waits and starts after the prior run reaches a terminal state. Scheduled invocations use
 the controller's shared run-history retention policy rather than maintaining a second scheduler-only
 history. Controllers and visible canvases publish active runs through the process-wide persistence

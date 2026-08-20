@@ -720,6 +720,22 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `stale overdue cursor reanchors instead of dispatching on startup`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "TRIGGER")
+        fc.updateSchedule(tabId, intervalMinutes = 1, nowEpochMs = 0)
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 120_001, discoverSchedules = false)
+            assertNull(fc.scheduleState(tabId)?.lastRunId)
+            assertEquals(180_001L, fc.scheduleState(tabId)?.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
     fun `fresh controller resumes a due cursor exactly once after reload`() = runBlocking {
         val storage = DesktopStorage()
         val first = controller(storage)

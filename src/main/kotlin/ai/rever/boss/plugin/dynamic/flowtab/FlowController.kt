@@ -368,7 +368,7 @@ class FlowController(
     suspend fun updateSchedule(
         tabId: String,
         intervalMinutes: Long?,
-        nowEpochMs: Long = System.currentTimeMillis(),
+        nowEpochMs: Long = nowMillis(),
     ): FlowSummary {
         intervalMinutes?.let {
             require(it in MIN_SCHEDULE_INTERVAL_MINUTES..MAX_SCHEDULE_INTERVAL_MINUTES) {
@@ -424,11 +424,15 @@ class FlowController(
         }
     }
 
-    internal fun startScheduleRunner(pollIntervalMs: Long = DEFAULT_SCHEDULE_POLL_INTERVAL_MS): Job =
+    internal fun startScheduleRunner(
+        pollIntervalMs: Long = DEFAULT_SCHEDULE_POLL_INTERVAL_MS,
+        startupGraceMs: Long = DEFAULT_SCHEDULE_STARTUP_GRACE_MS,
+    ): Job =
         synchronized(toolSyncLock) {
             check(!disposed) { "Cannot start scheduler after controller disposal" }
             scheduleJob ?: lifecycleScope.launch(Dispatchers.IO) {
                 var nextDiscoveryAtEpochMs = Long.MIN_VALUE
+                delay(startupGraceMs)
                 while (isActive) {
                     try {
                         val nowEpochMs = nowMillis()
@@ -453,7 +457,7 @@ class FlowController(
 
     /** One deterministic scheduler reconciliation; internal for lifecycle tests. */
     internal suspend fun runSchedulePass(
-        nowEpochMs: Long = System.currentTimeMillis(),
+        nowEpochMs: Long = nowMillis(),
         discoverSchedules: Boolean = true,
     ) {
         scheduleSweepMutex.withLock {
@@ -494,7 +498,7 @@ class FlowController(
             .toList()
     }
 
-    private fun activeLocalRunCount(): Int = executions.keys.count { runId ->
+    private fun activeScheduledRunCount(): Int = scheduledExecutions.values.count { runId ->
         jobs[runId]?.state == RunJobState.RUNNING
     }
 
@@ -522,7 +526,8 @@ class FlowController(
         if (state == null ||
             state.intervalMinutes != schedule.intervalMinutes ||
             state.nextRunAtEpochMs == null ||
-            state.nextRunAtEpochMs > nowEpochMs + intervalMs
+            state.nextRunAtEpochMs > nowEpochMs + intervalMs ||
+            state.nextRunAtEpochMs < nowEpochMs - intervalMs
         ) {
             state = FlowScheduleState(
                 tabId = tabId,
@@ -564,7 +569,7 @@ class FlowController(
         if (nowEpochMs < requireNotNull(state.nextRunAtEpochMs)) return
         if (executions.keys.any { runId -> jobs[runId]?.tabId == tabId }) return
         if (FlowPersistenceCoordinator.isFlowLive(tabId)) return
-        if (activeLocalRunCount() >= MAX_CONCURRENT_SCHEDULED_RUNS) return
+        if (activeScheduledRunCount() >= MAX_CONCURRENT_SCHEDULED_RUNS) return
 
         val runId = startRun(tabId)
         scheduledExecutions[tabId] = runId
@@ -1199,6 +1204,7 @@ class FlowController(
         const val MIN_SCHEDULE_INTERVAL_MINUTES = 1L
         const val MAX_SCHEDULE_INTERVAL_MINUTES = 365L * 24L * 60L
         const val DEFAULT_SCHEDULE_POLL_INTERVAL_MS = 15_000L
+        const val DEFAULT_SCHEDULE_STARTUP_GRACE_MS = 60_000L
         const val SCHEDULE_DISCOVERY_INTERVAL_MS = 5 * 60_000L
         const val MAX_CONCURRENT_SCHEDULED_RUNS = 4
         const val DEFAULT_RUN_TIMEOUT_MS = 15 * 60 * 1000L
