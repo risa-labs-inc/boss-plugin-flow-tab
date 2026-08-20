@@ -311,7 +311,8 @@ the controller's shared run-history retention policy rather than maintaining a s
 history. Controllers and visible canvases publish active runs through the process-wide persistence
 coordinator, which the scheduler checks before dispatch. Schedule edits serialize
 with reconciliation, reset the next start from edit time, and publish a coordinated graph
-update so an open canvas cannot autosave stale metadata over the change. Deleting a flow also removes
+update so an open canvas cannot autosave stale metadata over the change. Import strips schedule
+metadata so shared content cannot silently arm background execution. Deleting a flow also removes
 its scheduler cursor. Scheduled runs use the headless controller cleanup contract, but nodes such as
 Open Browser and Await Login may still open or focus an interactive tab; the scheduling dialog warns
 about that behavior.

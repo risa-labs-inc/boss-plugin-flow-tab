@@ -835,6 +835,9 @@ class FlowControllerTest {
             fc.runSchedulePass(nowEpochMs = 120_000)
             assertEquals(firstRunId, fc.scheduleState(tabId)?.lastRunId)
             assertEquals(RunJobState.RUNNING, fc.scheduleState(tabId)?.lastRunState)
+
+            fc.runSchedulePass(nowEpochMs = 240_001)
+            assertEquals(120_000L, fc.scheduleState(tabId)?.nextRunAtEpochMs)
         } finally {
             fc.dispose()
             runScope.cancel()

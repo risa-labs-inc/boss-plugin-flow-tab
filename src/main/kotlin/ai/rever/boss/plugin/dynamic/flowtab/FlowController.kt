@@ -527,7 +527,7 @@ class FlowController(
             state.intervalMinutes != schedule.intervalMinutes ||
             state.nextRunAtEpochMs == null ||
             state.nextRunAtEpochMs > nowEpochMs + intervalMs ||
-            state.nextRunAtEpochMs < nowEpochMs - intervalMs
+            (state.nextRunAtEpochMs < nowEpochMs - intervalMs && scheduledExecutions[tabId] == null)
         ) {
             state = FlowScheduleState(
                 tabId = tabId,

@@ -58,4 +58,16 @@ class GraphSnapshotTest {
         )
         assertEquals(15L, back.schedule?.intervalMinutes)
     }
+
+    @Test
+    fun `imported flow drops its armed schedule`() {
+        val snapshot = GraphSnapshot(
+            metadata = FlowMeta(name = "Shared", schedule = FlowSchedule(intervalMinutes = 1)),
+        )
+
+        val imported = snapshot.withoutSchedule()
+
+        assertEquals("Shared", imported.metadata?.name)
+        assertNull(imported.metadata?.schedule)
+    }
 }

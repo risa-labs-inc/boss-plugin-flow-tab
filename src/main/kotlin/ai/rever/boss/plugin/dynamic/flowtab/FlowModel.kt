@@ -328,6 +328,10 @@ data class GraphSnapshot(
     val metadata: FlowMeta? = null
 )
 
+/** Imported flows never carry an armed local recurring schedule across trust boundaries. */
+internal fun GraphSnapshot.withoutSchedule(): GraphSnapshot =
+    copy(metadata = metadata?.copy(schedule = null))
+
 /**
  * Highest on-disk [GraphSnapshot.schemaVersion] this build understands. Saves are
  * written at this version (see [FlowGraphState.toSnapshot]); a graph whose version
