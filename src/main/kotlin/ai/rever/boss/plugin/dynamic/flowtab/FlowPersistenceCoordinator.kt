@@ -175,8 +175,14 @@ internal object FlowPersistenceCoordinator {
 
     fun isRunLive(runId: String): Boolean = runUpdatesById[runId]?.job?.state == RunJobState.RUNNING
 
-    fun forgetRun(runId: String) {
+    fun forgetRun(runId: String, tabId: String? = null) {
+        val removedTabId = tabId ?: runUpdatesById[runId]?.job?.tabId
         runUpdatesById.remove(runId)
+        if (tabId != null && removedTabId != null) {
+            mutableRunUpdates.update { current ->
+                if (current[removedTabId]?.job?.runId == runId) current - removedTabId else current
+            }
+        }
     }
 
     fun forget(tabId: String) {

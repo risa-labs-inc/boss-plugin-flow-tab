@@ -312,6 +312,32 @@ class FlowControllerTest {
         FlowPersistenceCoordinator.forget(tabId)
     }
 
+    @Test
+    fun `missing graph persistence withdraws a mirrored running canvas update`() = runBlocking {
+        val fc = controller(DesktopStorage())
+        val tabId = "flow-missing-graph-${java.util.UUID.randomUUID()}"
+        val running = RunJob(
+            runId = "run-missing-graph-${java.util.UUID.randomUUID()}",
+            tabId = tabId,
+            state = RunJobState.RUNNING,
+            startedAtMs = 1L,
+        )
+        try {
+            fc.publishCanvasRun(running)
+            withTimeout(5_000) {
+                while (FlowPersistenceCoordinator.latestRunUpdate(tabId) != null) delay(10)
+            }
+
+            fc.publishCanvasRun(running.copy(state = RunJobState.SUCCEEDED))
+            delay(100)
+            assertNull(FlowPersistenceCoordinator.latestRunUpdate(tabId))
+            assertNull(FlowPersistenceCoordinator.runUpdate(running.runId))
+        } finally {
+            fc.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
     private fun hangingRegistry(
         kind: String,
         onStart: () -> Unit = {},

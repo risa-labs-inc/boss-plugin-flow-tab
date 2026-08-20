@@ -251,8 +251,10 @@ failure line is not discarded.
 Both controller/MCP runs and canvas runs publish the same persisted `run:<runId>` record, including
 start time, terminal/running state, and node count. The newest record is replayed into an open canvas
 through `FlowPersistenceCoordinator`, and the toolbar History dialog can load any retained run back
-into node overlays. The live channel drops node outputs and bounds diagnostic text; full results remain
-in controller/storage records. Retention is capped at the newest 20 runs per flow (active runs are never evicted); deleting a flow also
+into node overlays. The live channel drops node outputs and bounds diagnostic text; `flow_result`
+reports those snapshots as `contentComplete: false` with omission/truncation flags, while full results
+remain in controller/storage records. Retention is capped at the newest 20 runs per flow (active runs
+are never evicted); deleting a flow also
 deletes its run records. Legacy `runstate:<tabId>` remains readable for compatibility but is no longer
 the only canvas-visible history channel.
 The launcher/controller and an open tab are independent full-snapshot writers for the same graph

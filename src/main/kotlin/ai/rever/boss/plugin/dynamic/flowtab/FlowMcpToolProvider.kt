@@ -157,7 +157,8 @@ class FlowMcpToolProvider(
             })
         },
         def("flow_result", "Get a run's per-node status, errors, and bounded logs. " +
-            "Set includeOutput=true with nodeId to include that node's bounded output.",
+            "Set includeOutput=true with nodeId to include that node's bounded output. " +
+            "contentComplete=false means the live snapshot was scrubbed; outputOmitted/truncated will be true.",
             schema(
                 """{"runId":{"type":"string"},"nodeId":{"type":"string"},"includeOutput":{"type":"boolean"}}""",
                 required = listOf("runId"),

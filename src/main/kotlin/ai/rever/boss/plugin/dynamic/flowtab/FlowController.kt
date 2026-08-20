@@ -648,7 +648,7 @@ class FlowController(
                         if (storage != null && storage.getJson(graphKey(safeJob.tabId)) == null) {
                             jobs.remove(safeJob.runId)
                             ownedRunIds.remove(safeJob.runId)
-                            FlowPersistenceCoordinator.forgetRun(safeJob.runId)
+                            FlowPersistenceCoordinator.forgetRun(safeJob.runId, safeJob.tabId)
                             return@runCatching
                         }
                         storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), safeJob))

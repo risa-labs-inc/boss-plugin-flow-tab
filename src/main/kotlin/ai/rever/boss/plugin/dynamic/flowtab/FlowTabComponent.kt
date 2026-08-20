@@ -183,6 +183,7 @@ class FlowTabComponent(
     private var persistenceSyncRevision by mutableStateOf(0L)
     private var appliedGraphRevision by mutableStateOf(0L)
     private var displayedRunRevision by mutableStateOf(0L)
+    private var displayedRunId: String? = null
     private val liveCanvas = object : LiveFlowCanvas {
         override val isInitialized: Boolean get() = initialized
         override val appliedGraphRevision: Long get() = this@FlowTabComponent.appliedGraphRevision
@@ -306,7 +307,16 @@ class FlowTabComponent(
         LaunchedEffect(config.id) {
             while (!initialized) delay(20)
             FlowPersistenceCoordinator.runUpdates.collect { updates ->
-                updates[config.id]?.let { update ->
+                val update = updates[config.id]
+                if (update == null) {
+                    // A run whose graph disappeared is deliberately withdrawn rather
+                    // than persisted. Release any mirrored RUNNING UI that had consumed
+                    // its previous update; a canvas-owned run is governed by runJobs.
+                    if (!canvasRunOwned && currentCanvasHistoryRunId.get() == null && state.isRunning) {
+                        state.isRunning = false
+                        Snapshot.sendApplyNotifications()
+                    }
+                } else {
                     val suppressed = suppressedRunId.get() == update.job.runId
                     if (suppressed && update.job.isTerminal) {
                         suppressedRunId.compareAndSet(update.job.runId, null)
@@ -326,6 +336,10 @@ class FlowTabComponent(
                         } else {
                             update.job
                         }
+                        if (displayJob.state == RunJobState.RUNNING && displayedRunId != displayJob.runId) {
+                            state.runError = null
+                        }
+                        displayedRunId = displayJob.runId
                         state.applyRunJob(displayJob)
                         Snapshot.sendApplyNotifications()
                     }
