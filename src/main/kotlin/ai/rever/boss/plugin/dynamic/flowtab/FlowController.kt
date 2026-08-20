@@ -494,11 +494,12 @@ class FlowController(
             )
             persistScheduleState(state)
         }
-        // Scheduled invocations never overlap one another or an MCP/headless run
-        // owned by this controller. Visible canvas runs use an independent controller.
+        // Local jobs close the window before their first persistence; the shared live
+        // bus covers MCP controllers and open canvases after they publish admission.
         if (priorJob?.state == RunJobState.RUNNING) return
         if (nowEpochMs < requireNotNull(state.nextRunAtEpochMs)) return
         if (executions.keys.any { runId -> jobs[runId]?.tabId == tabId }) return
+        if (FlowPersistenceCoordinator.isFlowLive(tabId)) return
 
         val runId = startRun(tabId)
         scheduledExecutions[tabId] = runId

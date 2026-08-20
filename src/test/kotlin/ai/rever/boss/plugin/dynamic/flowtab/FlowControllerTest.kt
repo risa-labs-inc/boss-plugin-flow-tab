@@ -788,6 +788,39 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `schedule pass observes a canvas run published by another controller`() = runBlocking {
+        val storage = DesktopStorage()
+        val scheduler = controller(storage)
+        val canvasOwner = controller(storage)
+        val tabId = scheduler.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        scheduler.addNode(tabId, "TRIGGER")
+        val canvasRun = RunJob(
+            runId = "run-canvas-schedule-${java.util.UUID.randomUUID()}",
+            tabId = tabId,
+            state = RunJobState.RUNNING,
+            startedAtMs = canvasOwner.nextRunStartedAtMs(),
+        )
+
+        try {
+            scheduler.runSchedulePass(nowEpochMs = 0)
+            canvasOwner.publishCanvasRun(canvasRun, persist = false)
+            assertTrue(FlowPersistenceCoordinator.isFlowLive(tabId))
+
+            scheduler.runSchedulePass(nowEpochMs = 60_000)
+            assertNull(scheduler.scheduleState(tabId)?.lastRunId)
+
+            canvasOwner.publishCanvasRun(canvasRun.copy(state = RunJobState.SUCCEEDED), persist = false)
+            assertFalse(FlowPersistenceCoordinator.isFlowLive(tabId))
+            scheduler.runSchedulePass(nowEpochMs = 60_000)
+            assertNotNull(scheduler.scheduleState(tabId)?.lastRunId)
+        } finally {
+            canvasOwner.dispose()
+            scheduler.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
+    @Test
     fun `one schedule cursor failure does not block later flows`() = runBlocking {
         val storage = object : DesktopStorage() {
             var failingKey: String? = null

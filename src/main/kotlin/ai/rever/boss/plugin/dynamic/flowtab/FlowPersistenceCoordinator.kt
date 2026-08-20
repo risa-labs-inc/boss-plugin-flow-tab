@@ -175,6 +175,12 @@ internal object FlowPersistenceCoordinator {
 
     fun isRunLive(runId: String): Boolean = runUpdatesById[runId]?.job?.state == RunJobState.RUNNING
 
+    /** Whether any controller or open canvas has published an active run for this flow. */
+    fun isFlowLive(tabId: String): Boolean =
+        runUpdatesById.values.any { update ->
+            update.job.tabId == tabId && update.job.state == RunJobState.RUNNING
+        }
+
     fun forgetRun(runId: String, tabId: String? = null) {
         val removedTabId = tabId ?: runUpdatesById[runId]?.job?.tabId
         runUpdatesById.remove(runId)

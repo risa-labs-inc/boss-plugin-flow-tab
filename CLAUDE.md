@@ -298,14 +298,14 @@ planned start. Runtime cursor data lives separately at `schedule:<tabId>` so nor
 do not rewrite the graph. `buildHeadlessController` starts the scheduler on the controller-owned
 lifecycle, independent of replaceable host `pluginScope`, and controller disposal cancels it.
 The scheduler scans on an IO-backed 15-second cadence, persists the next start before subsequent
-passes, survives plugin reloads, and never overlaps another scheduled or headless-controller run
+passes, survives plugin reloads, and never overlaps another scheduled, MCP, or visible-canvas run
 of the same flow.
 Deadlines advance from the prior deadline to avoid poll-latency drift, skipping missed occurrences
 instead of creating a catch-up burst. If an invocation is still running at its next deadline, that
 occurrence waits and starts after the prior run reaches a terminal state. Scheduled invocations use
 the controller's shared run-history retention policy rather than maintaining a second scheduler-only
-history. A visible canvas owns an independent controller and cannot currently advertise its active
-run to the headless scheduler, so a canvas run may overlap a scheduled run. Schedule edits serialize
+history. Controllers and visible canvases publish active runs through the process-wide persistence
+coordinator, which the scheduler checks before dispatch. Schedule edits serialize
 with reconciliation, reset the next start from edit time, and publish a coordinated graph
 update so an open canvas cannot autosave stale metadata over the change. Deleting a flow also removes
 its scheduler cursor. Scheduled runs use the headless controller cleanup contract, but nodes such as
