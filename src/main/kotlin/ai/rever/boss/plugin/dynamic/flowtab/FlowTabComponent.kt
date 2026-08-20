@@ -114,10 +114,13 @@ private val RunStartedFormatter = java.time.format.DateTimeFormatter.ofPattern(
 )
 
 private fun FlowGraphState.applyRunJob(job: RunJob) {
-    clearRun()
-    runStates.putAll(RunSnapshot(job.nodes).toRuns())
+    val restored = RunSnapshot(job.nodes).toRuns()
+    runStates.keys.toList().filterNot(restored::containsKey).forEach(runStates::remove)
+    restored.forEach { (nodeId, run) ->
+        if (runStates[nodeId] != run) runStates[nodeId] = run
+    }
     isRunning = job.state == RunJobState.RUNNING
-    runError = job.error
+    if (job.error != null || job.isTerminal) runError = job.error
 }
 
 private fun formatRunStarted(startedAtMs: Long): String {
@@ -194,6 +197,7 @@ class FlowTabComponent(
     private val currentCanvasHistoryRunId = AtomicReference<String?>(null)
     private val lastCanvasHistoryRunId = AtomicReference<String?>(null)
     private val suppressedRunId = AtomicReference<String?>(null)
+    private var canvasRunOwned by mutableStateOf(false)
 
     init {
         FlowPersistenceCoordinator.registerLiveCanvas(config.id, liveCanvas)
@@ -312,7 +316,17 @@ class FlowTabComponent(
                         update.job.runId != lastCanvasHistoryRunId.get()
                     ) {
                         displayedRunRevision = update.revision
-                        state.applyRunJob(update.job)
+                        // The process-wide live bus deliberately omits node output.
+                        // Once terminal, hydrate the authoritative full job from this
+                        // controller/storage before rendering the final overlay.
+                        val displayJob = if (update.job.isTerminal) {
+                            withContext(Dispatchers.IO) {
+                                controller.runSnapshot(update.job.runId)
+                            } ?: update.job
+                        } else {
+                            update.job
+                        }
+                        state.applyRunJob(displayJob)
                         Snapshot.sendApplyNotifications()
                     }
                 }
@@ -395,6 +409,7 @@ class FlowTabComponent(
             val historyStartedAtMs = controller.nextRunStartedAtMs()
             currentCanvasHistoryRunId.set(historyRunId)
             lastCanvasHistoryRunId.set(historyRunId)
+            canvasRunOwned = true
             val job = runJobs.launch(Dispatchers.Default) {
                 val admitted = AtomicBoolean(false)
                 var runFailure: String? = null
@@ -532,12 +547,16 @@ class FlowTabComponent(
                             // Run-state persistence is best-effort, as before.
                         }
                     }
-                    currentCanvasHistoryRunId.compareAndSet(historyRunId, null)
+                    if (currentCanvasHistoryRunId.compareAndSet(historyRunId, null)) {
+                        canvasRunOwned = false
+                    }
                 }
             }
             // This also runs when a queued job is cancelled before its block starts.
             job.invokeOnCompletion { cause ->
-                currentCanvasHistoryRunId.compareAndSet(historyRunId, null)
+                if (currentCanvasHistoryRunId.compareAndSet(historyRunId, null)) {
+                    canvasRunOwned = false
+                }
                 if (runStatePersistence.isCurrent(runToken)) {
                     state.isRunning = false
                     state.notice = when {
@@ -597,11 +616,9 @@ class FlowTabComponent(
             // Invalidate before cancelling or mutating state so late executor callbacks
             // and the run finalizer cannot repopulate the cleared snapshot.
             val invalidation = runStatePersistence.invalidateRun()
-            suppressedRunId.set(
-                FlowPersistenceCoordinator.latestRunUpdate(config.id)?.job?.runId
-                    ?: lastCanvasHistoryRunId.get()
-            )
+            suppressedRunId.set(currentCanvasHistoryRunId.get())
             runJobs.cancelAll()
+            canvasRunOwned = false
             state.isRunning = false
             state.notice = null
             visibleTabId.getAndSet(null)?.let { id ->
@@ -721,7 +738,7 @@ class FlowTabComponent(
                 flowName = currentFlowName,
                 scale = state.scale,
                 isRunning = state.isRunning,
-                canStop = currentCanvasHistoryRunId.get() != null,
+                canStop = canvasRunOwned,
                 realistic = realistic,
                 onToggleRealistic = { realistic = !realistic },
                 headless = state.allBrowserHeadless,

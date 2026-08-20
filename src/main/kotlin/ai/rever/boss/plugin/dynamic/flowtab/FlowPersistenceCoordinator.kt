@@ -132,7 +132,21 @@ internal object FlowPersistenceCoordinator {
     fun latestGraphUpdate(tabId: String): ExternalGraphUpdate? = mutableGraphUpdates.value[tabId]
 
     fun publishRunUpdate(job: RunJob): ExternalRunUpdate {
-        val update = ExternalRunUpdate(revisionCounter.incrementAndGet(), job)
+        // This singleton is only a live-status bus, not the durable result store. In
+        // particular, retaining node output here pins arbitrary JSON for the plugin
+        // lifetime and duplicates the full job already held by its controller/storage.
+        val liveJob = job.copy(
+            error = job.error?.take(MAX_LIVE_MESSAGE_LENGTH),
+            nodes = job.nodes.mapValues { (_, node) ->
+                node.copy(
+                    error = node.error?.take(MAX_LIVE_MESSAGE_LENGTH),
+                    logs = node.logs.takeLast(MAX_LIVE_LOG_LINES).map { it.take(MAX_LIVE_MESSAGE_LENGTH) },
+                    output = emptyList(),
+                    skipReason = node.skipReason?.take(MAX_LIVE_MESSAGE_LENGTH),
+                )
+            },
+        )
+        val update = ExternalRunUpdate(revisionCounter.incrementAndGet(), liveJob)
         val effective = runUpdatesById.compute(job.runId) { _, previous ->
             if (previous?.job?.isTerminal == true) previous else update
         } ?: update
@@ -182,6 +196,9 @@ internal object FlowPersistenceCoordinator {
             if (current[tabId]?.revision == revision) current - tabId else current
         }
     }
+
+    private const val MAX_LIVE_LOG_LINES = 50
+    private const val MAX_LIVE_MESSAGE_LENGTH = 4_096
 }
 
 /** Apply a newer controller snapshot to live canvas state and return its acknowledged revision. */
