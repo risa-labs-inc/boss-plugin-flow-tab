@@ -65,7 +65,7 @@ private val JsonStringColor = Color(0xFF9ECE6A)
 private val JsonNumberColor = Color(0xFFE0AF68)
 private val JsonBoolColor = Color(0xFFBB9AF7)
 
-/** Replace one config field on [node], preserving the rest. */
+/** Replace one config field on [node], preserving the rest. Internal so tests can pin the edit round trip. */
 internal fun setConfig(node: FlowNode, key: String, value: String) {
     node.config = JsonObject(node.config + (key to JsonPrimitive(value)))
 }

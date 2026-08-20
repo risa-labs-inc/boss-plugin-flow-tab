@@ -104,6 +104,11 @@ submission tool. Explicitly listing that synthetic tool by name or `tool:flow:fl
 accepted as a backward-compatible no-op; a real allowlisted tool that shadows the reserved name is
 still a configuration conflict.
 
+`FieldType.JSON` Parameters editors must render structured `JsonObject`/`JsonArray` config as
+editable pretty JSON, never as a blank/default. The first edit intentionally normalizes it to a
+string-backed `JsonPrimitive`; JSON-field executors must accept both shapes so imported/MCP-authored
+config and inspector edits round-trip identically.
+
 Agent structured output is optional and backward-compatible. A non-blank `outputSchema` must have
 root `"type": "object"`; Flow advertises a reserved `flow_submit_output` tool whose input schema
 is that exact contract and appends a system instruction requiring the model to call it alone for
