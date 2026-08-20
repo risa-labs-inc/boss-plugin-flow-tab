@@ -40,9 +40,11 @@ internal interface LiveFlowCanvas {
 internal object FlowPersistenceCoordinator {
     private val locks = ConcurrentHashMap<String, Mutex>()
     private val revisionCounter = AtomicLong()
+    private val runStartedCounter = AtomicLong()
     private val mutableNames = MutableStateFlow<Map<String, String>>(emptyMap())
     private val mutableGraphUpdates = MutableStateFlow<Map<String, ExternalGraphUpdate>>(emptyMap())
     private val mutableRunUpdates = MutableStateFlow<Map<String, ExternalRunUpdate>>(emptyMap())
+    private val runUpdatesById = ConcurrentHashMap<String, ExternalRunUpdate>()
     private val liveCanvases = ConcurrentHashMap<String, MutableSet<LiveFlowCanvas>>()
 
     /** Latest successful rename per tab, used by toolbar/sidebar title synchronization. */
@@ -131,6 +133,7 @@ internal object FlowPersistenceCoordinator {
 
     fun publishRunUpdate(job: RunJob): ExternalRunUpdate {
         val update = ExternalRunUpdate(revisionCounter.incrementAndGet(), job)
+        runUpdatesById[job.runId] = update
         mutableRunUpdates.update { current ->
             val previous = current[job.tabId]
             if (previous == null || previous.job.runId == job.runId ||
@@ -146,10 +149,24 @@ internal object FlowPersistenceCoordinator {
 
     fun latestRunUpdate(tabId: String): ExternalRunUpdate? = mutableRunUpdates.value[tabId]
 
+    /** Exact in-process run snapshot, allowing separate controller instances to share liveness. */
+    fun runUpdate(runId: String): ExternalRunUpdate? = runUpdatesById[runId]
+
+    fun nextRunStartedAtMs(nowMillis: Long): Long = runStartedCounter.updateAndGet { previous ->
+        maxOf(nowMillis, previous + 1L)
+    }
+
+    fun isRunLive(runId: String): Boolean = runUpdatesById[runId]?.job?.state == RunJobState.RUNNING
+
+    fun forgetRun(runId: String) {
+        runUpdatesById.remove(runId)
+    }
+
     fun forget(tabId: String) {
         forgetName(tabId)
         mutableGraphUpdates.update { current -> current - tabId }
         mutableRunUpdates.update { current -> current - tabId }
+        runUpdatesById.entries.removeIf { it.value.job.tabId == tabId }
         // Keep the mutex entry for the plugin lifetime. Removing a held mutex could
         // let an already-waiting writer and a new writer acquire different locks.
     }

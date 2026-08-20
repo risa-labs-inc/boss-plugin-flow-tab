@@ -102,9 +102,10 @@ class FlowControllerTest {
         }
 
         withTimeout(5_000) {
-            while (storage.map.keys.count { it.startsWith("json:${FlowController.RUN_PREFIX}") } !=
-                FlowController.DEFAULT_RUN_HISTORY_LIMIT ||
-                FlowPersistenceCoordinator.latestRunUpdate(tabId)?.job?.runId != "run-history-25") {
+            val expected = (6..25).mapTo(mutableSetOf()) { "json:${FlowController.RUN_PREFIX}run-history-$it" }
+            while (storage.map.keys.filterTo(mutableSetOf()) {
+                    it.startsWith("json:${FlowController.RUN_PREFIX}")
+                } != expected) {
                 delay(10)
             }
         }
@@ -117,6 +118,62 @@ class FlowControllerTest {
             "run-history-25",
             FlowPersistenceCoordinator.latestRunUpdate(tabId)?.job?.runId,
         )
+    }
+
+    @Test
+    fun `a second controller observes a live canvas run without orphaning it`() = runBlocking {
+        val storage = DesktopStorage()
+        val owner = controller(storage)
+        val observer = controller(storage)
+        val tabId = owner.createFlow()
+        val running = RunJob(
+            runId = "run-cross-controller",
+            tabId = tabId,
+            state = RunJobState.RUNNING,
+            startedAtMs = 10L,
+            nodeCount = 1,
+        )
+        owner.publishCanvasRun(running)
+
+        assertEquals(RunJobState.RUNNING, observer.runStatus(running.runId)?.state)
+
+        owner.publishCanvasRun(running.copy(state = RunJobState.SUCCEEDED))
+        withTimeout(5_000) {
+            while (observer.runStatus(running.runId)?.state != RunJobState.SUCCEEDED) delay(10)
+        }
+    }
+
+    @Test
+    fun `stored running history is repaired after its in-process owner disappears`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        val runId = "run-stale-history"
+        storage.putJson(
+            "${FlowController.RUN_PREFIX}$runId",
+            kotlinx.serialization.json.Json.encodeToString(
+                RunJob.serializer(),
+                RunJob(runId, tabId, RunJobState.RUNNING, startedAtMs = 1L),
+            ),
+        )
+        FlowPersistenceCoordinator.forgetRun(runId)
+
+        val summary = fc.listRuns(tabId).single()
+        assertEquals(RunJobState.FAILED, summary.state)
+        assertEquals(RunJobState.FAILED, fc.runSnapshot(runId)?.state)
+    }
+
+    @Test
+    fun `older run updates cannot replace the newest live flow update`() {
+        val tabId = "flow-run-order-${java.util.UUID.randomUUID()}"
+        val newer = RunJob("run-new", tabId, RunJobState.RUNNING, startedAtMs = 2L)
+        val older = RunJob("run-old", tabId, RunJobState.SUCCEEDED, startedAtMs = 1L)
+
+        FlowPersistenceCoordinator.publishRunUpdate(newer)
+        FlowPersistenceCoordinator.publishRunUpdate(older)
+
+        assertEquals("run-new", FlowPersistenceCoordinator.latestRunUpdate(tabId)?.job?.runId)
+        FlowPersistenceCoordinator.forget(tabId)
     }
 
     private fun hangingRegistry(
