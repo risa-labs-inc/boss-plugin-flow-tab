@@ -8,6 +8,9 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlin.test.Test
@@ -55,7 +58,24 @@ class FlowInspectorCopyTest {
 
         assertTrue(copied.length <= 300)
         assertTrue(parsed.last().toString().contains("_boss_copy_truncated"))
-        assertTrue(parsed.last().toString().contains("Copied 0 of 2"))
+        assertTrue(parsed.first().toString().contains("small"))
+        assertTrue(parsed.last().toString().contains("Copied 1 of 2"))
+    }
+
+    @Test
+    fun `single structurally dense item makes progress when pretty output exceeds cap`() {
+        var nested: JsonElement = JsonPrimitive("value")
+        repeat(10) { index ->
+            val child = nested
+            nested = buildJsonObject { put("k$index", child) }
+        }
+        val item = Item(nested as JsonObject)
+
+        val copied = inspectorOutputText(listOf(item), maxChars = 300)
+        val parsed = Json.parseToJsonElement(copied) as JsonArray
+
+        assertTrue(copied.length <= 300)
+        assertTrue(parsed.last().toString().contains("Copied 0 of 1"))
     }
 
     @Test

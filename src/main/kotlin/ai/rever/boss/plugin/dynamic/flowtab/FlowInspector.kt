@@ -106,7 +106,7 @@ internal fun inspectorOutputText(
         val remaining = estimateBudget - estimatedChars
         if (remaining <= 1) break
         val itemChars = compactJsonLength(item.json, remaining)
-        if (itemChars > remaining) break
+        if (itemChars > remaining) continue
         included += item.json
         estimatedChars += itemChars + 1
     }
@@ -120,8 +120,8 @@ internal fun inspectorOutputText(
         val marker = JsonObject(
             mapOf(
                 "_boss_copy_truncated" to JsonPrimitive(
-                    "Copied ${included.size} of ${output.size} output items; remaining items were omitted " +
-                        "to keep clipboard text below 512 KiB.",
+                    "Copied ${included.size} of ${output.size} output items; oversized items were skipped " +
+                        "to keep clipboard text below $maxChars characters.",
                 ),
             ),
         )
@@ -130,7 +130,7 @@ internal fun inspectorOutputText(
             JsonArray(included + marker),
         )
         if (truncated.length <= maxChars || included.isEmpty()) return truncated
-        included.subList((included.size + 1) / 2, included.size).clear()
+        included.subList(included.size / 2, included.size).clear()
     }
 }
 
@@ -371,15 +371,10 @@ private fun OutputTab(state: FlowGraphState, node: FlowNode, copyText: (String) 
         CopyableFieldLabel(
             label = "Output (${run.output.size} item${if (run.output.size == 1) "" else "s"})",
             text = { inspectorOutputText(completeOutput) },
-            copyDescription = "Copy output JSON, including collapsed values; capped at 512 KiB",
+            copyDescription = "Copy output JSON, including collapsed values; capped at 512K characters",
             buttonLabel = "Copy output",
             copyKey = node.id to "output",
             copyText = copyText,
-        )
-        Text(
-            "Clipboard copy is capped at 512 KiB; truncated copies include a JSON marker.",
-            color = Muted,
-            fontSize = 10.sp,
         )
         // Collapsible JSON tree — click a node to fold/unfold; values are selectable
         // for copy. Replaces the flat dump so deep/large extracts stay readable.
@@ -526,7 +521,7 @@ private fun StatusBanner(nodeId: String, run: NodeRun?, copyText: (String) -> Bo
                     text = { err },
                     description = if (truncated) "Copy complete error text" else "Copy error text",
                     buttonLabel = if (truncated) "Copy full" else "Copy",
-                    feedbackKey = nodeId to "error-preview",
+                    feedbackKey = nodeId to err,
                     copyText = copyText,
                 )
             }
