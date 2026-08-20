@@ -681,6 +681,69 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `indexed schedule pass decodes only flows with durable cursors`() = runBlocking {
+        val storage = object : DesktopStorage() {
+            val graphReads = AtomicInteger()
+            override suspend fun getJson(key: String): String? {
+                if (key.startsWith(FlowController.GRAPH_PREFIX)) graphReads.incrementAndGet()
+                return super.getJson(key)
+            }
+        }
+        val fc = controller(storage)
+        val scheduled = fc.createFlow()
+        fc.createFlow()
+        fc.updateSchedule(scheduled, intervalMinutes = 10, nowEpochMs = 0)
+        storage.graphReads.set(0)
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 1, discoverSchedules = false)
+
+            assertEquals(1, storage.graphReads.get())
+            assertEquals(600_000L, fc.scheduleState(scheduled)?.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `backward clock correction reanchors a far future cursor`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+        fc.updateSchedule(tabId, intervalMinutes = 1, nowEpochMs = 1_000_000)
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0, discoverSchedules = false)
+            assertEquals(60_000L, fc.scheduleState(tabId)?.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `fresh controller resumes a due cursor exactly once after reload`() = runBlocking {
+        val storage = DesktopStorage()
+        val first = controller(storage)
+        val tabId = first.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        first.addNode(tabId, "TRIGGER")
+        first.runSchedulePass(nowEpochMs = 0)
+        first.runSchedulePass(nowEpochMs = 60_000)
+        val firstRunId = assertNotNull(first.scheduleState(tabId)?.lastRunId)
+        assertEquals(RunJobState.SUCCEEDED, awaitTerminal(first, firstRunId).state)
+        first.dispose()
+
+        val reloaded = controller(storage)
+        try {
+            reloaded.runSchedulePass(nowEpochMs = 120_000, discoverSchedules = false)
+            val resumedRunId = assertNotNull(reloaded.scheduleState(tabId)?.lastRunId)
+            assertTrue(resumedRunId != firstRunId)
+            assertEquals(180_000L, reloaded.scheduleState(tabId)?.nextRunAtEpochMs)
+        } finally {
+            reloaded.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
+    @Test
     fun `late schedule pass advances from prior deadline without catch-up burst`() = runBlocking {
         val fc = controller()
         val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
@@ -759,6 +822,39 @@ class FlowControllerTest {
         } finally {
             fc.dispose()
             runScope.cancel()
+        }
+    }
+
+    @Test
+    fun `schedule pass caps simultaneous scheduled dispatches`() = runBlocking {
+        val entered = AtomicInteger()
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val fc = FlowController(
+            context = context(DesktopStorage()),
+            scopeProvider = { runScope },
+            registry = hangingRegistry("SCHEDULE_CAP_HANG") { entered.incrementAndGet() },
+        )
+        val tabIds = List(FlowController.MAX_CONCURRENT_SCHEDULED_RUNS + 1) {
+            fc.createFlow(FlowMeta(schedule = FlowSchedule(1))).also { tabId ->
+                fc.addNode(tabId, "SCHEDULE_CAP_HANG")
+            }
+        }
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            fc.runSchedulePass(nowEpochMs = 60_000)
+
+            assertEquals(
+                FlowController.MAX_CONCURRENT_SCHEDULED_RUNS,
+                tabIds.count { fc.scheduleState(it)?.lastRunId != null },
+            )
+            withTimeout(5_000) {
+                while (entered.get() != FlowController.MAX_CONCURRENT_SCHEDULED_RUNS) delay(10)
+            }
+        } finally {
+            fc.dispose()
+            runScope.cancel()
+            tabIds.forEach(FlowPersistenceCoordinator::forget)
         }
     }
 
