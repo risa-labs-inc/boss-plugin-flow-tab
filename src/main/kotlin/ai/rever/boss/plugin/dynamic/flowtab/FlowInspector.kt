@@ -39,6 +39,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -52,7 +53,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -129,7 +133,7 @@ fun FlowInspector(
         }
 
         // Run status of this node — the first thing you want when a flow finishes.
-        StatusBanner(state.runStates[node.id], copyText)
+        StatusBanner(node.id, state.runStates[node.id], copyText)
 
         // Title editor
         FieldLabel("Name")
@@ -216,10 +220,12 @@ private fun ParametersTab(node: FlowNode) {
 private fun JsonTab(node: FlowNode, copyText: (String) -> Boolean) {
     var text by remember(node.id) { mutableStateOf(prettyJson.encodeToString(JsonObject.serializer(), node.config)) }
     var error by remember(node.id) { mutableStateOf<String?>(null) }
+    val displayedText = text
     CopyableFieldLabel(
         label = "Config (raw JSON)",
-        text = { text },
+        text = { displayedText },
         copyDescription = "Copy displayed config JSON",
+        copyKey = node.id to "config",
         copyText = copyText,
     )
     TextInput(text, singleLine = false, mono = true, error = error != null) {
@@ -251,21 +257,35 @@ private fun OutputTab(state: FlowGraphState, node: FlowNode, copyText: (String) 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         // Status shown in the always-visible banner above; here we focus on detail.
         if (run.error != null) {
-            CopyableFieldLabel("Error", { run.error }, "Copy complete error text", copyText = copyText)
+            CopyableFieldLabel(
+                "Error",
+                { run.error },
+                "Copy complete error text",
+                copyKey = node.id to "error",
+                copyText = copyText,
+            )
             SelectionContainer { Text(run.error, color = FlowTheme.Error, fontSize = 12.sp) }
         }
         if (run.logs.isNotEmpty()) {
-            val logsText = inspectorLogsText(run.logs)
-            CopyableFieldLabel("Logs", { logsText }, "Copy complete log text", copyText = copyText)
+            val logsText = remember(run.logs) { inspectorLogsText(run.logs) }
+            CopyableFieldLabel(
+                "Logs",
+                { logsText },
+                "Copy complete log text",
+                copyKey = node.id to "logs",
+                copyText = copyText,
+            )
             SelectionContainer {
                 Text(logsText, color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
             }
         }
+        val completeOutput = run.output
         CopyableFieldLabel(
             label = "Output (${run.output.size} item${if (run.output.size == 1) "" else "s"})",
-            text = { inspectorOutputText(run.output) },
+            text = { inspectorOutputText(completeOutput) },
             copyDescription = "Copy complete output JSON, including collapsed values",
             buttonLabel = "Copy all",
+            copyKey = node.id to "output",
             copyText = copyText,
         )
         // Collapsible JSON tree — click a node to fold/unfold; values are selectable
@@ -356,7 +376,7 @@ private fun JsonLeaf(label: String?, prim: JsonPrimitive, depth: Int) {
  * updates live while a flow executes.
  */
 @Composable
-private fun StatusBanner(run: NodeRun?, copyText: (String) -> Boolean) {
+private fun StatusBanner(nodeId: String, run: NodeRun?, copyText: (String) -> Boolean) {
     val status = run?.status
     val color = runStatusColor(status) ?: FlowTheme.TextFaint
     val label = when (status) {
@@ -413,6 +433,7 @@ private fun StatusBanner(run: NodeRun?, copyText: (String) -> Boolean) {
                     text = { err },
                     description = if (truncated) "Copy complete error text" else "Copy error text",
                     buttonLabel = if (truncated) "Copy full" else "Copy",
+                    feedbackKey = nodeId to "error-preview",
                     copyText = copyText,
                 )
             }
@@ -426,12 +447,13 @@ private fun CopyableFieldLabel(
     text: () -> String,
     copyDescription: String,
     buttonLabel: String = "Copy",
+    copyKey: Any,
     copyText: (String) -> Boolean,
 ) {
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         FieldLabel(label)
         Spacer(Modifier.weight(1f))
-        CopyButton(text, copyDescription, buttonLabel, copyText)
+        CopyButton(text, copyDescription, buttonLabel, copyKey, copyText)
     }
 }
 
@@ -442,10 +464,12 @@ private fun CopyButton(
     text: () -> String,
     description: String,
     buttonLabel: String,
+    feedbackKey: Any,
     copyText: (String) -> Boolean,
 ) {
-    var result by remember(description) { mutableStateOf<Boolean?>(null) }
-    var attempt by remember(description) { mutableStateOf(0) }
+    val scope = rememberCoroutineScope()
+    var result by remember(feedbackKey) { mutableStateOf<Boolean?>(null) }
+    var attempt by remember(feedbackKey) { mutableStateOf(0) }
     LaunchedEffect(attempt) {
         if (attempt > 0) {
             delay(1_500)
@@ -481,8 +505,12 @@ private fun CopyButton(
                 .clip(RoundedCornerShape(FlowTheme.rSm))
                 .border(1.dp, PanelBorder, RoundedCornerShape(FlowTheme.rSm))
                 .clickable(onClickLabel = description, role = Role.Button) {
-                    result = copyText(text())
-                    attempt += 1
+                    scope.launch {
+                        result = withContext(Dispatchers.Default) {
+                            runCatching { copyText(text()) }.getOrDefault(false)
+                        }
+                        attempt += 1
+                    }
                 }
                 .padding(horizontal = 6.dp, vertical = 3.dp),
             verticalAlignment = Alignment.CenterVertically,

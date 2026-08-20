@@ -604,7 +604,7 @@ class FlowTabComponent(
                     if (path != null) runCatching { java.io.File(path).writeText(text) }
                 }
             } else {
-                context.clipboardProvider?.setText(text)
+                copyInspectorText(context, text)
             }
         }
 
