@@ -884,7 +884,13 @@ class FlowTabComponent(
                 }
 
                 if (selectedNode != null) {
-                    FlowInspector(state, selectedNode)
+                    FlowInspector(
+                        state = state,
+                        node = selectedNode,
+                        copyText = { text ->
+                            runCatching { context.clipboardProvider?.setText(text) == true }.getOrDefault(false)
+                        },
+                    )
                 }
             }
         }

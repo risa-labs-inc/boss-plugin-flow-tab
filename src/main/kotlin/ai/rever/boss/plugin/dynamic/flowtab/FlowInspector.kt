@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.TooltipArea
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -28,9 +30,12 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.Icon
 import androidx.compose.material.Text
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -40,12 +45,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -73,12 +80,24 @@ private fun setConfig(node: FlowNode, key: String, value: String) {
 private fun configValue(node: FlowNode, field: ConfigField): String =
     (node.config[field.key] as? JsonPrimitive)?.content ?: field.default
 
+/** Complete, pretty-printed output copied by the inspector's explicit action. */
+internal fun inspectorOutputText(output: List<Item>): String =
+    prettyJson.encodeToString(JsonElement.serializer(), JsonArray(output.map { it.json }))
+
+/** Preserve every stored log boundary in the copied block. */
+internal fun inspectorLogsText(logs: List<String>): String = logs.joinToString("\n")
+
 /**
  * Right-side inspector for the selected node: edit its title + config fields
  * (Parameters), edit raw config JSON, and view the last run's output + logs.
  */
 @Composable
-fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Modifier) {
+fun FlowInspector(
+    state: FlowGraphState,
+    node: FlowNode,
+    copyText: (String) -> Boolean,
+    modifier: Modifier = Modifier,
+) {
     // Default to the Output tab once a node has run, so its extracted data (or error)
     // is the first thing shown; otherwise start on Parameters.
     var tab by remember(node.id) { mutableStateOf(if (state.runStates[node.id] != null) 2 else 0) } // 0 params, 1 json, 2 output
@@ -110,7 +129,7 @@ fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Mo
         }
 
         // Run status of this node — the first thing you want when a flow finishes.
-        StatusBanner(state.runStates[node.id])
+        StatusBanner(state.runStates[node.id], copyText)
 
         // Title editor
         FieldLabel("Name")
@@ -126,8 +145,8 @@ fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Mo
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
             when (tab) {
                 0 -> ParametersTab(node)
-                1 -> JsonTab(node)
-                else -> OutputTab(state, node)
+                1 -> JsonTab(node, copyText)
+                else -> OutputTab(state, node, copyText)
             }
         }
     }
@@ -138,16 +157,18 @@ fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Mo
 private fun ParametersTab(node: FlowNode) {
     val fields = node.spec.configFields
     if (node.spec.isUnavailable) {
-        Text(
-            "This node kind (\"${node.kind}\") isn't available in this build — its provider " +
-                "isn't loaded. The node is preserved; edit its raw config in the JSON tab.",
-            color = FlowTheme.Error,
-            fontSize = 12.sp,
-        )
+        SelectionContainer {
+            Text(
+                "This node kind (\"${node.kind}\") isn't available in this build — its provider " +
+                    "isn't loaded. The node is preserved; edit its raw config in the JSON tab.",
+                color = FlowTheme.Error,
+                fontSize = 12.sp,
+            )
+        }
         return
     }
     if (fields.isEmpty()) {
-        Text("This node has no parameters.", color = Muted, fontSize = 12.sp)
+        SelectionContainer { Text("This node has no parameters.", color = Muted, fontSize = 12.sp) }
         return
     }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -185,17 +206,22 @@ private fun ParametersTab(node: FlowNode) {
                 }
                 // Explanatory text only. Deliberately ignore node.config so a legacy
                 // stored value cannot masquerade as a live editable setting.
-                FieldType.INFO -> Text(info, color = Muted, fontSize = 12.sp)
+                FieldType.INFO -> SelectionContainer { Text(info, color = Muted, fontSize = 12.sp) }
             }
         }
     }
 }
 
 @Composable
-private fun JsonTab(node: FlowNode) {
+private fun JsonTab(node: FlowNode, copyText: (String) -> Boolean) {
     var text by remember(node.id) { mutableStateOf(prettyJson.encodeToString(JsonObject.serializer(), node.config)) }
     var error by remember(node.id) { mutableStateOf<String?>(null) }
-    FieldLabel("Config (raw JSON)")
+    CopyableFieldLabel(
+        label = "Config (raw JSON)",
+        text = text,
+        copyDescription = "Copy displayed config JSON",
+        copyText = copyText,
+    )
     TextInput(text, singleLine = false, mono = true, error = error != null) {
         text = it
         error = runCatching {
@@ -204,42 +230,56 @@ private fun JsonTab(node: FlowNode) {
         }.getOrElse { ex -> ex.message ?: "invalid JSON" }
     }
     if (error != null) {
-        Text(
-            "⚠ Invalid JSON — changes not applied: ${error}",
-            color = FlowTheme.Error,
-            fontSize = 11.sp,
-            modifier = Modifier.padding(top = 4.dp)
-        )
+        SelectionContainer {
+            Text(
+                "⚠ Invalid JSON — changes not applied: ${error}",
+                color = FlowTheme.Error,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
     }
 }
 
 @Composable
-private fun OutputTab(state: FlowGraphState, node: FlowNode) {
+private fun OutputTab(state: FlowGraphState, node: FlowNode, copyText: (String) -> Boolean) {
     val run = state.runStates[node.id]
     if (run == null) {
-        Text("Run the flow to see this node's output.", color = Muted, fontSize = 12.sp)
+        SelectionContainer { Text("Run the flow to see this node's output.", color = Muted, fontSize = 12.sp) }
         return
     }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         // Status shown in the always-visible banner above; here we focus on detail.
         if (run.error != null) {
-            FieldLabel("Error")
-            Text(run.error, color = FlowTheme.Error, fontSize = 12.sp)
+            CopyableFieldLabel("Error", run.error, "Copy complete error text", copyText = copyText)
+            SelectionContainer { Text(run.error, color = FlowTheme.Error, fontSize = 12.sp) }
         }
         if (run.logs.isNotEmpty()) {
-            FieldLabel("Logs")
-            Text(run.logs.joinToString("\n"), color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            val logsText = inspectorLogsText(run.logs)
+            CopyableFieldLabel("Logs", logsText, "Copy complete log text", copyText = copyText)
+            SelectionContainer {
+                Text(logsText, color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            }
         }
-        FieldLabel("Output (${run.output.size} item${if (run.output.size == 1) "" else "s"})")
+        val outputText = inspectorOutputText(run.output)
+        CopyableFieldLabel(
+            label = "Output (${run.output.size} item${if (run.output.size == 1) "" else "s"})",
+            text = outputText,
+            copyDescription = "Copy complete output JSON, including collapsed values",
+            buttonLabel = "Copy all",
+            copyText = copyText,
+        )
         // Collapsible JSON tree — click a node to fold/unfold; values are selectable
         // for copy. Replaces the flat dump so deep/large extracts stay readable.
-        Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(FlowTheme.rSm)).background(FieldBg).padding(vertical = 6.dp, horizontal = 8.dp)) {
-            Column {
-                if (run.output.isEmpty()) {
-                    Text("[]", color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                } else {
-                    run.output.forEachIndexed { i, item ->
-                        JsonNode(label = "[$i]", element = item.json, depth = 0)
+        SelectionContainer {
+            Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(FlowTheme.rSm)).background(FieldBg).padding(vertical = 6.dp, horizontal = 8.dp)) {
+                Column {
+                    if (run.output.isEmpty()) {
+                        Text("[]", color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                    } else {
+                        run.output.forEachIndexed { i, item ->
+                            JsonNode(label = "[$i]", element = item.json, depth = 0)
+                        }
                     }
                 }
             }
@@ -307,7 +347,7 @@ private fun JsonLeaf(label: String?, prim: JsonPrimitive, depth: Int) {
         if (label != null) {
             Text("$label: ", color = JsonKeyColor, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
         }
-        SelectionContainer { Text(text, color = color, fontSize = 11.sp, fontFamily = FontFamily.Monospace) }
+        Text(text, color = color, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
     }
 }
 
@@ -317,7 +357,7 @@ private fun JsonLeaf(label: String?, prim: JsonPrimitive, depth: Int) {
  * updates live while a flow executes.
  */
 @Composable
-private fun StatusBanner(run: NodeRun?) {
+private fun StatusBanner(run: NodeRun?, copyText: (String) -> Boolean) {
     val status = run?.status
     val color = runStatusColor(status) ?: FlowTheme.TextFaint
     val label = when (status) {
@@ -338,23 +378,116 @@ private fun StatusBanner(run: NodeRun?) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(8.dp).clip(CircleShape).background(color))
             Spacer(Modifier.width(8.dp))
-            Text(
-                label,
-                color = if (status == null) FlowTheme.TextMuted else color,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold
-            )
+            SelectionContainer {
+                Text(
+                    label,
+                    color = if (status == null) FlowTheme.TextMuted else color,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
         }
         val err = run?.error
         if (status == RunStatus.ERROR && !err.isNullOrBlank()) {
-            Text(
-                err,
-                color = FlowTheme.TextMuted,
-                fontSize = 11.sp,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(top = 4.dp)
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    SelectionContainer {
+                        Text(
+                            err,
+                            color = FlowTheme.TextMuted,
+                            fontSize = 11.sp,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    Text("Preview · Copy full uses the complete error", color = Muted, fontSize = 9.sp)
+                }
+                CopyButton(
+                    text = err,
+                    description = "Copy complete error text",
+                    buttonLabel = "Copy full",
+                    copyText = copyText,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CopyableFieldLabel(
+    label: String,
+    text: String,
+    copyDescription: String,
+    buttonLabel: String = "Copy",
+    copyText: (String) -> Boolean,
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        FieldLabel(label)
+        Spacer(Modifier.weight(1f))
+        CopyButton(text, copyDescription, buttonLabel, copyText)
+    }
+}
+
+/** Explicit clipboard action with platform-independent host wiring and brief feedback. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CopyButton(
+    text: String,
+    description: String,
+    buttonLabel: String,
+    copyText: (String) -> Boolean,
+) {
+    var result by remember(text, description) { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(result) {
+        if (result != null) {
+            delay(1_500)
+            result = null
+        }
+    }
+    val visibleLabel = when (result) {
+        true -> "Copied"
+        false -> "Copy failed"
+        null -> buttonLabel
+    }
+    val tooltip = when (result) {
+        true -> "$description — copied"
+        false -> "$description — clipboard unavailable"
+        null -> description
+    }
+    TooltipArea(
+        delayMillis = 350,
+        tooltip = {
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(FlowTheme.rSm))
+                    .background(Color(0xFF111114))
+                    .border(1.dp, PanelBorder, RoundedCornerShape(FlowTheme.rSm))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(tooltip, color = Color.White, fontSize = 11.sp)
+            }
+        },
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(FlowTheme.rSm))
+                .border(1.dp, PanelBorder, RoundedCornerShape(FlowTheme.rSm))
+                .clickable(onClickLabel = description, role = Role.Button) { result = copyText(text) }
+                .padding(horizontal = 6.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Icon(
+                imageVector = if (result == true) Icons.Filled.Check else Icons.Filled.ContentCopy,
+                contentDescription = null,
+                tint = if (result == true) FlowTheme.Success else FlowTheme.TextMuted,
+                modifier = Modifier.size(12.dp),
             )
+            Text(visibleLabel, color = FlowTheme.TextMuted, fontSize = 10.sp)
         }
     }
 }
