@@ -195,7 +195,7 @@ class FlowMcpToolProvider(
             })
         },
         def("flow_list", "List every stored flow's tabId. Pass detail=true to also return " +
-            "flowDetails with names, descriptions, node counts, and readability.",
+            "flowDetails with metadata, schedule status, node counts, and readability.",
             schema("""{"detail":{"type":"boolean"}}"""), readOnly = true) { a ->
             val detail = a.obj().bool("detail")
             val details = if (detail) controller.listFlowDetails() else null

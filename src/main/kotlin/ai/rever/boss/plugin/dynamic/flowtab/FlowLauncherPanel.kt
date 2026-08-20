@@ -412,10 +412,9 @@ class FlowLauncherComponent(
                             operationError = null
                             scope.launch {
                                 try {
-                                    val scheduled = requireNotNull(controller).updateSchedule(
-                                        flow.tabId,
-                                        selectedMinutes,
-                                    )
+                                    val scheduled = withContext(Dispatchers.IO) {
+                                        requireNotNull(controller).updateSchedule(flow.tabId, selectedMinutes)
+                                    }
                                     savedFlows = savedFlows.map { current ->
                                         if (current.tabId == flow.tabId) scheduled else current
                                     }
@@ -441,7 +440,9 @@ class FlowLauncherComponent(
                                     operationError = null
                                     scope.launch {
                                         try {
-                                            val disabled = requireNotNull(controller).updateSchedule(flow.tabId, null)
+                                            val disabled = withContext(Dispatchers.IO) {
+                                                requireNotNull(controller).updateSchedule(flow.tabId, null)
+                                            }
                                             savedFlows = savedFlows.map { current ->
                                                 if (current.tabId == flow.tabId) disabled else current
                                             }

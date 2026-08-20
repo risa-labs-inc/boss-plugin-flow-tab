@@ -287,6 +287,12 @@ data class EdgeModel(
     val toPort: Int
 )
 
+@Serializable
+data class FlowSchedule(
+    /** Fixed interval cadence owned by the Flow plugin. */
+    val intervalMinutes: Long,
+)
+
 /**
  * Optional descriptive metadata for a flow / lanager. Present on templates,
  * agent-driven workflows, and named UI-created flows; null on legacy or unnamed
@@ -295,12 +301,6 @@ data class EdgeModel(
  * @param inputs names of the values the flow expects to be supplied at run time
  *   (used by lanager templates + the MCP `flow_run` contract).
  */
-@Serializable
-data class FlowSchedule(
-    /** Fixed interval cadence owned by the Flow plugin. */
-    val intervalMinutes: Long,
-)
-
 @Serializable
 data class FlowMeta(
     val name: String = "",

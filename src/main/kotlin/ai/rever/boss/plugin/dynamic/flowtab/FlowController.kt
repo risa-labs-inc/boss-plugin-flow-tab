@@ -114,6 +114,7 @@ class FlowController(
     private val runStates = ConcurrentHashMap<String, ConcurrentHashMap<String, NodeRun>>()
     /** Prevent duplicate dispatch if persisting a newly-started scheduler cursor fails. */
     private val scheduledExecutions = ConcurrentHashMap<String, String>()
+    private val scheduleFailureTypes = ConcurrentHashMap<String, String>()
     private val persistMutex = Mutex()
     private val schedulePassMutex = Mutex()
     /** Independent from pluginScope so controller-owned work survives a sandbox watchdog
@@ -386,6 +387,9 @@ class FlowController(
             }
         }
         val prior = loadScheduleState(tabId)
+        // A cadence edit resets the durable cursor. Do not let an old in-memory
+        // dispatch overwrite that new phase on the next reconciliation pass.
+        scheduledExecutions.remove(tabId)
         val nextRunAt = intervalMinutes?.let { nowEpochMs + intervalMillis(it) }
         if (intervalMinutes == null) {
             storage.removeJsonValue(scheduleKey(tabId))
@@ -434,60 +438,82 @@ class FlowController(
     internal suspend fun runSchedulePass(nowEpochMs: Long = System.currentTimeMillis()) {
         schedulePassMutex.withLock {
             listFlows().forEach { tabId ->
-                val schedule = getFlow(tabId)?.metadata?.schedule ?: return@forEach
-                if (schedule.intervalMinutes !in MIN_SCHEDULE_INTERVAL_MINUTES..MAX_SCHEDULE_INTERVAL_MINUTES) {
-                    return@forEach
+                try {
+                    reconcileScheduledFlow(tabId, nowEpochMs)
+                    scheduleFailureTypes.remove(tabId)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    val failureType = failure::class.simpleName ?: "Exception"
+                    if (scheduleFailureTypes.put(tabId, failureType) != failureType) {
+                        val safeTabId = tabId.filterNot(Char::isISOControl).take(80)
+                        println("[flow-tab] schedule '$safeTabId' failed with $failureType; later flows continue")
+                    }
                 }
-                val intervalMs = intervalMillis(schedule.intervalMinutes)
-                var state = loadScheduleState(tabId)
-                if (state == null || state.intervalMinutes != schedule.intervalMinutes || state.nextRunAtEpochMs == null) {
-                    state = FlowScheduleState(
-                        tabId = tabId,
-                        intervalMinutes = schedule.intervalMinutes,
-                        lastRunAtEpochMs = state?.lastRunAtEpochMs,
-                        nextRunAtEpochMs = nowEpochMs + intervalMs,
-                        lastRunId = state?.lastRunId,
-                        lastRunState = state?.lastRunState,
-                    )
-                    persistScheduleState(state)
-                    return@forEach
-                }
-
-                val trackedRunId = scheduledExecutions[tabId] ?: state.lastRunId
-                val priorJob = trackedRunId?.let { runStatus(it) }
-                if (priorJob != null &&
-                    (trackedRunId != state.lastRunId || priorJob.state != state.lastRunState)
-                ) {
-                    val recoveredDispatch = trackedRunId != state.lastRunId
-                    state = state.copy(
-                        lastRunAtEpochMs = if (recoveredDispatch) nowEpochMs else state.lastRunAtEpochMs,
-                        nextRunAtEpochMs = if (recoveredDispatch) nowEpochMs + intervalMs else state.nextRunAtEpochMs,
-                        lastRunId = trackedRunId,
-                        lastRunState = priorJob.state,
-                    )
-                    persistScheduleState(state)
-                }
-                // Fixed-interval schedules never overlap. A long run may start the next
-                // invocation immediately after it terminates, but never while active.
-                if (priorJob?.state == RunJobState.RUNNING) return@forEach
-                if (nowEpochMs < requireNotNull(state.nextRunAtEpochMs)) return@forEach
-
-                val runId = startRun(tabId)
-                scheduledExecutions[tabId] = runId
-                persistScheduleState(
-                    state.copy(
-                        lastRunAtEpochMs = nowEpochMs,
-                        nextRunAtEpochMs = nextScheduledDeadline(
-                            previousDeadlineEpochMs = requireNotNull(state.nextRunAtEpochMs),
-                            nowEpochMs = nowEpochMs,
-                            intervalMs = intervalMs,
-                        ),
-                        lastRunId = runId,
-                        lastRunState = RunJobState.RUNNING,
-                    ),
-                )
             }
         }
+    }
+
+    private suspend fun reconcileScheduledFlow(tabId: String, nowEpochMs: Long) {
+        val schedule = getFlow(tabId)?.metadata?.schedule ?: return
+        if (schedule.intervalMinutes !in MIN_SCHEDULE_INTERVAL_MINUTES..MAX_SCHEDULE_INTERVAL_MINUTES) return
+        val intervalMs = intervalMillis(schedule.intervalMinutes)
+        var state = loadScheduleState(tabId)
+        if (state == null || state.intervalMinutes != schedule.intervalMinutes || state.nextRunAtEpochMs == null) {
+            state = FlowScheduleState(
+                tabId = tabId,
+                intervalMinutes = schedule.intervalMinutes,
+                lastRunAtEpochMs = state?.lastRunAtEpochMs,
+                nextRunAtEpochMs = nowEpochMs + intervalMs,
+                lastRunId = state?.lastRunId,
+                lastRunState = state?.lastRunState,
+            )
+            persistScheduleState(state)
+            return
+        }
+
+        val trackedRunId = scheduledExecutions[tabId] ?: state.lastRunId
+        val priorJob = trackedRunId?.let { runStatus(it) }
+        if (priorJob != null &&
+            (trackedRunId != state.lastRunId || priorJob.state != state.lastRunState)
+        ) {
+            val recoveredDispatch = trackedRunId != state.lastRunId
+            state = state.copy(
+                lastRunAtEpochMs = if (recoveredDispatch) nowEpochMs else state.lastRunAtEpochMs,
+                nextRunAtEpochMs = if (recoveredDispatch) {
+                    nextScheduledDeadline(
+                        previousDeadlineEpochMs = requireNotNull(state.nextRunAtEpochMs),
+                        nowEpochMs = nowEpochMs,
+                        intervalMs = intervalMs,
+                    )
+                } else {
+                    state.nextRunAtEpochMs
+                },
+                lastRunId = trackedRunId,
+                lastRunState = priorJob.state,
+            )
+            persistScheduleState(state)
+        }
+        // Scheduled invocations never overlap one another or an MCP/headless run
+        // owned by this controller. Visible canvas runs use an independent controller.
+        if (priorJob?.state == RunJobState.RUNNING) return
+        if (nowEpochMs < requireNotNull(state.nextRunAtEpochMs)) return
+        if (executions.keys.any { runId -> jobs[runId]?.tabId == tabId }) return
+
+        val runId = startRun(tabId)
+        scheduledExecutions[tabId] = runId
+        persistScheduleState(
+            state.copy(
+                lastRunAtEpochMs = nowEpochMs,
+                nextRunAtEpochMs = nextScheduledDeadline(
+                    previousDeadlineEpochMs = requireNotNull(state.nextRunAtEpochMs),
+                    nowEpochMs = nowEpochMs,
+                    intervalMs = intervalMs,
+                ),
+                lastRunId = runId,
+                lastRunState = RunJobState.RUNNING,
+            ),
+        )
     }
 
     internal suspend fun scheduleState(tabId: String): FlowScheduleState? = loadScheduleState(tabId)

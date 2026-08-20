@@ -594,6 +594,93 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `schedule edit clears stale in-memory dispatch before re-enable`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        fc.addNode(tabId, "TRIGGER")
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            fc.runSchedulePass(nowEpochMs = 60_000)
+            assertNotNull(fc.scheduleState(tabId)?.lastRunId)
+
+            fc.updateSchedule(tabId, null, nowEpochMs = 70_000)
+            fc.updateSchedule(tabId, 1, nowEpochMs = 80_000)
+            fc.runSchedulePass(nowEpochMs = 80_001)
+
+            val reenabled = fc.scheduleState(tabId)!!
+            assertNull(reenabled.lastRunId)
+            assertNull(reenabled.lastRunAtEpochMs)
+            assertEquals(140_000L, reenabled.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `schedule interval enforces inclusive minute bounds`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+
+        try {
+            assertFailsWith<IllegalArgumentException> { fc.updateSchedule(tabId, 0) }
+            assertFailsWith<IllegalArgumentException> {
+                fc.updateSchedule(tabId, FlowController.MAX_SCHEDULE_INTERVAL_MINUTES + 1)
+            }
+            assertEquals(
+                FlowController.MIN_SCHEDULE_INTERVAL_MINUTES,
+                fc.updateSchedule(tabId, FlowController.MIN_SCHEDULE_INTERVAL_MINUTES)
+                    .schedule?.intervalMinutes,
+            )
+            assertEquals(
+                FlowController.MAX_SCHEDULE_INTERVAL_MINUTES,
+                fc.updateSchedule(tabId, FlowController.MAX_SCHEDULE_INTERVAL_MINUTES)
+                    .schedule?.intervalMinutes,
+            )
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `schedule graph update blocks an older canvas autosave`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow(FlowMeta(name = "Coordinated"))
+        val stale = assertNotNull(fc.getFlow(tabId))
+
+        try {
+            fc.updateSchedule(tabId, 10, nowEpochMs = 0)
+            val update = assertNotNull(FlowPersistenceCoordinator.latestGraphUpdate(tabId))
+            assertEquals(10L, update.snapshot.metadata?.schedule?.intervalMinutes)
+
+            FlowPersistenceCoordinator.persistAutosave(tabId, stale, appliedGraphRevision = 0) { snapshot ->
+                storage.putJson(
+                    "${FlowController.GRAPH_PREFIX}$tabId",
+                    kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), snapshot),
+                )
+            }
+            assertEquals(10L, fc.getFlow(tabId)?.metadata?.schedule?.intervalMinutes)
+        } finally {
+            fc.deleteFlow(tabId)
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `schedule runner is memoized and cancelled by disposal`() = runBlocking {
+        val fc = controller()
+        val first = fc.startScheduleRunner(pollIntervalMs = 10)
+        val second = fc.startScheduleRunner(pollIntervalMs = 10)
+        assertSame(first, second)
+
+        fc.dispose()
+        withTimeout(5_000) { first.join() }
+        assertTrue(first.isCancelled)
+        assertFailsWith<IllegalStateException> { fc.startScheduleRunner(pollIntervalMs = 10) }
+    }
+
+    @Test
     fun `late schedule pass advances from prior deadline without catch-up burst`() = runBlocking {
         val fc = controller()
         val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
@@ -672,6 +759,57 @@ class FlowControllerTest {
         } finally {
             fc.dispose()
             runScope.cancel()
+        }
+    }
+
+    @Test
+    fun `schedule pass does not overlap a manual headless run of the flow`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val fc = FlowController(
+            context = context(DesktopStorage()),
+            scopeProvider = { runScope },
+            registry = hangingRegistry("MANUAL_SCHEDULE_HANG") { entered.complete(Unit) },
+        )
+        val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        fc.addNode(tabId, "MANUAL_SCHEDULE_HANG")
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            fc.startRun(tabId)
+            withTimeout(5_000) { entered.await() }
+
+            fc.runSchedulePass(nowEpochMs = 60_000)
+            assertNull(fc.scheduleState(tabId)?.lastRunId)
+        } finally {
+            fc.dispose()
+            runScope.cancel()
+        }
+    }
+
+    @Test
+    fun `one schedule cursor failure does not block later flows`() = runBlocking {
+        val storage = object : DesktopStorage() {
+            var failingKey: String? = null
+            override suspend fun putJson(key: String, jsonValue: String) {
+                if (key == failingKey) error("test cursor failure")
+                super.putJson(key, jsonValue)
+            }
+        }
+        val fc = controller(storage)
+        val first = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        val second = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        fc.addNode(first, "TRIGGER")
+        fc.addNode(second, "TRIGGER")
+        fc.runSchedulePass(nowEpochMs = 0)
+        val ordered = listOf(first, second).sorted()
+        storage.failingKey = "${FlowController.SCHEDULE_STATE_PREFIX}${ordered.first()}"
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 60_000)
+            assertNotNull(fc.scheduleState(ordered.last())?.lastRunId)
+        } finally {
+            fc.dispose()
         }
     }
 
