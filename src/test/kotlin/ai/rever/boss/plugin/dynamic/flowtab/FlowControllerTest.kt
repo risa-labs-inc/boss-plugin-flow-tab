@@ -943,6 +943,51 @@ class FlowControllerTest {
         assertFalse(fc.deleteFlow("flow-missing"))
     }
 
+    @Test
+    fun `deleteFlow suppresses a terminal persist queued after deletion`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val nodeFinished = CompletableDeferred<Unit>()
+        val registry = builtinNodeRegistry().also {
+            it.register(
+                NodeSpec(
+                    id = "DELETE_RACE",
+                    label = "Delete race",
+                    inputs = 0,
+                    outputs = 1,
+                    accent = 0,
+                    description = "test only",
+                    runMode = RunMode.ONCE,
+                    executor = NodeExecutor { _, _, _, _ ->
+                        entered.complete(Unit)
+                        withContext(NonCancellable) { release.await() }
+                        nodeFinished.complete(Unit)
+                        NodeOutput.EMPTY
+                    },
+                )
+            )
+        }
+        val storage = DesktopStorage()
+        val fc = controller(storage, registry, runTimeoutMs = 5_000)
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "DELETE_RACE")
+        val runId = fc.startRun(tabId)
+        try {
+            withTimeout(5_000) { entered.await() }
+            assertTrue(fc.deleteFlow(tabId))
+            release.complete(Unit)
+            withTimeout(5_000) { nodeFinished.await() }
+            delay(100)
+
+            assertNull(storage.getJson("${FlowController.RUN_PREFIX}$runId"))
+            assertNull(FlowPersistenceCoordinator.runUpdate(runId))
+        } finally {
+            release.complete(Unit)
+            fc.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
     // ---- async run job ------------------------------------------------------
 
     private suspend fun awaitTerminal(fc: FlowController, runId: String): RunJob =

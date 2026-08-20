@@ -309,6 +309,74 @@ class FlowMcpToolProviderTest {
     }
 
     @Test
+    fun `cross-controller live result reports scrubbed content then hydrates terminal output`() = runBlocking {
+        val storage = FakeStorage()
+        val owner = FlowController(context(storage), { scope })
+        val observer = FlowController(context(storage), { scope })
+        val p = FlowMcpToolProvider(observer, PromptRegistry(storage))
+        val tabId = owner.createFlow()
+        val runId = "run-cross-result-${java.util.UUID.randomUUID()}"
+        val output = buildJsonObject { put("payload", "complete") }
+        val running = RunJob(
+            runId = runId,
+            tabId = tabId,
+            state = RunJobState.RUNNING,
+            startedAtMs = 1L,
+            nodes = mapOf(
+                "node" to NodeRunSnap(
+                    status = RunStatus.SUCCESS,
+                    logs = listOf("live progress"),
+                    output = listOf(output),
+                ),
+            ),
+        )
+        try {
+            owner.publishCanvasRun(running, persist = false)
+
+            val status = obj(call(p, "flow_status", """{"runId":"$runId"}"""))
+            assertEquals("RUNNING", status.getValue("state").jsonPrimitive.content)
+            val live = obj(
+                call(
+                    p,
+                    "flow_result",
+                    """{"runId":"$runId","nodeId":"node","includeOutput":true}""",
+                )
+            )
+            assertEquals("false", live.getValue("contentComplete").jsonPrimitive.content)
+            assertEquals("false", live.getValue("outputIncluded").jsonPrimitive.content)
+            assertEquals("true", live.getValue("outputOmitted").jsonPrimitive.content)
+            assertEquals("true", live.getValue("truncated").jsonPrimitive.content)
+
+            owner.publishCanvasRun(running.copy(state = RunJobState.SUCCEEDED))
+            val terminal = withTimeout(5_000) {
+                while (true) {
+                    val candidate = obj(
+                        call(
+                            p,
+                            "flow_result",
+                            """{"runId":"$runId","nodeId":"node","includeOutput":true}""",
+                        )
+                    )
+                    if (candidate.getValue("state").jsonPrimitive.content == "SUCCEEDED") {
+                        return@withTimeout candidate
+                    }
+                    delay(10)
+                }
+                error("unreachable")
+            }
+            assertEquals("true", terminal.getValue("contentComplete").jsonPrimitive.content)
+            assertEquals("true", terminal.getValue("outputIncluded").jsonPrimitive.content)
+            assertEquals("false", terminal.getValue("outputOmitted").jsonPrimitive.content)
+            assertEquals(listOf(output), terminal.getValue("nodes").jsonObject
+                .getValue("node").jsonObject.getValue("output").jsonArray.map { it.jsonObject })
+        } finally {
+            owner.dispose()
+            observer.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
+    @Test
     fun `flow_runs lists only the requested flow newest first with bounded summaries`() = runBlocking {
         val p = provider()
         val tabId = obj(call(p, "flow_create", """{"name":"History"}"""))

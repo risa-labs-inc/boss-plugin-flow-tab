@@ -300,9 +300,10 @@ class FlowMcpToolProvider(
     }
 
     private fun RunJob.toMcpResult(includeOutput: Boolean, nodeId: String?): JsonObject {
-        var contentTruncated = false
+        var contentTruncated = !contentComplete
         val selectedNodes = if (nodeId == null) nodes else mapOf(nodeId to nodes.getValue(nodeId))
-        val outputOmitted = !includeOutput && selectedNodes.values.any { it.output.isNotEmpty() }
+        val outputOmitted = !contentComplete ||
+            (!includeOutput && selectedNodes.values.any { it.output.isNotEmpty() })
         val boundedNodes = selectedNodes.mapValues { (_, node) ->
             val boundedError = node.error?.boundedUtf8(RESULT_ERROR_MAX_BYTES)?.also {
                 contentTruncated = contentTruncated || it.truncated
@@ -342,7 +343,7 @@ class FlowMcpToolProvider(
         ).jsonObject
         return buildJsonObject {
             base.forEach { (key, value) -> put(key, value) }
-            put("outputIncluded", includeOutput)
+            put("outputIncluded", includeOutput && contentComplete)
             put("outputOmitted", outputOmitted)
             put("truncated", contentTruncated)
             nodeId?.let { put("nodeId", it) }

@@ -38,6 +38,8 @@ data class RunJob(
     val nodeCount: Int = 0,
     val error: String? = null,
     val nodes: Map<String, NodeRunSnap> = emptyMap(),
+    /** False only for a scrubbed in-process progress snapshot; durable jobs default to complete. */
+    val contentComplete: Boolean = true,
 ) {
     val isTerminal: Boolean get() = state != RunJobState.RUNNING
 }
@@ -410,16 +412,25 @@ class FlowController(
         if (store.getJson(graphKey(tabId)) == null) return false
 
         closeOpenFlowTabs(tabId)
+        var deleted = false
         withContext(NonCancellable) {
-            store.removeJsonValue(graphKey(tabId))
-            store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
-            storedRuns().filter { it.second.tabId == tabId }.forEach { (runId, _) ->
-                store.removeJsonValue(runKey(runId))
-                jobs.remove(runId)
-                ownedRunIds.remove(runId)
-                FlowPersistenceCoordinator.forgetRun(runId)
+            FlowPersistenceCoordinator.withFlowLock(tabId) {
+                persistMutex.withLock {
+                    if (store.getJson(graphKey(tabId)) != null) {
+                        store.removeJsonValue(graphKey(tabId))
+                        store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
+                        storedRuns().filter { it.second.tabId == tabId }.forEach { (runId, _) ->
+                            store.removeJsonValue(runKey(runId))
+                            jobs.remove(runId)
+                            ownedRunIds.remove(runId)
+                            FlowPersistenceCoordinator.forgetRun(runId)
+                        }
+                        deleted = true
+                    }
+                }
             }
         }
+        if (!deleted) return false
         FlowPersistenceCoordinator.forget(tabId)
         return true
     }
@@ -625,19 +636,30 @@ class FlowController(
 
     private suspend fun persistRun(job: RunJob, publish: Boolean = true) {
         withContext(NonCancellable) {
-            persistMutex.withLock {
-                runCatching {
-                    // Always serialize the newest in-memory snapshot. Coroutine
-                    // scheduling may otherwise let an older live write run last.
-                    val safeJob = jobs[job.runId] ?: job
-                    storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), safeJob))
-                    // dispose() already published a synchronous terminal snapshot and
-                    // forgot the exact entry. A late NonCancellable write remains
-                    // durable but must not repopulate the process-global live cache.
-                    if (publish && !synchronized(toolSyncLock) { disposed }) {
-                        FlowPersistenceCoordinator.publishRunUpdate(safeJob)
+            // Share the graph lock with deletion across controller instances. Whichever
+            // operation wins is authoritative: delete removes an earlier terminal write,
+            // while a later persist observes the missing graph and cannot recreate it.
+            FlowPersistenceCoordinator.withFlowLock(job.tabId) {
+                persistMutex.withLock {
+                    runCatching {
+                        // Always serialize the newest in-memory snapshot. Coroutine
+                        // scheduling may otherwise let an older live write run last.
+                        val safeJob = jobs[job.runId] ?: job
+                        if (storage != null && storage.getJson(graphKey(safeJob.tabId)) == null) {
+                            jobs.remove(safeJob.runId)
+                            ownedRunIds.remove(safeJob.runId)
+                            FlowPersistenceCoordinator.forgetRun(safeJob.runId)
+                            return@runCatching
+                        }
+                        storage?.putJson(runKey(job.runId), json.encodeToString(RunJob.serializer(), safeJob))
+                        // dispose() already published a synchronous terminal snapshot and
+                        // forgot the exact entry. A late NonCancellable write remains
+                        // durable but must not repopulate the process-global live cache.
+                        if (publish && !synchronized(toolSyncLock) { disposed }) {
+                            FlowPersistenceCoordinator.publishRunUpdate(safeJob)
+                        }
+                        if (safeJob.isTerminal) evictOldRuns(safeJob.tabId)
                     }
-                    if (safeJob.isTerminal) evictOldRuns(safeJob.tabId)
                 }
             }
         }
@@ -650,8 +672,14 @@ class FlowController(
         jobs.compute(job.runId) { _, current ->
             if (current?.isTerminal == true) current else job
         }
-        FlowPersistenceCoordinator.publishRunUpdate(jobs[job.runId] ?: job)
-        if (persist) lifecycleScope.launch { persistRun(jobs[job.runId] ?: job) }
+        val safeJob = jobs[job.runId] ?: job
+        // A terminal update must not become observable until its complete output is
+        // durable; persistRun writes storage first and then publishes it. Running
+        // updates remain immediate, and only the admission snapshot is persisted.
+        if (!persist || !safeJob.isTerminal) {
+            FlowPersistenceCoordinator.publishRunUpdate(safeJob)
+        }
+        if (persist) lifecycleScope.launch { persistRun(safeJob) }
     }
 
     /** Millisecond timestamp made strictly monotonic for deterministic newest-first ordering. */

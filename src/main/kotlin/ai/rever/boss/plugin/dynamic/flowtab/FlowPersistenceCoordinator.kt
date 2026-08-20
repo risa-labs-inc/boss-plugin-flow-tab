@@ -145,6 +145,7 @@ internal object FlowPersistenceCoordinator {
                     skipReason = node.skipReason?.take(MAX_LIVE_MESSAGE_LENGTH),
                 )
             },
+            contentComplete = false,
         )
         val update = ExternalRunUpdate(revisionCounter.incrementAndGet(), liveJob)
         val effective = runUpdatesById.compute(job.runId) { _, previous ->
