@@ -69,6 +69,7 @@ private val PanelBorder = FlowTheme.Border
 private val FieldBg = FlowTheme.Canvas
 private val Muted = FlowTheme.TextFaint
 private val prettyJson = Json { prettyPrint = true; isLenient = true }
+private val compactJson = Json { isLenient = true }
 private const val INSPECTOR_OUTPUT_COPY_MAX_CHARS = 512 * 1024
 
 // Syntax colors for the collapsible JSON tree in the Output tab.
@@ -93,44 +94,89 @@ internal fun inspectorOutputText(
     output: List<Item>,
     maxChars: Int = INSPECTOR_OUTPUT_COPY_MAX_CHARS,
 ): String {
-    require(maxChars > 0)
+    require(maxChars >= 256)
     if (output.isEmpty()) return "[]"
 
-    // Estimate before serializing so a single multi-megabyte value is never
-    // duplicated merely to discover that it is too large for the clipboard.
+    // Bound individual string leaves before serialization so a multi-megabyte
+    // HTML/SVG value still yields its surrounding structure and a useful prefix.
+    val stringLimit = maxOf(32, maxChars / 4)
     val markerReserve = minOf(1_024, maxChars / 2)
     val estimateBudget = maxChars - markerReserve
-    val included = mutableListOf<JsonElement>()
+    val included = mutableListOf<Pair<Int, JsonElement>>()
+    var leafContentTruncated = false
     var estimatedChars = 2
-    for (item in output) {
+    for ((index, item) in output.withIndex()) {
+        val bounded = item.json.boundStringLeaves(stringLimit)
+        leafContentTruncated = leafContentTruncated || bounded.truncated
         val remaining = estimateBudget - estimatedChars
         if (remaining <= 1) break
-        val itemChars = compactJsonLength(item.json, remaining)
+        val itemChars = compactJsonLength(bounded.value, remaining)
         if (itemChars > remaining) continue
-        included += item.json
+        included += index to bounded.value
         estimatedChars += itemChars + 1
     }
 
-    if (included.size == output.size) {
-        val complete = prettyJson.encodeToString(JsonElement.serializer(), JsonArray(included))
+    if (included.size == output.size && !leafContentTruncated) {
+        val values = JsonArray(included.map { it.second })
+        val complete = prettyJson.encodeToString(JsonElement.serializer(), values)
         if (complete.length <= maxChars) return complete
+        val compact = compactJson.encodeToString(JsonElement.serializer(), values)
+        if (compact.length <= maxChars) return compact
     }
 
     while (true) {
+        val includedIndices = included.mapTo(mutableSetOf()) { it.first }
+        val omittedIndices = output.indices.filterNot(includedIndices::contains)
+        val omittedSummary = omittedIndices.take(8).joinToString(",") +
+            if (omittedIndices.size > 8) ",…" else ""
+        val reason = buildList {
+            if (leafContentTruncated) add("long string values were shortened")
+            if (omittedIndices.isNotEmpty()) add("item indices [$omittedSummary] were omitted")
+        }.joinToString("; ")
         val marker = JsonObject(
             mapOf(
                 "_boss_copy_truncated" to JsonPrimitive(
-                    "Copied ${included.size} of ${output.size} output items; oversized items were skipped " +
-                        "to keep clipboard text below $maxChars characters.",
+                    "Copied ${included.size} of ${output.size} items; $reason. Limit: $maxChars characters.",
                 ),
             ),
         )
-        val truncated = prettyJson.encodeToString(
+        val values = JsonArray(included.map { it.second } + marker)
+        val pretty = prettyJson.encodeToString(
             JsonElement.serializer(),
-            JsonArray(included + marker),
+            values,
         )
-        if (truncated.length <= maxChars || included.isEmpty()) return truncated
+        if (pretty.length <= maxChars) return pretty
+        val compact = compactJson.encodeToString(JsonElement.serializer(), values)
+        if (compact.length <= maxChars) return compact
+        if (included.isEmpty()) {
+            return """[{"_boss_copy_truncated":"Output exceeded the $maxChars character clipboard limit."}]"""
+        }
         included.subList(included.size / 2, included.size).clear()
+    }
+}
+
+private data class BoundedJson(val value: JsonElement, val truncated: Boolean)
+
+private fun JsonElement.boundStringLeaves(maxChars: Int): BoundedJson = when (this) {
+    is JsonObject -> {
+        var truncated = false
+        val values = mapValues { (_, value) ->
+            value.boundStringLeaves(maxChars).also { truncated = truncated || it.truncated }.value
+        }
+        BoundedJson(JsonObject(values), truncated)
+    }
+    is JsonArray -> {
+        var truncated = false
+        val values = map { value ->
+            value.boundStringLeaves(maxChars).also { truncated = truncated || it.truncated }.value
+        }
+        BoundedJson(JsonArray(values), truncated)
+    }
+    is JsonPrimitive -> if (isString && content.length > maxChars) {
+        val omitted = content.length - maxChars
+        BoundedJson(JsonPrimitive(content.take(maxChars) + "… [truncated, $omitted characters omitted]"), true)
+    } else {
+        BoundedJson(this, false)
     }
 }
 

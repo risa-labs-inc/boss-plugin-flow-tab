@@ -57,9 +57,11 @@ class FlowInspectorCopyTest {
         val parsed = Json.parseToJsonElement(copied) as JsonArray
 
         assertTrue(copied.length <= 300)
+        assertTrue(parsed.first().toString().contains("truncated"))
+        assertTrue(parsed.first().toString().contains("large"))
+        assertTrue(parsed[1].toString().contains("small"))
         assertTrue(parsed.last().toString().contains("_boss_copy_truncated"))
-        assertTrue(parsed.first().toString().contains("small"))
-        assertTrue(parsed.last().toString().contains("Copied 1 of 2"))
+        assertTrue(parsed.last().toString().contains("Copied 2 of 2"))
     }
 
     @Test
@@ -72,10 +74,10 @@ class FlowInspectorCopyTest {
         val item = Item(nested as JsonObject)
 
         val copied = inspectorOutputText(listOf(item), maxChars = 300)
-        val parsed = Json.parseToJsonElement(copied) as JsonArray
+        val parsed = Json.parseToJsonElement(copied)
 
         assertTrue(copied.length <= 300)
-        assertTrue(parsed.last().toString().contains("Copied 0 of 1"))
+        assertEquals(JsonArray(listOf(item.json)), parsed)
     }
 
     @Test
