@@ -611,16 +611,20 @@ class FlowTabComponent(
         fun openImportedInNewTab(snapshotJson: String, title: String, notice: String) {
             val parsed = runCatching { json.decodeFromString(GraphSnapshot.serializer(), snapshotJson) }.getOrNull()
             if (parsed == null) { state.runError = "Import failed: not a valid flow"; return }
+            // Scheduling is a local operational choice. Imported/shared content must
+            // remain inert until the user explicitly arms it from the launcher.
+            val imported = parsed.withoutSchedule()
             val splitView = context.splitViewOperations
             val store = storage
             if (splitView == null || store == null) {
-                runCatching { state.load(parsed) }
+                runCatching { state.load(imported) }
                 state.notice = "Imported into the current tab (open-in-new-tab unavailable here)"
                 return
             }
             uiScope.launch {
                 val newId = "flow-${java.util.UUID.randomUUID()}"
-                runCatching { store.putJson("graph:$newId", snapshotJson) }
+                val safeJson = json.encodeToString(GraphSnapshot.serializer(), imported)
+                runCatching { store.putJson("graph:$newId", safeJson) }
                 splitView.openTab(FlowTabData(id = newId, title = title))
                 state.notice = notice
             }

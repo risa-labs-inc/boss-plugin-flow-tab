@@ -31,6 +31,7 @@ import androidx.compose.material.TextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.outlined.AccountTree
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
@@ -53,8 +54,13 @@ import androidx.compose.ui.unit.sp
 import com.arkivanov.decompose.ComponentContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 /** Sidebar panel info for the Flow launcher. */
 object FlowLauncherInfo : PanelInfo {
@@ -96,6 +102,9 @@ class FlowLauncherComponent(
         var renamingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
         var pendingRename by remember { mutableStateOf<FlowSummary?>(null) }
         var renameText by remember { mutableStateOf("") }
+        var schedulingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+        var pendingSchedule by remember { mutableStateOf<FlowSummary?>(null) }
+        var scheduleMinutesText by remember { mutableStateOf("") }
         val scope = rememberCoroutineScope()
 
         LaunchedEffect(controller, refreshGeneration) {
@@ -115,6 +124,23 @@ class FlowLauncherComponent(
                 loadError = failure.message ?: failure.toString()
             } finally {
                 if (refreshGeneration == requestGeneration) loading = false
+            }
+        }
+
+        // Scheduled rows are operational status, not static metadata. Refresh them
+        // quietly while at least one cadence is enabled so last/next stays useful.
+        LaunchedEffect(controller) {
+            while (isActive) {
+                delay(SCHEDULE_STATUS_REFRESH_MS)
+                if (savedFlows.none { it.schedule != null }) continue
+                try {
+                    savedFlows = withContext(Dispatchers.IO) { controller?.listFlowDetails().orEmpty() }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // Manual Refresh owns visible load errors; a transient background
+                    // refresh must not replace the last known-good launcher list.
+                }
             }
         }
 
@@ -226,6 +252,7 @@ class FlowLauncherComponent(
                             context.activeTabsProvider != null && flow.tabId !in openingFlowIds,
                         deleteEnabled = controller != null && flow.tabId !in deletingFlowIds,
                         renameEnabled = flow.readable && controller != null && flow.tabId !in renamingFlowIds,
+                        scheduleEnabled = flow.readable && controller != null && flow.tabId !in schedulingFlowIds,
                         onOpen = {
                             if (flow.tabId in openingFlowIds) return@SavedFlowRow
                             openingFlowIds += flow.tabId
@@ -255,6 +282,10 @@ class FlowLauncherComponent(
                         onRename = {
                             renameText = flow.name
                             pendingRename = flow
+                        },
+                        onSchedule = {
+                            scheduleMinutesText = flow.schedule?.intervalMinutes?.toString().orEmpty()
+                            pendingSchedule = flow
                         },
                         onDelete = { pendingDelete = flow },
                     )
@@ -345,6 +376,92 @@ class FlowLauncherComponent(
                 },
             )
         }
+
+        pendingSchedule?.let { flow ->
+            val minutes = scheduleMinutesText.toLongOrNull()
+            val valid = minutes != null &&
+                minutes in FlowController.MIN_SCHEDULE_INTERVAL_MINUTES..FlowController.MAX_SCHEDULE_INTERVAL_MINUTES
+            AlertDialog(
+                onDismissRequest = { pendingSchedule = null },
+                title = { Text("Schedule ${flow.name.ifBlank { "flow" }}") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            "Run this flow automatically at a fixed interval " +
+                                "(${FlowController.MIN_SCHEDULE_INTERVAL_MINUTES}–" +
+                                "${FlowController.MAX_SCHEDULE_INTERVAL_MINUTES} minutes). " +
+                                "Interactive browser steps may open or focus a tab.",
+                        )
+                        TextField(
+                            value = scheduleMinutesText,
+                            onValueChange = { scheduleMinutesText = it.filter(Char::isDigit).take(8) },
+                            label = { Text("Interval (minutes)") },
+                            singleLine = true,
+                        )
+                        flowScheduleStatus(flow)?.let { status -> Text(status, fontSize = 11.sp) }
+                    }
+                },
+                confirmButton = {
+                    TextButton(
+                        enabled = valid,
+                        onClick = {
+                            val selectedMinutes = requireNotNull(minutes)
+                            pendingSchedule = null
+                            if (flow.tabId in schedulingFlowIds) return@TextButton
+                            schedulingFlowIds += flow.tabId
+                            operationError = null
+                            scope.launch {
+                                try {
+                                    val scheduled = withContext(Dispatchers.IO) {
+                                        requireNotNull(controller).updateSchedule(flow.tabId, selectedMinutes)
+                                    }
+                                    savedFlows = savedFlows.map { current ->
+                                        if (current.tabId == flow.tabId) scheduled else current
+                                    }
+                                } catch (cancelled: CancellationException) {
+                                    throw cancelled
+                                } catch (failure: Exception) {
+                                    operationError = failure.message ?: failure.toString()
+                                } finally {
+                                    schedulingFlowIds -= flow.tabId
+                                }
+                            }
+                        },
+                    ) { Text("Save") }
+                },
+                dismissButton = {
+                    Row {
+                        if (flow.schedule != null) {
+                            TextButton(
+                                onClick = {
+                                    pendingSchedule = null
+                                    if (flow.tabId in schedulingFlowIds) return@TextButton
+                                    schedulingFlowIds += flow.tabId
+                                    operationError = null
+                                    scope.launch {
+                                        try {
+                                            val disabled = withContext(Dispatchers.IO) {
+                                                requireNotNull(controller).updateSchedule(flow.tabId, null)
+                                            }
+                                            savedFlows = savedFlows.map { current ->
+                                                if (current.tabId == flow.tabId) disabled else current
+                                            }
+                                        } catch (cancelled: CancellationException) {
+                                            throw cancelled
+                                        } catch (failure: Exception) {
+                                            operationError = failure.message ?: failure.toString()
+                                        } finally {
+                                            schedulingFlowIds -= flow.tabId
+                                        }
+                                    }
+                                },
+                            ) { Text("Disable") }
+                        }
+                        TextButton(onClick = { pendingSchedule = null }) { Text("Cancel") }
+                    }
+                },
+            )
+        }
     }
 }
 
@@ -372,9 +489,11 @@ private fun SavedFlowRow(
     openEnabled: Boolean,
     deleteEnabled: Boolean,
     renameEnabled: Boolean,
+    scheduleEnabled: Boolean,
     onOpen: () -> Unit,
     onDelete: () -> Unit,
     onRename: () -> Unit,
+    onSchedule: () -> Unit,
 ) {
     val title = flow.name.ifBlank { "Untitled Flow" }
     Row(
@@ -417,8 +536,25 @@ private fun SavedFlowRow(
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
+            flowScheduleStatus(flow)?.let { status ->
+                Text(
+                    text = status,
+                    color = Color(0xFF8FB8E8),
+                    fontSize = 10.sp,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
         Column {
+            IconButton(enabled = scheduleEnabled, onClick = onSchedule, modifier = Modifier.size(30.dp)) {
+                Icon(
+                    Icons.Filled.Schedule,
+                    contentDescription = "Schedule $title",
+                    tint = if (scheduleEnabled) Color(0xFF8FB8E8) else Color(0xFF66666F),
+                    modifier = Modifier.size(16.dp),
+                )
+            }
             IconButton(enabled = renameEnabled, onClick = onRename, modifier = Modifier.size(30.dp)) {
                 Icon(
                     Icons.Outlined.Edit,
@@ -438,6 +574,25 @@ private fun SavedFlowRow(
         }
     }
 }
+
+private val scheduleTimeFormatter: DateTimeFormatter = DateTimeFormatter
+    .ofPattern("MMM d, h:mm a")
+    .withZone(ZoneId.systemDefault())
+
+internal fun flowScheduleStatus(flow: FlowSummary): String? {
+    val schedule = flow.schedule ?: return null
+    val unit = if (schedule.intervalMinutes == 1L) "minute" else "minutes"
+    val last = flow.lastScheduledRunAtEpochMs?.let {
+        scheduleTimeFormatter.format(Instant.ofEpochMilli(it)) +
+            flow.lastScheduledRunState?.let { state -> " (${state.name.lowercase()})" }.orEmpty()
+    } ?: "not run yet"
+    val next = flow.nextScheduledRunAtEpochMs?.let {
+        scheduleTimeFormatter.format(Instant.ofEpochMilli(it))
+    } ?: "pending"
+    return "Every ${schedule.intervalMinutes} $unit · Last: $last · Next: $next"
+}
+
+private const val SCHEDULE_STATUS_REFRESH_MS = 30_000L
 
 @Composable
 private fun LauncherMessage(text: String, color: Color = Color(0xFF8C8C96)) {

@@ -39,4 +39,35 @@ class GraphSnapshotTest {
         assertEquals("does X", back.metadata?.description)
         assertEquals(3, back.metadata?.version)
     }
+
+    @Test
+    fun `flow schedule is optional and round-trips in metadata`() {
+        val legacyMetadata = json.decodeFromString(
+            FlowMeta.serializer(),
+            """{"name":"Manual"}""",
+        )
+        assertNull(legacyMetadata.schedule)
+
+        val scheduled = FlowMeta(
+            name = "Digest",
+            schedule = FlowSchedule(intervalMinutes = 15),
+        )
+        val back = json.decodeFromString(
+            FlowMeta.serializer(),
+            json.encodeToString(FlowMeta.serializer(), scheduled),
+        )
+        assertEquals(15L, back.schedule?.intervalMinutes)
+    }
+
+    @Test
+    fun `imported flow drops its armed schedule`() {
+        val snapshot = GraphSnapshot(
+            metadata = FlowMeta(name = "Shared", schedule = FlowSchedule(intervalMinutes = 1)),
+        )
+
+        val imported = snapshot.withoutSchedule()
+
+        assertEquals("Shared", imported.metadata?.name)
+        assertNull(imported.metadata?.schedule)
+    }
 }

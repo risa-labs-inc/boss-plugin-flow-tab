@@ -291,6 +291,32 @@ without an owner. Plugin disposal joins that forced cleanup and the actor finali
 unload budget. Fatal actor failure is logged without provider payloads and rejects later requests as crashed with plugin
 reload guidance, distinct from normal disposal.
 
+Flow-owned schedules are optional fixed intervals stored in `FlowMeta.schedule`; an absent field
+keeps every legacy graph manual-only. The launcher is the scheduling UI: its clock action sets or
+disables the interval and each scheduled row shows the last scheduled start/result plus the next
+planned start. Runtime cursor data lives separately at `schedule:<tabId>` so normal scheduler ticks
+do not rewrite the graph. `buildHeadlessController` starts the scheduler on the controller-owned
+lifecycle, independent of replaceable host `pluginScope`, and controller disposal cancels it.
+The scheduler reconciles durable `schedule:` cursors on an IO-backed 15-second cadence and performs
+a full graph discovery only at startup and every five minutes, so unscheduled graphs are not decoded
+on every tick. Its first pass waits 60 seconds for host and external tool registries to populate.
+It persists the next start before subsequent passes, survives plugin reloads, caps
+simultaneous scheduled dispatch at four, and never overlaps another scheduled, MCP, or visible-canvas
+run of the same flow.
+Deadlines advance from the prior deadline to avoid poll-latency drift, skipping missed occurrences
+instead of creating a catch-up burst; startup resumes and backward wall-clock corrections reanchor a
+cursor that is more than one interval away. If an invocation is still running at its next deadline, that
+occurrence waits and starts after the prior run reaches a terminal state. Scheduled invocations use
+the controller's shared run-history retention policy rather than maintaining a second scheduler-only
+history. Controllers and visible canvases publish active runs through the process-wide persistence
+coordinator, which the scheduler checks before dispatch. Schedule edits serialize
+with reconciliation, reset the next start from edit time, and publish a coordinated graph
+update so an open canvas cannot autosave stale metadata over the change. Import strips schedule
+metadata so shared content cannot silently arm background execution. Deleting a flow also removes
+its scheduler cursor. Scheduled runs use the headless controller cleanup contract, but nodes such as
+Open Browser and Await Login may still open or focus an interactive tab; the scheduling dialog warns
+about that behavior.
+
 ### Runtime secret templates
 
 HTTP node URL, headers, and body fields plus Type text and Inject scripts accept

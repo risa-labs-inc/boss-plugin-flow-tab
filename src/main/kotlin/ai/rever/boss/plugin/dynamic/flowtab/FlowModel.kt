@@ -287,6 +287,12 @@ data class EdgeModel(
     val toPort: Int
 )
 
+@Serializable
+data class FlowSchedule(
+    /** Fixed interval cadence owned by the Flow plugin. */
+    val intervalMinutes: Long,
+)
+
 /**
  * Optional descriptive metadata for a flow / lanager. Present on templates,
  * agent-driven workflows, and named UI-created flows; null on legacy or unnamed
@@ -300,7 +306,9 @@ data class FlowMeta(
     val name: String = "",
     val description: String = "",
     val version: Int = 1,
-    val inputs: List<String> = emptyList()
+    val inputs: List<String> = emptyList(),
+    /** Null keeps every pre-scheduling graph disabled and wire-compatible. */
+    val schedule: FlowSchedule? = null,
 )
 
 /**
@@ -319,6 +327,10 @@ data class GraphSnapshot(
     val schemaVersion: Int = 1,
     val metadata: FlowMeta? = null
 )
+
+/** Imported flows never carry an armed local recurring schedule across trust boundaries. */
+internal fun GraphSnapshot.withoutSchedule(): GraphSnapshot =
+    copy(metadata = metadata?.copy(schedule = null))
 
 /**
  * Highest on-disk [GraphSnapshot.schemaVersion] this build understands. Saves are

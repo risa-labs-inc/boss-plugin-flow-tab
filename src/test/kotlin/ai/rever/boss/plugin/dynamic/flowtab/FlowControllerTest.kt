@@ -576,6 +576,392 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `updateSchedule persists cadence and durable next run then disables cleanly`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(FlowMeta(name = "Digest"))
+
+        val scheduled = fc.updateSchedule(tabId, intervalMinutes = 15, nowEpochMs = 1_000)
+        assertEquals(15L, fc.getFlow(tabId)?.metadata?.schedule?.intervalMinutes)
+        assertEquals(15L, scheduled.schedule?.intervalMinutes)
+        assertEquals(901_000L, scheduled.nextScheduledRunAtEpochMs)
+        assertEquals(901_000L, fc.scheduleState(tabId)?.nextRunAtEpochMs)
+
+        val disabled = fc.updateSchedule(tabId, intervalMinutes = null, nowEpochMs = 2_000)
+        assertNull(fc.getFlow(tabId)?.metadata?.schedule)
+        assertNull(disabled.schedule)
+        assertNull(fc.scheduleState(tabId))
+        fc.dispose()
+    }
+
+    @Test
+    fun `schedule edit clears stale in-memory dispatch before re-enable`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        fc.addNode(tabId, "TRIGGER")
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            fc.runSchedulePass(nowEpochMs = 60_000)
+            assertNotNull(fc.scheduleState(tabId)?.lastRunId)
+
+            fc.updateSchedule(tabId, null, nowEpochMs = 70_000)
+            fc.updateSchedule(tabId, 1, nowEpochMs = 80_000)
+            fc.runSchedulePass(nowEpochMs = 80_001)
+
+            val reenabled = fc.scheduleState(tabId)!!
+            assertNull(reenabled.lastRunId)
+            assertNull(reenabled.lastRunAtEpochMs)
+            assertEquals(140_000L, reenabled.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `schedule interval enforces inclusive minute bounds`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+
+        try {
+            assertFailsWith<IllegalArgumentException> { fc.updateSchedule(tabId, 0) }
+            assertFailsWith<IllegalArgumentException> {
+                fc.updateSchedule(tabId, FlowController.MAX_SCHEDULE_INTERVAL_MINUTES + 1)
+            }
+            assertEquals(
+                FlowController.MIN_SCHEDULE_INTERVAL_MINUTES,
+                fc.updateSchedule(tabId, FlowController.MIN_SCHEDULE_INTERVAL_MINUTES)
+                    .schedule?.intervalMinutes,
+            )
+            assertEquals(
+                FlowController.MAX_SCHEDULE_INTERVAL_MINUTES,
+                fc.updateSchedule(tabId, FlowController.MAX_SCHEDULE_INTERVAL_MINUTES)
+                    .schedule?.intervalMinutes,
+            )
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `schedule graph update blocks an older canvas autosave`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow(FlowMeta(name = "Coordinated"))
+        val stale = assertNotNull(fc.getFlow(tabId))
+
+        try {
+            fc.updateSchedule(tabId, 10, nowEpochMs = 0)
+            val update = assertNotNull(FlowPersistenceCoordinator.latestGraphUpdate(tabId))
+            assertEquals(10L, update.snapshot.metadata?.schedule?.intervalMinutes)
+
+            FlowPersistenceCoordinator.persistAutosave(tabId, stale, appliedGraphRevision = 0) { snapshot ->
+                storage.putJson(
+                    "${FlowController.GRAPH_PREFIX}$tabId",
+                    kotlinx.serialization.json.Json.encodeToString(GraphSnapshot.serializer(), snapshot),
+                )
+            }
+            assertEquals(10L, fc.getFlow(tabId)?.metadata?.schedule?.intervalMinutes)
+        } finally {
+            fc.deleteFlow(tabId)
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `schedule runner is memoized and cancelled by disposal`() = runBlocking {
+        val fc = controller()
+        val first = fc.startScheduleRunner(pollIntervalMs = 10)
+        val second = fc.startScheduleRunner(pollIntervalMs = 10)
+        assertSame(first, second)
+
+        fc.dispose()
+        withTimeout(5_000) { first.join() }
+        assertTrue(first.isCancelled)
+        assertFailsWith<IllegalStateException> { fc.startScheduleRunner(pollIntervalMs = 10) }
+    }
+
+    @Test
+    fun `indexed schedule pass decodes only flows with durable cursors`() = runBlocking {
+        val storage = object : DesktopStorage() {
+            val graphReads = AtomicInteger()
+            override suspend fun getJson(key: String): String? {
+                if (key.startsWith(FlowController.GRAPH_PREFIX)) graphReads.incrementAndGet()
+                return super.getJson(key)
+            }
+        }
+        val fc = controller(storage)
+        val scheduled = fc.createFlow()
+        fc.createFlow()
+        fc.updateSchedule(scheduled, intervalMinutes = 10, nowEpochMs = 0)
+        storage.graphReads.set(0)
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 1, discoverSchedules = false)
+
+            assertEquals(1, storage.graphReads.get())
+            assertEquals(600_000L, fc.scheduleState(scheduled)?.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `backward clock correction reanchors a far future cursor`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+        fc.updateSchedule(tabId, intervalMinutes = 1, nowEpochMs = 1_000_000)
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0, discoverSchedules = false)
+            assertEquals(60_000L, fc.scheduleState(tabId)?.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `stale overdue cursor reanchors instead of dispatching on startup`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow()
+        fc.addNode(tabId, "TRIGGER")
+        fc.updateSchedule(tabId, intervalMinutes = 1, nowEpochMs = 0)
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 120_001, discoverSchedules = false)
+            assertNull(fc.scheduleState(tabId)?.lastRunId)
+            assertEquals(180_001L, fc.scheduleState(tabId)?.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `fresh controller resumes a due cursor exactly once after reload`() = runBlocking {
+        val storage = DesktopStorage()
+        val first = controller(storage)
+        val tabId = first.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        first.addNode(tabId, "TRIGGER")
+        first.runSchedulePass(nowEpochMs = 0)
+        first.runSchedulePass(nowEpochMs = 60_000)
+        val firstRunId = assertNotNull(first.scheduleState(tabId)?.lastRunId)
+        assertEquals(RunJobState.SUCCEEDED, awaitTerminal(first, firstRunId).state)
+        first.dispose()
+
+        val reloaded = controller(storage)
+        try {
+            reloaded.runSchedulePass(nowEpochMs = 120_000, discoverSchedules = false)
+            val resumedRunId = assertNotNull(reloaded.scheduleState(tabId)?.lastRunId)
+            assertTrue(resumedRunId != firstRunId)
+            assertEquals(180_000L, reloaded.scheduleState(tabId)?.nextRunAtEpochMs)
+        } finally {
+            reloaded.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
+    @Test
+    fun `late schedule pass advances from prior deadline without catch-up burst`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        fc.addNode(tabId, "TRIGGER")
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            fc.runSchedulePass(nowEpochMs = 90_000)
+
+            val state = fc.scheduleState(tabId)!!
+            assertEquals(90_000L, state.lastRunAtEpochMs)
+            assertEquals(120_000L, state.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `deleteFlow removes durable schedule cursor`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(10)))
+        fc.runSchedulePass(nowEpochMs = 0)
+        assertNotNull(fc.scheduleState(tabId))
+
+        assertTrue(fc.deleteFlow(tabId))
+        assertNull(fc.scheduleState(tabId))
+        fc.dispose()
+    }
+
+    @Test
+    fun `schedule pass starts due flow and records terminal result`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(FlowMeta(name = "Digest", schedule = FlowSchedule(1)))
+        fc.addNode(tabId, "TRIGGER")
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            assertEquals(60_000L, fc.scheduleState(tabId)?.nextRunAtEpochMs)
+
+            fc.runSchedulePass(nowEpochMs = 60_000)
+            val started = fc.scheduleState(tabId)!!
+            val runId = assertNotNull(started.lastRunId)
+            assertEquals(60_000L, started.lastRunAtEpochMs)
+            assertEquals(120_000L, started.nextRunAtEpochMs)
+
+            assertEquals(RunJobState.SUCCEEDED, awaitTerminal(fc, runId).state)
+            fc.runSchedulePass(nowEpochMs = 60_001)
+            assertEquals(RunJobState.SUCCEEDED, fc.scheduleState(tabId)?.lastRunState)
+            assertEquals(RunJobState.SUCCEEDED, fc.listFlowDetails().single().lastScheduledRunState)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `schedule pass never overlaps a still-running invocation`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val fc = FlowController(
+            context = context(DesktopStorage()),
+            scopeProvider = { runScope },
+            registry = hangingRegistry("SCHEDULE_HANG") { entered.complete(Unit) },
+        )
+        val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        fc.addNode(tabId, "SCHEDULE_HANG")
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            fc.runSchedulePass(nowEpochMs = 60_000)
+            withTimeout(5_000) { entered.await() }
+            val firstRunId = fc.scheduleState(tabId)?.lastRunId
+
+            fc.runSchedulePass(nowEpochMs = 120_000)
+            assertEquals(firstRunId, fc.scheduleState(tabId)?.lastRunId)
+            assertEquals(RunJobState.RUNNING, fc.scheduleState(tabId)?.lastRunState)
+
+            fc.runSchedulePass(nowEpochMs = 240_001)
+            assertEquals(120_000L, fc.scheduleState(tabId)?.nextRunAtEpochMs)
+        } finally {
+            fc.dispose()
+            runScope.cancel()
+        }
+    }
+
+    @Test
+    fun `schedule pass caps simultaneous scheduled dispatches`() = runBlocking {
+        val entered = AtomicInteger()
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val fc = FlowController(
+            context = context(DesktopStorage()),
+            scopeProvider = { runScope },
+            registry = hangingRegistry("SCHEDULE_CAP_HANG") { entered.incrementAndGet() },
+        )
+        val tabIds = List(FlowController.MAX_CONCURRENT_SCHEDULED_RUNS + 1) {
+            fc.createFlow(FlowMeta(schedule = FlowSchedule(1))).also { tabId ->
+                fc.addNode(tabId, "SCHEDULE_CAP_HANG")
+            }
+        }
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            fc.runSchedulePass(nowEpochMs = 60_000)
+
+            assertEquals(
+                FlowController.MAX_CONCURRENT_SCHEDULED_RUNS,
+                tabIds.count { fc.scheduleState(it)?.lastRunId != null },
+            )
+            withTimeout(5_000) {
+                while (entered.get() != FlowController.MAX_CONCURRENT_SCHEDULED_RUNS) delay(10)
+            }
+        } finally {
+            fc.dispose()
+            runScope.cancel()
+            tabIds.forEach(FlowPersistenceCoordinator::forget)
+        }
+    }
+
+    @Test
+    fun `schedule pass does not overlap a manual headless run of the flow`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val fc = FlowController(
+            context = context(DesktopStorage()),
+            scopeProvider = { runScope },
+            registry = hangingRegistry("MANUAL_SCHEDULE_HANG") { entered.complete(Unit) },
+        )
+        val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        fc.addNode(tabId, "MANUAL_SCHEDULE_HANG")
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            fc.startRun(tabId)
+            withTimeout(5_000) { entered.await() }
+
+            fc.runSchedulePass(nowEpochMs = 60_000)
+            assertNull(fc.scheduleState(tabId)?.lastRunId)
+        } finally {
+            fc.dispose()
+            runScope.cancel()
+        }
+    }
+
+    @Test
+    fun `schedule pass observes a canvas run published by another controller`() = runBlocking {
+        val storage = DesktopStorage()
+        val scheduler = controller(storage)
+        val canvasOwner = controller(storage)
+        val tabId = scheduler.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        scheduler.addNode(tabId, "TRIGGER")
+        val canvasRun = RunJob(
+            runId = "run-canvas-schedule-${java.util.UUID.randomUUID()}",
+            tabId = tabId,
+            state = RunJobState.RUNNING,
+            startedAtMs = canvasOwner.nextRunStartedAtMs(),
+        )
+
+        try {
+            scheduler.runSchedulePass(nowEpochMs = 0)
+            canvasOwner.publishCanvasRun(canvasRun, persist = false)
+            assertTrue(FlowPersistenceCoordinator.isFlowLive(tabId))
+
+            scheduler.runSchedulePass(nowEpochMs = 60_000)
+            assertNull(scheduler.scheduleState(tabId)?.lastRunId)
+
+            canvasOwner.publishCanvasRun(canvasRun.copy(state = RunJobState.SUCCEEDED), persist = false)
+            assertFalse(FlowPersistenceCoordinator.isFlowLive(tabId))
+            scheduler.runSchedulePass(nowEpochMs = 60_000)
+            assertNotNull(scheduler.scheduleState(tabId)?.lastRunId)
+        } finally {
+            canvasOwner.dispose()
+            scheduler.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
+
+    @Test
+    fun `one schedule cursor failure does not block later flows`() = runBlocking {
+        val storage = object : DesktopStorage() {
+            var failingKey: String? = null
+            override suspend fun putJson(key: String, jsonValue: String) {
+                if (key == failingKey) error("test cursor failure")
+                super.putJson(key, jsonValue)
+            }
+        }
+        val fc = controller(storage)
+        val first = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        val second = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        fc.addNode(first, "TRIGGER")
+        fc.addNode(second, "TRIGGER")
+        fc.runSchedulePass(nowEpochMs = 0)
+        val ordered = listOf(first, second).sorted()
+        storage.failingKey = "${FlowController.SCHEDULE_STATE_PREFIX}${ordered.first()}"
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 60_000)
+            assertNotNull(fc.scheduleState(ordered.last())?.lastRunId)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
     fun `getFlow returns null for an unknown tabId`() = runBlocking {
         assertNull(controller().getFlow("flow-does-not-exist"))
     }
@@ -587,11 +973,14 @@ class FlowControllerTest {
             FlowMeta(name = "Old name", description = "Keep me", version = 3, inputs = listOf("claimId"))
         )
         val nodeId = fc.addNode(tabId, "TRIGGER")
+        fc.updateSchedule(tabId, intervalMinutes = 15, nowEpochMs = 1_000)
 
         val summary = fc.renameFlow(tabId, "  Claims intake  ")
         val renamed = fc.getFlow(tabId)!!
 
         assertEquals("Claims intake", summary.name)
+        assertEquals(15L, summary.schedule?.intervalMinutes)
+        assertEquals(901_000L, summary.nextScheduledRunAtEpochMs)
         assertEquals("Claims intake", renamed.metadata?.name)
         assertEquals("Keep me", renamed.metadata?.description)
         assertEquals(3, renamed.metadata?.version)
