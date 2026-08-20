@@ -8,6 +8,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -61,6 +63,21 @@ data class FlowSummary(
     val description: String = "",
     val nodeCount: Int = 0,
     val readable: Boolean = true,
+    val schedule: FlowSchedule? = null,
+    val lastScheduledRunAtEpochMs: Long? = null,
+    val nextScheduledRunAtEpochMs: Long? = null,
+    val lastScheduledRunState: RunJobState? = null,
+)
+
+/** Durable scheduler cursor. Graph metadata remains the source of schedule configuration. */
+@Serializable
+data class FlowScheduleState(
+    val tabId: String,
+    val intervalMinutes: Long,
+    val lastRunAtEpochMs: Long? = null,
+    val nextRunAtEpochMs: Long? = null,
+    val lastRunId: String? = null,
+    val lastRunState: RunJobState? = null,
 )
 
 /**
@@ -95,13 +112,17 @@ class FlowController(
     private val ownedRunIds = ConcurrentHashMap.newKeySet<String>()
     private val executions = ConcurrentHashMap<String, Job>()
     private val runStates = ConcurrentHashMap<String, ConcurrentHashMap<String, NodeRun>>()
+    /** Prevent duplicate dispatch if persisting a newly-started scheduler cursor fails. */
+    private val scheduledExecutions = ConcurrentHashMap<String, String>()
     private val persistMutex = Mutex()
+    private val schedulePassMutex = Mutex()
     /** Independent from pluginScope so controller-owned work survives a sandbox watchdog
      * replacing that scope. Everything launched here is cancelled from [dispose]. */
     private val lifecycleScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val toolSyncLock = Any()
     private var bossToolSyncJob: Job? = null
     private var externalToolSyncJob: Job? = null
+    private var scheduleJob: Job? = null
     private var toolSyncJobs: List<Job> = emptyList()
     private var disposed = false
 
@@ -321,14 +342,147 @@ class FlowController(
     // Discovery intentionally reads each graph: storage has no secondary summary index yet.
     suspend fun listFlowDetails(): List<FlowSummary> = listFlows().map { tabId ->
         val snapshot = getFlow(tabId)
+        val scheduleState = loadScheduleState(tabId)
         FlowSummary(
             tabId = tabId,
             name = snapshot?.metadata?.name.orEmpty(),
             description = snapshot?.metadata?.description.orEmpty(),
             nodeCount = snapshot?.nodes?.size ?: 0,
             readable = snapshot != null,
+            schedule = snapshot?.metadata?.schedule,
+            lastScheduledRunAtEpochMs = scheduleState?.lastRunAtEpochMs,
+            nextScheduledRunAtEpochMs = scheduleState?.nextRunAtEpochMs,
+            lastScheduledRunState = scheduleState?.lastRunState,
         )
     }
+
+    /**
+     * Set a fixed-interval schedule, or disable scheduling with null. The graph update is
+     * coordinated with open-canvas autosave, while the durable cursor is reset from now
+     * so changing a cadence can never cause an immediate stale-time invocation.
+     */
+    suspend fun updateSchedule(
+        tabId: String,
+        intervalMinutes: Long?,
+        nowEpochMs: Long = System.currentTimeMillis(),
+    ): FlowSummary = schedulePassMutex.withLock {
+        intervalMinutes?.let {
+            require(it in MIN_SCHEDULE_INTERVAL_MINUTES..MAX_SCHEDULE_INTERVAL_MINUTES) {
+                "Schedule interval must be between $MIN_SCHEDULE_INTERVAL_MINUTES and " +
+                    "$MAX_SCHEDULE_INTERVAL_MINUTES minutes"
+            }
+        }
+        check(storage != null) { "Flow storage is unavailable" }
+        val updated = FlowPersistenceCoordinator.withFlowLock(tabId) {
+            val current = FlowPersistenceCoordinator.latestLiveSnapshot(tabId)
+                ?: getFlow(tabId)
+                ?: throw IllegalArgumentException("No readable flow '$tabId'")
+            val metadata = (current.metadata ?: FlowMeta()).copy(
+                schedule = intervalMinutes?.let(::FlowSchedule),
+            )
+            current.copy(metadata = metadata).also { snapshot ->
+                writeUnlocked(tabId, snapshot)
+                FlowPersistenceCoordinator.publishGraphUpdate(tabId, snapshot)
+            }
+        }
+        val prior = loadScheduleState(tabId)
+        persistScheduleState(
+            FlowScheduleState(
+                tabId = tabId,
+                intervalMinutes = intervalMinutes ?: prior?.intervalMinutes ?: MIN_SCHEDULE_INTERVAL_MINUTES,
+                lastRunAtEpochMs = prior?.lastRunAtEpochMs,
+                nextRunAtEpochMs = intervalMinutes?.let { nowEpochMs + intervalMillis(it) },
+                lastRunId = prior?.lastRunId,
+                lastRunState = prior?.lastRunState,
+            ),
+        )
+        FlowSummary(
+            tabId = tabId,
+            name = updated.metadata?.name.orEmpty(),
+            description = updated.metadata?.description.orEmpty(),
+            nodeCount = updated.nodes.size,
+            schedule = updated.metadata?.schedule,
+            lastScheduledRunAtEpochMs = prior?.lastRunAtEpochMs,
+            nextScheduledRunAtEpochMs = intervalMinutes?.let { nowEpochMs + intervalMillis(it) },
+            lastScheduledRunState = prior?.lastRunState,
+        )
+    }
+
+    internal fun startScheduleRunner(pollIntervalMs: Long = DEFAULT_SCHEDULE_POLL_INTERVAL_MS): Job =
+        synchronized(toolSyncLock) {
+            check(!disposed) { "Cannot start scheduler after controller disposal" }
+            scheduleJob ?: lifecycleScope.launch {
+                while (isActive) {
+                    try {
+                        runSchedulePass()
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (failure: Exception) {
+                        println("[flow-tab] schedule pass failed: ${failure.message}")
+                    }
+                    delay(pollIntervalMs)
+                }
+            }.also { scheduleJob = it }
+        }
+
+    /** One deterministic scheduler reconciliation; internal for lifecycle tests. */
+    internal suspend fun runSchedulePass(nowEpochMs: Long = System.currentTimeMillis()) {
+        schedulePassMutex.withLock {
+            listFlows().forEach { tabId ->
+                val schedule = getFlow(tabId)?.metadata?.schedule ?: return@forEach
+                if (schedule.intervalMinutes !in MIN_SCHEDULE_INTERVAL_MINUTES..MAX_SCHEDULE_INTERVAL_MINUTES) {
+                    return@forEach
+                }
+                val intervalMs = intervalMillis(schedule.intervalMinutes)
+                var state = loadScheduleState(tabId)
+                if (state == null || state.intervalMinutes != schedule.intervalMinutes || state.nextRunAtEpochMs == null) {
+                    state = FlowScheduleState(
+                        tabId = tabId,
+                        intervalMinutes = schedule.intervalMinutes,
+                        lastRunAtEpochMs = state?.lastRunAtEpochMs,
+                        nextRunAtEpochMs = nowEpochMs + intervalMs,
+                        lastRunId = state?.lastRunId,
+                        lastRunState = state?.lastRunState,
+                    )
+                    persistScheduleState(state)
+                    return@forEach
+                }
+
+                val trackedRunId = scheduledExecutions[tabId] ?: state.lastRunId
+                val priorJob = trackedRunId?.let { runStatus(it) }
+                if (priorJob != null &&
+                    (trackedRunId != state.lastRunId || priorJob.state != state.lastRunState)
+                ) {
+                    val recoveredDispatch = trackedRunId != state.lastRunId
+                    state = state.copy(
+                        lastRunAtEpochMs = if (recoveredDispatch) nowEpochMs else state.lastRunAtEpochMs,
+                        nextRunAtEpochMs = if (recoveredDispatch) nowEpochMs + intervalMs else state.nextRunAtEpochMs,
+                        lastRunId = trackedRunId,
+                        lastRunState = priorJob.state,
+                    )
+                    persistScheduleState(state)
+                }
+                // Fixed-interval schedules never overlap. A long run may start the next
+                // invocation immediately after it terminates, but never while active.
+                if (priorJob?.state == RunJobState.RUNNING) return@forEach
+                if (trackedRunId != null) scheduledExecutions.remove(tabId, trackedRunId)
+                if (nowEpochMs < requireNotNull(state.nextRunAtEpochMs)) return@forEach
+
+                val runId = startRun(tabId)
+                scheduledExecutions[tabId] = runId
+                persistScheduleState(
+                    state.copy(
+                        lastRunAtEpochMs = nowEpochMs,
+                        nextRunAtEpochMs = nowEpochMs + intervalMs,
+                        lastRunId = runId,
+                        lastRunState = RunJobState.RUNNING,
+                    ),
+                )
+            }
+        }
+    }
+
+    internal suspend fun scheduleState(tabId: String): FlowScheduleState? = loadScheduleState(tabId)
 
     /** Rename a readable flow without changing any other metadata or graph content. */
     suspend fun renameFlow(tabId: String, name: String): FlowSummary =
@@ -419,6 +573,7 @@ class FlowController(
                     if (store.getJson(graphKey(tabId)) != null) {
                         store.removeJsonValue(graphKey(tabId))
                         store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
+                        store.removeJsonValue(scheduleKey(tabId))
                         storedRuns().filter { it.second.tabId == tabId }.forEach { (runId, _) ->
                             store.removeJsonValue(runKey(runId))
                             jobs.remove(runId)
@@ -431,6 +586,7 @@ class FlowController(
             }
         }
         if (!deleted) return false
+        scheduledExecutions.remove(tabId)
         FlowPersistenceCoordinator.forget(tabId)
         return true
     }
@@ -833,6 +989,18 @@ class FlowController(
         storage?.putJson(graphKey(tabId), json.encodeToString(GraphSnapshot.serializer(), snapshot))
     }
 
+    private suspend fun loadScheduleState(tabId: String): FlowScheduleState? {
+        val raw = storage?.getJson(scheduleKey(tabId)) ?: return null
+        return runCatching { json.decodeFromString(FlowScheduleState.serializer(), raw) }.getOrNull()
+    }
+
+    private suspend fun persistScheduleState(state: FlowScheduleState) {
+        storage?.putJson(
+            scheduleKey(state.tabId),
+            json.encodeToString(FlowScheduleState.serializer(), state),
+        )
+    }
+
     private fun failedRun(
         runId: String,
         tabId: String,
@@ -904,6 +1072,9 @@ class FlowController(
 
     private fun graphKey(tabId: String) = "$GRAPH_PREFIX$tabId"
     private fun runKey(runId: String) = "$RUN_PREFIX$runId"
+    private fun scheduleKey(tabId: String) = "$SCHEDULE_STATE_PREFIX$tabId"
+
+    private fun intervalMillis(intervalMinutes: Long): Long = intervalMinutes * 60_000L
 
     companion object {
         private const val MAX_KINDS_IN_ERROR = 30
@@ -912,6 +1083,10 @@ class FlowController(
         const val STORAGE_NAMESPACE = "ai.rever.boss.plugin.dynamic.flowtab"
         const val GRAPH_PREFIX = "graph:"
         const val RUN_PREFIX = "run:"
+        const val SCHEDULE_STATE_PREFIX = "schedule:"
+        const val MIN_SCHEDULE_INTERVAL_MINUTES = 1L
+        const val MAX_SCHEDULE_INTERVAL_MINUTES = 365L * 24L * 60L
+        const val DEFAULT_SCHEDULE_POLL_INTERVAL_MS = 1_000L
         const val DEFAULT_RUN_TIMEOUT_MS = 15 * 60 * 1000L
         const val DEFAULT_RUN_HISTORY_LIMIT = 20
         const val MAX_RUN_HISTORY_LIMIT = DEFAULT_RUN_HISTORY_LIMIT
@@ -949,5 +1124,6 @@ fun buildHeadlessController(
     // Start controller-owned background work only after construction can no longer fail.
     // Both collectors remain live across pluginScope replacement for the controller lifetime.
     controller.startToolRegistrySync(external)
+    controller.startScheduleRunner()
     return controller
 }

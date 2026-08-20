@@ -296,11 +296,19 @@ data class EdgeModel(
  *   (used by lanager templates + the MCP `flow_run` contract).
  */
 @Serializable
+data class FlowSchedule(
+    /** Fixed interval cadence owned by the Flow plugin. */
+    val intervalMinutes: Long,
+)
+
+@Serializable
 data class FlowMeta(
     val name: String = "",
     val description: String = "",
     val version: Int = 1,
-    val inputs: List<String> = emptyList()
+    val inputs: List<String> = emptyList(),
+    /** Null keeps every pre-scheduling graph disabled and wire-compatible. */
+    val schedule: FlowSchedule? = null,
 )
 
 /**

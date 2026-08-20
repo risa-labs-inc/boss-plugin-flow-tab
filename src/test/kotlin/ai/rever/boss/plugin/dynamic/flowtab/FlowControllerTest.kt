@@ -576,6 +576,76 @@ class FlowControllerTest {
     }
 
     @Test
+    fun `updateSchedule persists cadence and durable next run then disables cleanly`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(FlowMeta(name = "Digest"))
+
+        val scheduled = fc.updateSchedule(tabId, intervalMinutes = 15, nowEpochMs = 1_000)
+        assertEquals(15L, fc.getFlow(tabId)?.metadata?.schedule?.intervalMinutes)
+        assertEquals(15L, scheduled.schedule?.intervalMinutes)
+        assertEquals(901_000L, scheduled.nextScheduledRunAtEpochMs)
+        assertEquals(901_000L, fc.scheduleState(tabId)?.nextRunAtEpochMs)
+
+        val disabled = fc.updateSchedule(tabId, intervalMinutes = null, nowEpochMs = 2_000)
+        assertNull(fc.getFlow(tabId)?.metadata?.schedule)
+        assertNull(disabled.schedule)
+        assertNull(fc.scheduleState(tabId)?.nextRunAtEpochMs)
+        fc.dispose()
+    }
+
+    @Test
+    fun `schedule pass starts due flow and records terminal result`() = runBlocking {
+        val fc = controller()
+        val tabId = fc.createFlow(FlowMeta(name = "Digest", schedule = FlowSchedule(1)))
+        fc.addNode(tabId, "TRIGGER")
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            assertEquals(60_000L, fc.scheduleState(tabId)?.nextRunAtEpochMs)
+
+            fc.runSchedulePass(nowEpochMs = 60_000)
+            val started = fc.scheduleState(tabId)!!
+            val runId = assertNotNull(started.lastRunId)
+            assertEquals(60_000L, started.lastRunAtEpochMs)
+            assertEquals(120_000L, started.nextRunAtEpochMs)
+
+            assertEquals(RunJobState.SUCCEEDED, awaitTerminal(fc, runId).state)
+            fc.runSchedulePass(nowEpochMs = 60_001)
+            assertEquals(RunJobState.SUCCEEDED, fc.scheduleState(tabId)?.lastRunState)
+            assertEquals(RunJobState.SUCCEEDED, fc.listFlowDetails().single().lastScheduledRunState)
+        } finally {
+            fc.dispose()
+        }
+    }
+
+    @Test
+    fun `schedule pass never overlaps a still-running invocation`() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val runScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+        val fc = FlowController(
+            context = context(DesktopStorage()),
+            scopeProvider = { runScope },
+            registry = hangingRegistry("SCHEDULE_HANG") { entered.complete(Unit) },
+        )
+        val tabId = fc.createFlow(FlowMeta(schedule = FlowSchedule(1)))
+        fc.addNode(tabId, "SCHEDULE_HANG")
+
+        try {
+            fc.runSchedulePass(nowEpochMs = 0)
+            fc.runSchedulePass(nowEpochMs = 60_000)
+            withTimeout(5_000) { entered.await() }
+            val firstRunId = fc.scheduleState(tabId)?.lastRunId
+
+            fc.runSchedulePass(nowEpochMs = 120_000)
+            assertEquals(firstRunId, fc.scheduleState(tabId)?.lastRunId)
+            assertEquals(RunJobState.RUNNING, fc.scheduleState(tabId)?.lastRunState)
+        } finally {
+            fc.dispose()
+            runScope.cancel()
+        }
+    }
+
+    @Test
     fun `getFlow returns null for an unknown tabId`() = runBlocking {
         assertNull(controller().getFlow("flow-does-not-exist"))
     }
