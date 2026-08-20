@@ -113,6 +113,10 @@ private val RunStartedFormatter = java.time.format.DateTimeFormatter.ofPattern(
     java.util.Locale.getDefault(),
 )
 
+/** Clipboard providers are optional host services and may fail across the plugin boundary. */
+internal fun copyInspectorText(context: PluginContext, text: String): Boolean =
+    runCatching { context.clipboardProvider?.setText(text) == true }.getOrDefault(false)
+
 private fun FlowGraphState.applyRunJob(job: RunJob) {
     val restored = RunSnapshot(job.nodes).toRuns()
     runStates.keys.toList().filterNot(restored::containsKey).forEach(runStates::remove)
@@ -887,9 +891,7 @@ class FlowTabComponent(
                     FlowInspector(
                         state = state,
                         node = selectedNode,
-                        copyText = { text ->
-                            runCatching { context.clipboardProvider?.setText(text) == true }.getOrDefault(false)
-                        },
+                        copyText = { text -> copyInspectorText(context, text) },
                     )
                 }
             }

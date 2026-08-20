@@ -218,7 +218,7 @@ private fun JsonTab(node: FlowNode, copyText: (String) -> Boolean) {
     var error by remember(node.id) { mutableStateOf<String?>(null) }
     CopyableFieldLabel(
         label = "Config (raw JSON)",
-        text = text,
+        text = { text },
         copyDescription = "Copy displayed config JSON",
         copyText = copyText,
     )
@@ -251,20 +251,19 @@ private fun OutputTab(state: FlowGraphState, node: FlowNode, copyText: (String) 
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         // Status shown in the always-visible banner above; here we focus on detail.
         if (run.error != null) {
-            CopyableFieldLabel("Error", run.error, "Copy complete error text", copyText = copyText)
+            CopyableFieldLabel("Error", { run.error }, "Copy complete error text", copyText = copyText)
             SelectionContainer { Text(run.error, color = FlowTheme.Error, fontSize = 12.sp) }
         }
         if (run.logs.isNotEmpty()) {
             val logsText = inspectorLogsText(run.logs)
-            CopyableFieldLabel("Logs", logsText, "Copy complete log text", copyText = copyText)
+            CopyableFieldLabel("Logs", { logsText }, "Copy complete log text", copyText = copyText)
             SelectionContainer {
                 Text(logsText, color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
             }
         }
-        val outputText = inspectorOutputText(run.output)
         CopyableFieldLabel(
             label = "Output (${run.output.size} item${if (run.output.size == 1) "" else "s"})",
-            text = outputText,
+            text = { inspectorOutputText(run.output) },
             copyDescription = "Copy complete output JSON, including collapsed values",
             buttonLabel = "Copy all",
             copyText = copyText,
@@ -389,6 +388,7 @@ private fun StatusBanner(run: NodeRun?, copyText: (String) -> Boolean) {
         }
         val err = run?.error
         if (status == RunStatus.ERROR && !err.isNullOrBlank()) {
+            var truncated by remember(err) { mutableStateOf(false) }
             Row(
                 modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
                 verticalAlignment = Alignment.Top,
@@ -402,14 +402,17 @@ private fun StatusBanner(run: NodeRun?, copyText: (String) -> Boolean) {
                             fontSize = 11.sp,
                             maxLines = 3,
                             overflow = TextOverflow.Ellipsis,
+                            onTextLayout = { truncated = it.hasVisualOverflow },
                         )
                     }
-                    Text("Preview · Copy full uses the complete error", color = Muted, fontSize = 9.sp)
+                    if (truncated) {
+                        Text("Preview · Copy full uses the complete error", color = Muted, fontSize = 10.sp)
+                    }
                 }
                 CopyButton(
-                    text = err,
-                    description = "Copy complete error text",
-                    buttonLabel = "Copy full",
+                    text = { err },
+                    description = if (truncated) "Copy complete error text" else "Copy error text",
+                    buttonLabel = if (truncated) "Copy full" else "Copy",
                     copyText = copyText,
                 )
             }
@@ -420,7 +423,7 @@ private fun StatusBanner(run: NodeRun?, copyText: (String) -> Boolean) {
 @Composable
 private fun CopyableFieldLabel(
     label: String,
-    text: String,
+    text: () -> String,
     copyDescription: String,
     buttonLabel: String = "Copy",
     copyText: (String) -> Boolean,
@@ -436,14 +439,15 @@ private fun CopyableFieldLabel(
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun CopyButton(
-    text: String,
+    text: () -> String,
     description: String,
     buttonLabel: String,
     copyText: (String) -> Boolean,
 ) {
-    var result by remember(text, description) { mutableStateOf<Boolean?>(null) }
-    LaunchedEffect(result) {
-        if (result != null) {
+    var result by remember(description) { mutableStateOf<Boolean?>(null) }
+    var attempt by remember(description) { mutableStateOf(0) }
+    LaunchedEffect(attempt) {
+        if (attempt > 0) {
             delay(1_500)
             result = null
         }
@@ -476,7 +480,10 @@ private fun CopyButton(
             modifier = Modifier
                 .clip(RoundedCornerShape(FlowTheme.rSm))
                 .border(1.dp, PanelBorder, RoundedCornerShape(FlowTheme.rSm))
-                .clickable(onClickLabel = description, role = Role.Button) { result = copyText(text) }
+                .clickable(onClickLabel = description, role = Role.Button) {
+                    result = copyText(text())
+                    attempt += 1
+                }
                 .padding(horizontal = 6.dp, vertical = 3.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp),
