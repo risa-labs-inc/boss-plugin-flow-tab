@@ -973,11 +973,14 @@ class FlowControllerTest {
             FlowMeta(name = "Old name", description = "Keep me", version = 3, inputs = listOf("claimId"))
         )
         val nodeId = fc.addNode(tabId, "TRIGGER")
+        fc.updateSchedule(tabId, intervalMinutes = 15, nowEpochMs = 1_000)
 
         val summary = fc.renameFlow(tabId, "  Claims intake  ")
         val renamed = fc.getFlow(tabId)!!
 
         assertEquals("Claims intake", summary.name)
+        assertEquals(15L, summary.schedule?.intervalMinutes)
+        assertEquals(901_000L, summary.nextScheduledRunAtEpochMs)
         assertEquals("Claims intake", renamed.metadata?.name)
         assertEquals("Keep me", renamed.metadata?.description)
         assertEquals(3, renamed.metadata?.version)

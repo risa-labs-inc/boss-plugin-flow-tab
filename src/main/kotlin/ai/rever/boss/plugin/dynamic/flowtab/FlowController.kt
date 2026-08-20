@@ -652,11 +652,16 @@ class FlowController(
                 println("[flow-tab] renamed '$tabId', but its tab title could not be refreshed: ${failure.message}")
             }
         }
+        val scheduleState = if (metadata.schedule != null) loadScheduleState(tabId) else null
         return FlowSummary(
             tabId = tabId,
             name = normalizedName,
             description = metadata.description,
             nodeCount = snapshot.nodes.size,
+            schedule = metadata.schedule,
+            lastScheduledRunAtEpochMs = scheduleState?.lastRunAtEpochMs,
+            nextScheduledRunAtEpochMs = scheduleState?.nextRunAtEpochMs,
+            lastScheduledRunState = scheduleState?.lastRunState,
         )
     }
 
