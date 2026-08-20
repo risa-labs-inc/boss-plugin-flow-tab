@@ -31,6 +31,7 @@ class FlowInspectorCopyTest {
             Item(
                 buildJsonObject {
                     put("name", "second")
+                    put("formatted", "line one\n  line two")
                     put("nested", buildJsonObject { put("visibleAfterCollapse", true) })
                 },
             ),
@@ -40,6 +41,21 @@ class FlowInspectorCopyTest {
 
         assertTrue(copied.lines().size > 2, "structured output should retain pretty-printed line breaks")
         assertEquals(JsonArray(items.map { it.json }), Json.parseToJsonElement(copied))
+    }
+
+    @Test
+    fun `oversized output stays valid JSON and reports truncation`() {
+        val items = listOf(
+            Item(buildJsonObject { put("large", "x".repeat(1_000)) }),
+            Item(buildJsonObject { put("small", true) }),
+        )
+
+        val copied = inspectorOutputText(items, maxChars = 300)
+        val parsed = Json.parseToJsonElement(copied) as JsonArray
+
+        assertTrue(copied.length <= 300)
+        assertTrue(parsed.last().toString().contains("_boss_copy_truncated"))
+        assertTrue(parsed.last().toString().contains("Copied 0 of 2"))
     }
 
     @Test

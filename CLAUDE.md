@@ -365,8 +365,9 @@ fixed, dynamic, or secret without rendering the value itself. Card dimensions re
 in `FlowModel.kt` so rendering, edges, hit-testing, imports, and fit-to-content stay aligned.
 
 Inspector diagnostics and results stay inside Compose `SelectionContainer`s so native pointer
-selection and Cmd/Ctrl+C keep working. Explicit copy actions use the host `clipboardProvider`, never
-AWT, and must say when they copy complete stored content beyond a collapsed or truncated preview.
+selection and Cmd/Ctrl+C keep working. Explicit copy actions go through the host `clipboardProvider`
+instead of reaching for AWT directly, and must state whether collapsed, truncated, or complete stored
+content is copied.
 
 ### Canvas layout
 

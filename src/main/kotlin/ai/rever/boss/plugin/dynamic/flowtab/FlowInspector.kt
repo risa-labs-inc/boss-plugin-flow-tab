@@ -69,6 +69,7 @@ private val PanelBorder = FlowTheme.Border
 private val FieldBg = FlowTheme.Canvas
 private val Muted = FlowTheme.TextFaint
 private val prettyJson = Json { prettyPrint = true; isLenient = true }
+private const val INSPECTOR_OUTPUT_COPY_MAX_CHARS = 512 * 1024
 
 // Syntax colors for the collapsible JSON tree in the Output tab.
 private val JsonKeyColor = Color(0xFF7AA2F7)
@@ -84,9 +85,96 @@ private fun setConfig(node: FlowNode, key: String, value: String) {
 private fun configValue(node: FlowNode, field: ConfigField): String =
     (node.config[field.key] as? JsonPrimitive)?.content ?: field.default
 
-/** Complete, pretty-printed output copied by the inspector's explicit action. */
-internal fun inspectorOutputText(output: List<Item>): String =
-    prettyJson.encodeToString(JsonElement.serializer(), JsonArray(output.map { it.json }))
+/**
+ * Pretty-printed output for the inspector clipboard action. Large runs are
+ * bounded and remain valid JSON by ending with an explicit truncation marker.
+ */
+internal fun inspectorOutputText(
+    output: List<Item>,
+    maxChars: Int = INSPECTOR_OUTPUT_COPY_MAX_CHARS,
+): String {
+    require(maxChars > 0)
+    if (output.isEmpty()) return "[]"
+
+    // Estimate before serializing so a single multi-megabyte value is never
+    // duplicated merely to discover that it is too large for the clipboard.
+    val markerReserve = minOf(1_024, maxChars / 2)
+    val estimateBudget = maxChars - markerReserve
+    val included = mutableListOf<JsonElement>()
+    var estimatedChars = 2
+    for (item in output) {
+        val remaining = estimateBudget - estimatedChars
+        if (remaining <= 1) break
+        val itemChars = compactJsonLength(item.json, remaining)
+        if (itemChars > remaining) break
+        included += item.json
+        estimatedChars += itemChars + 1
+    }
+
+    if (included.size == output.size) {
+        val complete = prettyJson.encodeToString(JsonElement.serializer(), JsonArray(included))
+        if (complete.length <= maxChars) return complete
+    }
+
+    while (true) {
+        val marker = JsonObject(
+            mapOf(
+                "_boss_copy_truncated" to JsonPrimitive(
+                    "Copied ${included.size} of ${output.size} output items; remaining items were omitted " +
+                        "to keep clipboard text below 512 KiB.",
+                ),
+            ),
+        )
+        val truncated = prettyJson.encodeToString(
+            JsonElement.serializer(),
+            JsonArray(included + marker),
+        )
+        if (truncated.length <= maxChars || included.isEmpty()) return truncated
+        included.subList((included.size + 1) / 2, included.size).clear()
+    }
+}
+
+private fun compactJsonLength(element: JsonElement, limit: Int): Int {
+    fun cappedAdd(left: Int, right: Int): Int =
+        if (left > limit - right) limit + 1 else left + right
+
+    return when (element) {
+        is JsonObject -> {
+            var size = 2
+            element.entries.forEachIndexed { index, (key, value) ->
+                if (index > 0) size = cappedAdd(size, 1)
+                size = cappedAdd(size, jsonStringLength(key, limit))
+                size = cappedAdd(size, 1)
+                size = cappedAdd(size, compactJsonLength(value, limit))
+                if (size > limit) return limit + 1
+            }
+            size
+        }
+        is JsonArray -> {
+            var size = 2
+            element.forEachIndexed { index, value ->
+                if (index > 0) size = cappedAdd(size, 1)
+                size = cappedAdd(size, compactJsonLength(value, limit))
+                if (size > limit) return limit + 1
+            }
+            size
+        }
+        is JsonPrimitive -> if (element.isString) jsonStringLength(element.content, limit) else element.content.length
+    }
+}
+
+private fun jsonStringLength(value: String, limit: Int): Int {
+    var size = 2
+    for (char in value) {
+        size += when (char) {
+            '"', '\\', '\b', '\t', '\n', '\u000C', '\r' -> 2
+            in '\u0000'..'\u001F' -> 6
+            else -> 1
+        }
+        if (size > limit) return limit + 1
+    }
+    return size
+}
 
 /** Preserve every stored log boundary in the copied block. */
 internal fun inspectorLogsText(logs: List<String>): String = logs.joinToString("\n")
@@ -283,10 +371,15 @@ private fun OutputTab(state: FlowGraphState, node: FlowNode, copyText: (String) 
         CopyableFieldLabel(
             label = "Output (${run.output.size} item${if (run.output.size == 1) "" else "s"})",
             text = { inspectorOutputText(completeOutput) },
-            copyDescription = "Copy complete output JSON, including collapsed values",
-            buttonLabel = "Copy all",
+            copyDescription = "Copy output JSON, including collapsed values; capped at 512 KiB",
+            buttonLabel = "Copy output",
             copyKey = node.id to "output",
             copyText = copyText,
+        )
+        Text(
+            "Clipboard copy is capped at 512 KiB; truncated copies include a JSON marker.",
+            color = Muted,
+            fontSize = 10.sp,
         )
         // Collapsible JSON tree — click a node to fold/unfold; values are selectable
         // for copy. Replaces the flat dump so deep/large extracts stay readable.
@@ -506,9 +599,8 @@ private fun CopyButton(
                 .border(1.dp, PanelBorder, RoundedCornerShape(FlowTheme.rSm))
                 .clickable(onClickLabel = description, role = Role.Button) {
                     scope.launch {
-                        result = withContext(Dispatchers.Default) {
-                            runCatching { copyText(text()) }.getOrDefault(false)
-                        }
+                        val payload = withContext(Dispatchers.Default) { runCatching { text() }.getOrNull() }
+                        result = payload != null && runCatching { copyText(payload) }.getOrDefault(false)
                         attempt += 1
                     }
                 }
@@ -518,11 +610,19 @@ private fun CopyButton(
         ) {
             Icon(
                 imageVector = if (result == true) Icons.Filled.Check else Icons.Filled.ContentCopy,
-                contentDescription = null,
-                tint = if (result == true) FlowTheme.Success else FlowTheme.TextMuted,
+                contentDescription = description,
+                tint = when (result) {
+                    true -> FlowTheme.Success
+                    false -> FlowTheme.Error
+                    null -> FlowTheme.TextMuted
+                },
                 modifier = Modifier.size(12.dp),
             )
-            Text(visibleLabel, color = FlowTheme.TextMuted, fontSize = 10.sp)
+            Text(
+                visibleLabel,
+                color = if (result == false) FlowTheme.Error else FlowTheme.TextMuted,
+                fontSize = 10.sp,
+            )
         }
     }
 }
