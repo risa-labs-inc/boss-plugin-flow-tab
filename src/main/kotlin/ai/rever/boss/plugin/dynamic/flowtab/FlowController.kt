@@ -685,14 +685,14 @@ class FlowController(
      * reload), so advertised durability is real (red-team S2), then re-caches it.
      */
     suspend fun runStatus(runId: String): RunJob? =
-        jobs[runId]
-            ?: FlowPersistenceCoordinator.runUpdate(runId)?.job
+        FlowPersistenceCoordinator.runUpdate(runId)?.job
+            ?: jobs[runId]
             ?: loadJob(runId)?.also { jobs[runId] = it }
 
     /** Read a history snapshot, sharing in-process liveness before repairing stale storage. */
     internal suspend fun runSnapshot(runId: String): RunJob? =
-        jobs[runId]
-            ?: FlowPersistenceCoordinator.runUpdate(runId)?.job
+        FlowPersistenceCoordinator.runUpdate(runId)?.job
+            ?: jobs[runId]
             ?: loadJob(runId)
 
     /** Per-node outputs for [runId] (in-memory or read back from storage), or null. */

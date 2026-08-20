@@ -266,11 +266,11 @@ class FlowTabComponent(
                 // one-slot runstate key. This makes an MCP run visible after reopening.
                 runCatching {
                     withContext(Dispatchers.IO) {
-                        controller.listRuns(config.id).firstOrNull { it.state != RunJobState.RUNNING }
+                        controller.listRuns(config.id)
+                            .firstOrNull { it.state != RunJobState.RUNNING }
+                            ?.let { controller.runSnapshot(it.runId) }
                     }
-                }.getOrNull()?.let { summary ->
-                    controller.runSnapshot(summary.runId)?.let(state::applyRunJob)
-                }
+                }.getOrNull()?.let(state::applyRunJob)
                 // A launcher/sidebar rename may have completed while this graph was
                 // loading. The replayed name wins over the older stored snapshot.
                 FlowPersistenceCoordinator.latestName(config.id)?.let { name ->
@@ -955,7 +955,9 @@ class FlowTabComponent(
                                             .fillMaxWidth()
                                             .clickable {
                                                 uiScope.launch {
-                                                    controller.runSnapshot(summary.runId)?.let { job ->
+                                                    withContext(Dispatchers.IO) {
+                                                        controller.runSnapshot(summary.runId)
+                                                    }?.let { job ->
                                                         if (job.state == RunJobState.RUNNING) {
                                                             state.notice = "That run is still in progress; live status appears automatically"
                                                         } else {
