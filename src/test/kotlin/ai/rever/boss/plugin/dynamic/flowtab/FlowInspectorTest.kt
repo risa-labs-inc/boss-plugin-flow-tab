@@ -2,6 +2,7 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
@@ -66,6 +67,7 @@ class FlowInspectorTest {
         assertEquals("already string-backed", configValue(primitive, jsonField))
 
         assertEquals(jsonField.default, configValue(node(buildJsonObject {}), jsonField))
+        assertEquals(jsonField.default, configValue(node(buildJsonObject { put(jsonField.key, JsonNull) }), jsonField))
 
         val textField = ConfigField(jsonField.key, "Payload", FieldType.TEXT, default = "text fallback")
         val structured = node(buildJsonObject { put(jsonField.key, buildJsonObject { put("kept", true) }) })

@@ -79,6 +79,7 @@ internal fun setConfig(node: FlowNode, key: String, value: String) {
 internal fun configValue(node: FlowNode, field: ConfigField): String {
     val value = node.config[field.key] ?: return field.default
     return when {
+        value === JsonNull -> field.default
         value is JsonPrimitive -> value.content
         field.type == FieldType.JSON -> prettyJson.encodeToString(JsonElement.serializer(), value)
         else -> field.default
