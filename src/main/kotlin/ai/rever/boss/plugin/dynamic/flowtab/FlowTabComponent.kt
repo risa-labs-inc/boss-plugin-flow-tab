@@ -701,6 +701,7 @@ class FlowTabComponent(
                 flowName = currentFlowName,
                 scale = state.scale,
                 isRunning = state.isRunning,
+                canStop = currentCanvasHistoryRunId.get() != null,
                 realistic = realistic,
                 onToggleRealistic = { realistic = !realistic },
                 headless = state.allBrowserHeadless,
@@ -975,6 +976,7 @@ private fun Toolbar(
     renameEnabled: Boolean,
     scale: Float,
     isRunning: Boolean,
+    canStop: Boolean,
     realistic: Boolean,
     onToggleRealistic: () -> Unit,
     headless: Boolean,
@@ -1032,19 +1034,45 @@ private fun Toolbar(
         Row(
             modifier = Modifier
                 .clip(RoundedCornerShape(7.dp))
-                .background(if (isRunning) FlowTheme.Error else RunGreen)
-                .clickable(onClick = if (isRunning) onStop else onRun)
+                .background(
+                    when {
+                        !isRunning -> RunGreen
+                        canStop -> FlowTheme.Error
+                        else -> NoticeBg
+                    }
+                )
+                .clickable(
+                    enabled = !isRunning || canStop,
+                    onClick = if (isRunning) onStop else onRun,
+                )
                 .padding(horizontal = 9.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                if (isRunning) Icons.Filled.Stop else Icons.Filled.PlayArrow,
-                contentDescription = if (isRunning) "Stop" else "Run",
+                when {
+                    !isRunning -> Icons.Filled.PlayArrow
+                    canStop -> Icons.Filled.Stop
+                    else -> Icons.Filled.Schedule
+                },
+                contentDescription = when {
+                    !isRunning -> "Run"
+                    canStop -> "Stop"
+                    else -> "Running through MCP"
+                },
                 tint = Color.White,
                 modifier = Modifier.size(13.dp)
             )
             Spacer(Modifier.width(4.dp))
-            Text(if (isRunning) "Stop" else "Run", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+            Text(
+                when {
+                    !isRunning -> "Run"
+                    canStop -> "Stop"
+                    else -> "Running"
+                },
+                color = Color.White,
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+            )
         }
 
         Spacer(Modifier.width(8.dp))

@@ -466,13 +466,14 @@ class FlowController(
                     states[id] = r
                     // flow_result must be a non-blocking snapshot even while the
                     // run is active. Do not let late output overwrite a watchdog result.
-                    jobs.computeIfPresent(runId) { _, current ->
+                    val liveJob = jobs.computeIfPresent(runId) { _, current ->
                         if (current.state == RunJobState.RUNNING) {
                             current.copy(nodes = states.toRunSnapshot().states)
                         } else {
                             current
                         }
                     }
+                    liveJob?.let(FlowPersistenceCoordinator::publishRunUpdate)
                     // Serialize storage writes through persistRun so a delayed live
                     // snapshot can never overwrite a terminal watchdog verdict.
                     lifecycleScope.launch { jobs[runId]?.let { persistRun(it) } }
