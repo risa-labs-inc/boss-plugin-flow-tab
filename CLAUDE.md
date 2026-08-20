@@ -107,7 +107,7 @@ still a configuration conflict.
 `FieldType.JSON` Parameters editors must render structured `JsonObject`/`JsonArray` config as
 editable pretty JSON, never as a blank/default. The first edit intentionally normalizes it to a
 string-backed `JsonPrimitive`; JSON-field executors must accept both shapes so imported/MCP-authored
-config and inspector edits round-trip identically.
+config remains readable before and after inspector edits.
 
 Agent structured output is optional and backward-compatible. A non-blank `outputSchema` must have
 root `"type": "object"`; Flow advertises a reserved `flow_submit_output` tool whose input schema
