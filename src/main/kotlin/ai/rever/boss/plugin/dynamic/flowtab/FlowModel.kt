@@ -206,8 +206,8 @@ const val NODE_WIDTH = 272f
 const val PORT_RADIUS = 6f
 const val NODE_CORNER = 14f
 
-/** Base card height — type eyebrow + title/action summary — used when a side has ≤1 port. */
-const val NODE_ROW_H = 86f
+/** Base card height — type eyebrow + readable title + action summary — used when a side has ≤1 port. */
+const val NODE_ROW_H = 100f
 
 /** Extra height for the metadata chip row, added only to types that show it. */
 const val NODE_META_H = 22f
