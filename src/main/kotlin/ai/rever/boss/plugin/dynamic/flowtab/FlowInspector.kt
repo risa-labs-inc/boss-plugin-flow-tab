@@ -72,6 +72,12 @@ private val prettyJson = Json { prettyPrint = true; isLenient = true }
 private val compactJson = Json { isLenient = true }
 private const val INSPECTOR_OUTPUT_COPY_MAX_CHARS = 512 * 1024
 
+private data class IncludedOutput(
+    val index: Int,
+    val value: JsonElement,
+    val shortenedString: Boolean,
+)
+
 // Syntax colors for the collapsible JSON tree in the Output tab.
 private val JsonKeyColor = Color(0xFF7AA2F7)
 private val JsonStringColor = Color(0xFF9ECE6A)
@@ -102,22 +108,21 @@ internal fun inspectorOutputText(
     val stringLimit = maxOf(32, maxChars / 4)
     val markerReserve = minOf(1_024, maxChars / 2)
     val estimateBudget = maxChars - markerReserve
-    val included = mutableListOf<Pair<Int, JsonElement>>()
-    var leafContentTruncated = false
+    val included = mutableListOf<IncludedOutput>()
     var estimatedChars = 2
     for ((index, item) in output.withIndex()) {
         val bounded = item.json.boundStringLeaves(stringLimit)
-        leafContentTruncated = leafContentTruncated || bounded.truncated
         val remaining = estimateBudget - estimatedChars
         if (remaining <= 1) break
         val itemChars = compactJsonLength(bounded.value, remaining)
-        if (itemChars > remaining) continue
-        included += index to bounded.value
+        // Preserve the tree's item indices: omit only a tail, never a middle item.
+        if (itemChars > remaining) break
+        included += IncludedOutput(index, bounded.value, bounded.truncated)
         estimatedChars += itemChars + 1
     }
 
-    if (included.size == output.size && !leafContentTruncated) {
-        val values = JsonArray(included.map { it.second })
+    if (included.size == output.size && included.none { it.shortenedString }) {
+        val values = JsonArray(included.map { it.value })
         val complete = prettyJson.encodeToString(JsonElement.serializer(), values)
         if (complete.length <= maxChars) return complete
         val compact = compactJson.encodeToString(JsonElement.serializer(), values)
@@ -125,12 +130,12 @@ internal fun inspectorOutputText(
     }
 
     while (true) {
-        val includedIndices = included.mapTo(mutableSetOf()) { it.first }
+        val includedIndices = included.mapTo(mutableSetOf()) { it.index }
         val omittedIndices = output.indices.filterNot(includedIndices::contains)
         val omittedSummary = omittedIndices.take(8).joinToString(",") +
             if (omittedIndices.size > 8) ",…" else ""
         val reason = buildList {
-            if (leafContentTruncated) add("long string values were shortened")
+            if (included.any { it.shortenedString }) add("long string values were shortened")
             if (omittedIndices.isNotEmpty()) add("item indices [$omittedSummary] were omitted")
         }.joinToString("; ")
         val marker = JsonObject(
@@ -140,7 +145,7 @@ internal fun inspectorOutputText(
                 ),
             ),
         )
-        val values = JsonArray(included.map { it.second } + marker)
+        val values = JsonArray(included.map { it.value } + marker)
         val pretty = prettyJson.encodeToString(
             JsonElement.serializer(),
             values,
