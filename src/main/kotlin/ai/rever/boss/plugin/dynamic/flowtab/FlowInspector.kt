@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.TooltipArea
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -28,24 +30,33 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.Icon
 import androidx.compose.material.Text
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -58,6 +69,14 @@ private val PanelBorder = FlowTheme.Border
 private val FieldBg = FlowTheme.Canvas
 private val Muted = FlowTheme.TextFaint
 private val prettyJson = Json { prettyPrint = true; isLenient = true }
+private val compactJson = Json { isLenient = true }
+private const val INSPECTOR_OUTPUT_COPY_MAX_CHARS = 512 * 1024
+
+private data class IncludedOutput(
+    val index: Int,
+    val value: JsonElement,
+    val shortenedString: Boolean,
+)
 
 // Syntax colors for the collapsible JSON tree in the Output tab.
 private val JsonKeyColor = Color(0xFF7AA2F7)
@@ -74,11 +93,154 @@ private fun configValue(node: FlowNode, field: ConfigField): String =
     (node.config[field.key] as? JsonPrimitive)?.content ?: field.default
 
 /**
+ * Pretty-printed output for the inspector clipboard action. Large runs are
+ * bounded and remain valid JSON by ending with an explicit truncation marker.
+ */
+internal fun inspectorOutputText(
+    output: List<Item>,
+    maxChars: Int = INSPECTOR_OUTPUT_COPY_MAX_CHARS,
+): String {
+    require(maxChars >= 256)
+    if (output.isEmpty()) return "[]"
+
+    // Bound individual string leaves before serialization so a multi-megabyte
+    // HTML/SVG value still yields its surrounding structure and a useful prefix.
+    val stringLimit = maxOf(32, maxChars / 4)
+    val markerReserve = minOf(1_024, maxChars / 2)
+    val estimateBudget = maxChars - markerReserve
+    val included = mutableListOf<IncludedOutput>()
+    var estimatedChars = 2
+    for ((index, item) in output.withIndex()) {
+        val bounded = item.json.boundStringLeaves(stringLimit)
+        val remaining = estimateBudget - estimatedChars
+        if (remaining <= 1) break
+        val itemChars = compactJsonLength(bounded.value, remaining)
+        // Preserve the tree's item indices: omit only a tail, never a middle item.
+        if (itemChars > remaining) break
+        included += IncludedOutput(index, bounded.value, bounded.truncated)
+        estimatedChars += itemChars + 1
+    }
+
+    if (included.size == output.size && included.none { it.shortenedString }) {
+        val values = JsonArray(included.map { it.value })
+        val complete = prettyJson.encodeToString(JsonElement.serializer(), values)
+        if (complete.length <= maxChars) return complete
+        val compact = compactJson.encodeToString(JsonElement.serializer(), values)
+        if (compact.length <= maxChars) return compact
+    }
+
+    while (true) {
+        val includedIndices = included.mapTo(mutableSetOf()) { it.index }
+        val omittedIndices = output.indices.filterNot(includedIndices::contains)
+        val omittedSummary = omittedIndices.take(8).joinToString(",") +
+            if (omittedIndices.size > 8) ",…" else ""
+        val reason = buildList {
+            if (included.any { it.shortenedString }) add("long string values were shortened")
+            if (omittedIndices.isNotEmpty()) add("item indices [$omittedSummary] were omitted")
+        }.joinToString("; ")
+        val marker = JsonObject(
+            mapOf(
+                "_boss_copy_truncated" to JsonPrimitive(
+                    "Copied ${included.size} of ${output.size} items; $reason. Limit: $maxChars characters.",
+                ),
+            ),
+        )
+        val values = JsonArray(included.map { it.value } + marker)
+        val pretty = prettyJson.encodeToString(
+            JsonElement.serializer(),
+            values,
+        )
+        if (pretty.length <= maxChars) return pretty
+        val compact = compactJson.encodeToString(JsonElement.serializer(), values)
+        if (compact.length <= maxChars) return compact
+        if (included.isEmpty()) {
+            return """[{"_boss_copy_truncated":"Output exceeded the $maxChars character clipboard limit."}]"""
+        }
+        included.subList(included.size / 2, included.size).clear()
+    }
+}
+
+private data class BoundedJson(val value: JsonElement, val truncated: Boolean)
+
+private fun JsonElement.boundStringLeaves(maxChars: Int): BoundedJson = when (this) {
+    is JsonObject -> {
+        var truncated = false
+        val values = mapValues { (_, value) ->
+            value.boundStringLeaves(maxChars).also { truncated = truncated || it.truncated }.value
+        }
+        BoundedJson(JsonObject(values), truncated)
+    }
+    is JsonArray -> {
+        var truncated = false
+        val values = map { value ->
+            value.boundStringLeaves(maxChars).also { truncated = truncated || it.truncated }.value
+        }
+        BoundedJson(JsonArray(values), truncated)
+    }
+    is JsonPrimitive -> if (isString && content.length > maxChars) {
+        val omitted = content.length - maxChars
+        BoundedJson(JsonPrimitive(content.take(maxChars) + "… [truncated, $omitted characters omitted]"), true)
+    } else {
+        BoundedJson(this, false)
+    }
+}
+
+private fun compactJsonLength(element: JsonElement, limit: Int): Int {
+    fun cappedAdd(left: Int, right: Int): Int =
+        if (left > limit - right) limit + 1 else left + right
+
+    return when (element) {
+        is JsonObject -> {
+            var size = 2
+            element.entries.forEachIndexed { index, (key, value) ->
+                if (index > 0) size = cappedAdd(size, 1)
+                size = cappedAdd(size, jsonStringLength(key, limit))
+                size = cappedAdd(size, 1)
+                size = cappedAdd(size, compactJsonLength(value, limit))
+                if (size > limit) return limit + 1
+            }
+            size
+        }
+        is JsonArray -> {
+            var size = 2
+            element.forEachIndexed { index, value ->
+                if (index > 0) size = cappedAdd(size, 1)
+                size = cappedAdd(size, compactJsonLength(value, limit))
+                if (size > limit) return limit + 1
+            }
+            size
+        }
+        is JsonPrimitive -> if (element.isString) jsonStringLength(element.content, limit) else element.content.length
+    }
+}
+
+private fun jsonStringLength(value: String, limit: Int): Int {
+    var size = 2
+    for (char in value) {
+        size += when (char) {
+            '"', '\\', '\b', '\t', '\n', '\u000C', '\r' -> 2
+            in '\u0000'..'\u001F' -> 6
+            else -> 1
+        }
+        if (size > limit) return limit + 1
+    }
+    return size
+}
+
+/** Preserve every stored log boundary in the copied block. */
+internal fun inspectorLogsText(logs: List<String>): String = logs.joinToString("\n")
+
+/**
  * Right-side inspector for the selected node: edit its title + config fields
  * (Parameters), edit raw config JSON, and view the last run's output + logs.
  */
 @Composable
-fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Modifier) {
+fun FlowInspector(
+    state: FlowGraphState,
+    node: FlowNode,
+    copyText: (String) -> Boolean,
+    modifier: Modifier = Modifier,
+) {
     // Default to the Output tab once a node has run, so its extracted data (or error)
     // is the first thing shown; otherwise start on Parameters.
     var tab by remember(node.id) { mutableStateOf(if (state.runStates[node.id] != null) 2 else 0) } // 0 params, 1 json, 2 output
@@ -110,7 +272,7 @@ fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Mo
         }
 
         // Run status of this node — the first thing you want when a flow finishes.
-        StatusBanner(state.runStates[node.id])
+        StatusBanner(node.id, state.runStates[node.id], copyText)
 
         // Title editor
         FieldLabel("Name")
@@ -126,8 +288,8 @@ fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Mo
         Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
             when (tab) {
                 0 -> ParametersTab(node)
-                1 -> JsonTab(node)
-                else -> OutputTab(state, node)
+                1 -> JsonTab(node, copyText)
+                else -> OutputTab(state, node, copyText)
             }
         }
     }
@@ -138,16 +300,18 @@ fun FlowInspector(state: FlowGraphState, node: FlowNode, modifier: Modifier = Mo
 private fun ParametersTab(node: FlowNode) {
     val fields = node.spec.configFields
     if (node.spec.isUnavailable) {
-        Text(
-            "This node kind (\"${node.kind}\") isn't available in this build — its provider " +
-                "isn't loaded. The node is preserved; edit its raw config in the JSON tab.",
-            color = FlowTheme.Error,
-            fontSize = 12.sp,
-        )
+        SelectionContainer {
+            Text(
+                "This node kind (\"${node.kind}\") isn't available in this build — its provider " +
+                    "isn't loaded. The node is preserved; edit its raw config in the JSON tab.",
+                color = FlowTheme.Error,
+                fontSize = 12.sp,
+            )
+        }
         return
     }
     if (fields.isEmpty()) {
-        Text("This node has no parameters.", color = Muted, fontSize = 12.sp)
+        SelectionContainer { Text("This node has no parameters.", color = Muted, fontSize = 12.sp) }
         return
     }
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -185,17 +349,24 @@ private fun ParametersTab(node: FlowNode) {
                 }
                 // Explanatory text only. Deliberately ignore node.config so a legacy
                 // stored value cannot masquerade as a live editable setting.
-                FieldType.INFO -> Text(info, color = Muted, fontSize = 12.sp)
+                FieldType.INFO -> SelectionContainer { Text(info, color = Muted, fontSize = 12.sp) }
             }
         }
     }
 }
 
 @Composable
-private fun JsonTab(node: FlowNode) {
+private fun JsonTab(node: FlowNode, copyText: (String) -> Boolean) {
     var text by remember(node.id) { mutableStateOf(prettyJson.encodeToString(JsonObject.serializer(), node.config)) }
     var error by remember(node.id) { mutableStateOf<String?>(null) }
-    FieldLabel("Config (raw JSON)")
+    val displayedText = text
+    CopyableFieldLabel(
+        label = "Config (raw JSON)",
+        text = { displayedText },
+        copyDescription = "Copy displayed config JSON",
+        copyKey = node.id to "config",
+        copyText = copyText,
+    )
     TextInput(text, singleLine = false, mono = true, error = error != null) {
         text = it
         error = runCatching {
@@ -204,42 +375,69 @@ private fun JsonTab(node: FlowNode) {
         }.getOrElse { ex -> ex.message ?: "invalid JSON" }
     }
     if (error != null) {
-        Text(
-            "⚠ Invalid JSON — changes not applied: ${error}",
-            color = FlowTheme.Error,
-            fontSize = 11.sp,
-            modifier = Modifier.padding(top = 4.dp)
-        )
+        SelectionContainer {
+            Text(
+                "⚠ Invalid JSON — changes not applied: ${error}",
+                color = FlowTheme.Error,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
     }
 }
 
 @Composable
-private fun OutputTab(state: FlowGraphState, node: FlowNode) {
+private fun OutputTab(state: FlowGraphState, node: FlowNode, copyText: (String) -> Boolean) {
     val run = state.runStates[node.id]
     if (run == null) {
-        Text("Run the flow to see this node's output.", color = Muted, fontSize = 12.sp)
+        SelectionContainer { Text("Run the flow to see this node's output.", color = Muted, fontSize = 12.sp) }
         return
     }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         // Status shown in the always-visible banner above; here we focus on detail.
         if (run.error != null) {
-            FieldLabel("Error")
-            Text(run.error, color = FlowTheme.Error, fontSize = 12.sp)
+            CopyableFieldLabel(
+                "Error",
+                { run.error },
+                "Copy complete error text",
+                copyKey = node.id to "error",
+                copyText = copyText,
+            )
+            SelectionContainer { Text(run.error, color = FlowTheme.Error, fontSize = 12.sp) }
         }
         if (run.logs.isNotEmpty()) {
-            FieldLabel("Logs")
-            Text(run.logs.joinToString("\n"), color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            val logsText = remember(run.logs) { inspectorLogsText(run.logs) }
+            CopyableFieldLabel(
+                "Logs",
+                { logsText },
+                "Copy complete log text",
+                copyKey = node.id to "logs",
+                copyText = copyText,
+            )
+            SelectionContainer {
+                Text(logsText, color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+            }
         }
-        FieldLabel("Output (${run.output.size} item${if (run.output.size == 1) "" else "s"})")
+        val completeOutput = run.output
+        CopyableFieldLabel(
+            label = "Output (${run.output.size} item${if (run.output.size == 1) "" else "s"})",
+            text = { inspectorOutputText(completeOutput) },
+            copyDescription = "Copy output JSON, including collapsed values; capped at 512K characters",
+            buttonLabel = "Copy output",
+            copyKey = node.id to "output",
+            copyText = copyText,
+        )
         // Collapsible JSON tree — click a node to fold/unfold; values are selectable
         // for copy. Replaces the flat dump so deep/large extracts stay readable.
-        Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(FlowTheme.rSm)).background(FieldBg).padding(vertical = 6.dp, horizontal = 8.dp)) {
-            Column {
-                if (run.output.isEmpty()) {
-                    Text("[]", color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
-                } else {
-                    run.output.forEachIndexed { i, item ->
-                        JsonNode(label = "[$i]", element = item.json, depth = 0)
+        SelectionContainer {
+            Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(FlowTheme.rSm)).background(FieldBg).padding(vertical = 6.dp, horizontal = 8.dp)) {
+                Column {
+                    if (run.output.isEmpty()) {
+                        Text("[]", color = Muted, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
+                    } else {
+                        run.output.forEachIndexed { i, item ->
+                            JsonNode(label = "[$i]", element = item.json, depth = 0)
+                        }
                     }
                 }
             }
@@ -307,7 +505,7 @@ private fun JsonLeaf(label: String?, prim: JsonPrimitive, depth: Int) {
         if (label != null) {
             Text("$label: ", color = JsonKeyColor, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
         }
-        SelectionContainer { Text(text, color = color, fontSize = 11.sp, fontFamily = FontFamily.Monospace) }
+        Text(text, color = color, fontSize = 11.sp, fontFamily = FontFamily.Monospace)
     }
 }
 
@@ -317,7 +515,7 @@ private fun JsonLeaf(label: String?, prim: JsonPrimitive, depth: Int) {
  * updates live while a flow executes.
  */
 @Composable
-private fun StatusBanner(run: NodeRun?) {
+private fun StatusBanner(nodeId: String, run: NodeRun?, copyText: (String) -> Boolean) {
     val status = run?.status
     val color = runStatusColor(status) ?: FlowTheme.TextFaint
     val label = when (status) {
@@ -338,22 +536,138 @@ private fun StatusBanner(run: NodeRun?) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(8.dp).clip(CircleShape).background(color))
             Spacer(Modifier.width(8.dp))
-            Text(
-                label,
-                color = if (status == null) FlowTheme.TextMuted else color,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.SemiBold
-            )
+            SelectionContainer {
+                Text(
+                    label,
+                    color = if (status == null) FlowTheme.TextMuted else color,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
         }
         val err = run?.error
         if (status == RunStatus.ERROR && !err.isNullOrBlank()) {
+            var truncated by remember(err) { mutableStateOf(false) }
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                verticalAlignment = Alignment.Top,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Column(Modifier.weight(1f)) {
+                    SelectionContainer {
+                        Text(
+                            err,
+                            color = FlowTheme.TextMuted,
+                            fontSize = 11.sp,
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis,
+                            onTextLayout = { truncated = it.hasVisualOverflow },
+                        )
+                    }
+                    if (truncated) {
+                        Text("Preview · Copy full uses the complete error", color = Muted, fontSize = 10.sp)
+                    }
+                }
+                CopyButton(
+                    text = { err },
+                    description = if (truncated) "Copy complete error text" else "Copy error text",
+                    buttonLabel = if (truncated) "Copy full" else "Copy",
+                    feedbackKey = nodeId to err,
+                    copyText = copyText,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CopyableFieldLabel(
+    label: String,
+    text: () -> String,
+    copyDescription: String,
+    buttonLabel: String = "Copy",
+    copyKey: Any,
+    copyText: (String) -> Boolean,
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        FieldLabel(label)
+        Spacer(Modifier.weight(1f))
+        CopyButton(text, copyDescription, buttonLabel, copyKey, copyText)
+    }
+}
+
+/** Explicit clipboard action with platform-independent host wiring and brief feedback. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CopyButton(
+    text: () -> String,
+    description: String,
+    buttonLabel: String,
+    feedbackKey: Any,
+    copyText: (String) -> Boolean,
+) {
+    val scope = rememberCoroutineScope()
+    var result by remember(feedbackKey) { mutableStateOf<Boolean?>(null) }
+    var attempt by remember(feedbackKey) { mutableStateOf(0) }
+    LaunchedEffect(attempt) {
+        if (attempt > 0) {
+            delay(1_500)
+            result = null
+        }
+    }
+    val visibleLabel = when (result) {
+        true -> "Copied"
+        false -> "Copy failed"
+        null -> buttonLabel
+    }
+    val tooltip = when (result) {
+        true -> "$description — copied"
+        false -> "$description — clipboard unavailable"
+        null -> description
+    }
+    TooltipArea(
+        delayMillis = 350,
+        tooltip = {
+            Box(
+                Modifier
+                    .clip(RoundedCornerShape(FlowTheme.rSm))
+                    .background(Color(0xFF111114))
+                    .border(1.dp, PanelBorder, RoundedCornerShape(FlowTheme.rSm))
+                    .padding(horizontal = 8.dp, vertical = 4.dp)
+            ) {
+                Text(tooltip, color = Color.White, fontSize = 11.sp)
+            }
+        },
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(FlowTheme.rSm))
+                .border(1.dp, PanelBorder, RoundedCornerShape(FlowTheme.rSm))
+                .clickable(onClickLabel = description, role = Role.Button) {
+                    scope.launch {
+                        val payload = withContext(Dispatchers.Default) { runCatching { text() }.getOrNull() }
+                        result = payload != null && runCatching { copyText(payload) }.getOrDefault(false)
+                        attempt += 1
+                    }
+                }
+                .padding(horizontal = 6.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Icon(
+                imageVector = if (result == true) Icons.Filled.Check else Icons.Filled.ContentCopy,
+                contentDescription = description,
+                tint = when (result) {
+                    true -> FlowTheme.Success
+                    false -> FlowTheme.Error
+                    null -> FlowTheme.TextMuted
+                },
+                modifier = Modifier.size(12.dp),
+            )
             Text(
-                err,
-                color = FlowTheme.TextMuted,
-                fontSize = 11.sp,
-                maxLines = 3,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.padding(top = 4.dp)
+                visibleLabel,
+                color = if (result == false) FlowTheme.Error else FlowTheme.TextMuted,
+                fontSize = 10.sp,
             )
         }
     }

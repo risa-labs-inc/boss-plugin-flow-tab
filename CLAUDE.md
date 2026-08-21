@@ -364,6 +364,11 @@ credentials, request bodies, or assignment payloads. Metadata chips may identify
 fixed, dynamic, or secret without rendering the value itself. Card dimensions remain centralized
 in `FlowModel.kt` so rendering, edges, hit-testing, imports, and fit-to-content stay aligned.
 
+Inspector diagnostics and results stay inside Compose `SelectionContainer`s so native pointer
+selection and Cmd/Ctrl+C keep working. Explicit copy actions go through the host `clipboardProvider`
+instead of reaching for AWT directly, and must state whether collapsed, truncated, or complete stored
+content is copied.
+
 ### Canvas layout
 
 `FlowLayout.kt` owns deterministic graph placement. Tidy layout assigns longest-path dependency
