@@ -76,7 +76,8 @@ private val EdgeHighlight = FlowTheme.Accent
 fun FlowCanvas(
     state: FlowGraphState,
     modifier: Modifier = Modifier,
-    onViewportSize: (Size) -> Unit = {}
+    onViewportSize: (Size) -> Unit = {},
+    onManualViewportChange: () -> Unit = {},
 ) {
     var viewport by remember { mutableStateOf(Size.Zero) }
 
@@ -112,6 +113,7 @@ fun FlowCanvas(
                                 if (sy != 0f && state.pickerRequest == null && !change.isConsumed) {
                                     val factor = if (sy < 0f) ZOOM_STEP else 1f / ZOOM_STEP
                                     state.zoomBy(factor, change.position)
+                                    onManualViewportChange()
                                     change.consume()
                                 }
                             }
@@ -161,6 +163,7 @@ fun FlowCanvas(
                         if (delta != Offset.Zero) {
                             dragged = true
                             state.panOffset += delta
+                            onManualViewportChange()
                             change.consume()
                         }
                     }
@@ -336,9 +339,19 @@ private fun DrawScope.drawEdges(state: FlowGraphState) {
     for (edge in state.edges) {
         val ends = state.edgeEndpoints(edge) ?: continue
         val active = state.selection == Selection.Edge(edge.id) || state.hoveredEdgeId == edge.id
-        val color = if (active) EdgeHighlight else EdgeColor
-        val width = if (active) 3.5f else 2f
+        val flowing = state.isRunning && state.runStates[edge.toNode]?.status == RunStatus.RUNNING
+        val color = when {
+            active -> EdgeHighlight
+            flowing -> FlowTheme.Accent.copy(alpha = 0.7f)
+            else -> EdgeColor
+        }
+        val width = when {
+            active -> 3.5f
+            flowing -> 2.5f
+            else -> 2f
+        }
         drawEdgePath(state, ends.first, ends.second, color, width, arrow = true)
+        if (flowing) drawExecutionPulse(state, ends.first, ends.second)
     }
 
     val pending = state.pendingConnection
@@ -356,6 +369,28 @@ private fun DrawScope.drawEdges(state: FlowGraphState) {
             drawCircle(color, radius = if (snap != null) 5f else 4f, center = state.toScreen(endWorld))
         }
     }
+}
+
+/** A moving dot on an incoming edge makes execution direction legible at a glance.
+ * More than one edge can pulse at once, so parallel branches remain truthful. */
+private fun DrawScope.drawExecutionPulse(state: FlowGraphState, startWorld: Offset, endWorld: Offset) {
+    val (c1w, c2w) = edgeControlPoints(startWorld, endWorld)
+    // A one-second loop (repaintTick advances every 100 ms) is fast enough to read
+    // as motion without competing with the node content.
+    val t = ((state.repaintTick % 10) / 10f).coerceIn(0f, 1f)
+    val point = executionPulsePoint(
+        state.toScreen(startWorld), state.toScreen(c1w), state.toScreen(c2w), state.toScreen(endWorld), t
+    )
+    drawCircle(FlowTheme.Accent, radius = 5f, center = point)
+    drawCircle(Color.White.copy(alpha = 0.72f), radius = 2f, center = point)
+}
+
+private fun executionPulsePoint(start: Offset, c1: Offset, c2: Offset, end: Offset, t: Float): Offset {
+    val u = 1f - t
+    return start * (u * u * u) +
+        c1 * (3f * u * u * t) +
+        c2 * (3f * u * t * t) +
+        end * (t * t * t)
 }
 
 private fun DrawScope.drawEdgePath(

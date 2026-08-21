@@ -238,6 +238,7 @@ class FlowTabComponent(
     @Composable
     override fun Content() {
         var viewportSize by remember { mutableStateOf(Size.Zero) }
+        var followExecution by remember { mutableStateOf(true) }
         val focusRequester = remember { FocusRequester() }
 
         val storage = remember {
@@ -742,6 +743,28 @@ class FlowTabComponent(
         }
 
         val selectedNode = (state.selection as? Selection.Node)?.let { state.nodeById(it.id) }
+        val runningNodes = state.nodes.filter { state.runStates[it.id]?.status == RunStatus.RUNNING }
+        val completedNodeCount = state.nodes.count {
+            when (state.runStates[it.id]?.status) {
+                RunStatus.SUCCESS, RunStatus.SKIPPED, RunStatus.ERROR -> true
+                else -> false
+            }
+        }
+        val primaryRunningNode = runningNodes.firstOrNull()
+
+        // Follow is intentionally opt-out: it helps on long flows, but any canvas
+        // pan/zoom pauses it so people can inspect another branch without a fight.
+        LaunchedEffect(state.isRunning, primaryRunningNode?.id, followExecution, viewportSize) {
+            val node = primaryRunningNode
+            if (state.isRunning && followExecution && node != null && viewportSize != Size.Zero) {
+                state.selection = Selection.Node(node.id)
+                val nodeCenter = Offset(
+                    node.x + nodeOuterWidth() / 2f,
+                    node.y + nodeHeight(node.spec) / 2f,
+                )
+                state.panOffset = Offset(viewportSize.width / 2f, viewportSize.height / 2f) - nodeCenter * state.scale
+            }
+        }
         var confirmClear by remember { mutableStateOf(false) }
         var showGallery by remember { mutableStateOf(false) }
         var showMcpConfig by remember { mutableStateOf(false) }
@@ -765,7 +788,7 @@ class FlowTabComponent(
                 onToggleRealistic = { realistic = !realistic },
                 headless = state.allBrowserHeadless,
                 onToggleHeadless = { state.setAllBrowserHeadless(!state.allBrowserHeadless) },
-                onRun = { startRun() },
+                onRun = { followExecution = true; startRun() },
                 onStop = { stopRun() },
                 onNewFlow = {
                     context.splitViewOperations?.openTab(
@@ -815,6 +838,17 @@ class FlowTabComponent(
                 onExport = { exportFlow() },
                 onImport = { importFlow() }
             )
+
+            if (state.isRunning) {
+                ExecutionProgressStrip(
+                    primaryNode = primaryRunningNode,
+                    parallelNodeCount = (runningNodes.size - 1).coerceAtLeast(0),
+                    completedNodeCount = completedNodeCount,
+                    totalNodeCount = state.nodes.size,
+                    following = followExecution,
+                    onToggleFollow = { followExecution = !followExecution },
+                )
+            }
 
             // One status bar at a time, prioritized: clear-confirm > run error > notice.
             // (Stacking three banners pushed the canvas down and read as noise.)
@@ -883,7 +917,8 @@ class FlowTabComponent(
                 ) {
                     FlowCanvas(
                         state = state,
-                        onViewportSize = { viewportSize = it }
+                        onViewportSize = { viewportSize = it },
+                        onManualViewportChange = { followExecution = false },
                     )
                 }
 
@@ -1038,6 +1073,56 @@ class FlowTabComponent(
                 )
             }
         }
+    }
+}
+
+/** Persistent run context for long canvases. The card is the local "now" signal;
+ * this strip provides the global answer without forcing the user to find that card. */
+@Composable
+private fun ExecutionProgressStrip(
+    primaryNode: FlowNode?,
+    parallelNodeCount: Int,
+    completedNodeCount: Int,
+    totalNodeCount: Int,
+    following: Boolean,
+    onToggleFollow: () -> Unit,
+) {
+    val currentLabel = primaryNode?.title?.ifBlank { primaryNode.spec.label } ?: "Preparing flow"
+    val parallelLabel = if (parallelNodeCount > 0) " + $parallelNodeCount parallel" else ""
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(FlowTheme.Primary.copy(alpha = 0.18f))
+            .border(1.dp, FlowTheme.Primary.copy(alpha = 0.35f))
+            .padding(horizontal = 12.dp, vertical = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(FlowTheme.Accent)
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = "Running $completedNodeCount / $totalNodeCount · $currentLabel$parallelLabel",
+            color = FlowTheme.TextPrimary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            text = if (following) "Following" else "Follow",
+            color = if (following) FlowTheme.Accent else FlowTheme.TextPrimary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier
+                .clip(RoundedCornerShape(FlowTheme.rSm))
+                .clickable(onClick = onToggleFollow)
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+        )
     }
 }
 

@@ -1,7 +1,12 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -247,6 +252,12 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode, displayNumber: Int) {
 
     val run = state.runStates[node.id]
     val status = run?.status
+    val runningPulse by rememberInfiniteTransition(label = "node-running-${node.id}").animateFloat(
+        initialValue = 0.45f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(800), repeatMode = RepeatMode.Reverse),
+        label = "node-running-pulse",
+    )
 
     // Border reflects run state (error > running > success); otherwise selection/hover.
     val borderColor = when (status) {
@@ -260,7 +271,14 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode, displayNumber: Int) {
             else -> NodeBorder
         }
     }
-    val borderWidth = if (status != null || selected) 1.5.dp else 1.dp
+    val borderWidth = when {
+        status == RunStatus.RUNNING -> (1.5f + runningPulse).dp
+        status != null || selected -> 1.5.dp
+        else -> 1.dp
+    }
+    val visibleBorderColor = if (status == RunStatus.RUNNING) {
+        borderColor.copy(alpha = 0.55f + (runningPulse * 0.45f))
+    } else borderColor
 
     Box(
         modifier = Modifier
@@ -302,7 +320,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode, displayNumber: Int) {
                 .shadow(elevation, RoundedCornerShape(corner), clip = false)
                 .clip(RoundedCornerShape(corner))
                 .background(NodeBody)
-                .border(borderWidth, borderColor, RoundedCornerShape(corner))
+                .border(borderWidth, visibleBorderColor, RoundedCornerShape(corner))
         ) {
             Row(
                 modifier = Modifier
