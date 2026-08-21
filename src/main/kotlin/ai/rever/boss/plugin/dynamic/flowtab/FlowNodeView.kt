@@ -76,6 +76,9 @@ private val NodeBorderHover = FlowTheme.BorderStrong
 private val PortFill = FlowTheme.Canvas
 private val LabelColor = FlowTheme.TextMuted
 
+/** Keep the node name scannable before falling back to an ellipsis. */
+private const val NODE_TITLE_MAX_LINES = 2
+
 /** Generous radius (world units) for snapping a dragged wire to an input port. */
 const val SNAP_RADIUS = PORT_RADIUS * 4f
 
@@ -305,7 +308,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode, displayNumber: Int) {
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(horizontal = 12f.wdp(), vertical = 8f.wdp()),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.Top,
             ) {
                 // Colored icon tile.
                 Box(
@@ -343,10 +346,11 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode, displayNumber: Int) {
                     Text(
                         text = node.title,
                         color = FlowTheme.TextPrimary,
-                        fontSize = 14.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        fontSize = 16.sp,
+                        lineHeight = 18.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = NODE_TITLE_MAX_LINES,
+                        overflow = TextOverflow.Ellipsis,
                     )
                     // Human-readable action sentence; never dumps sensitive value payloads.
                     Text(
