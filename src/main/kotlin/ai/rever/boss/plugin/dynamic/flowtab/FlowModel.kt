@@ -3,6 +3,7 @@ package ai.rever.boss.plugin.dynamic.flowtab
 import androidx.compose.ui.geometry.Offset
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
+import java.security.MessageDigest
 import kotlin.math.max
 
 /** How the executor feeds items to a node. */
@@ -330,6 +331,46 @@ data class GraphSnapshot(
     val schemaVersion: Int = 1,
     val metadata: FlowMeta? = null
 )
+
+/** Immutable workflow definition attached to a run. The snapshot keeps historical
+ * results interpretable even after nodes are renamed, moved, or deleted. */
+@Serializable
+data class WorkflowRevision(
+    val id: String,
+    val fingerprint: String,
+    val capturedAtMs: Long,
+    val source: String,
+    val snapshot: GraphSnapshot,
+)
+
+/** Stable executable identity. Layout and user-facing release labels intentionally
+ * do not participate, so moving cards or changing a label does not mint a version. */
+fun GraphSnapshot.executionFingerprint(): String {
+    val executable = buildString {
+        nodes.sortedBy { it.id }.forEach { node ->
+            append(node.id).append('|').append(node.type).append('|').append(node.title).append('|').append(node.config)
+            append('\n')
+        }
+        edges.sortedBy { it.id }.forEach { edge ->
+            append(edge.id).append('|').append(edge.fromNode).append('|').append(edge.fromPort)
+                .append('|').append(edge.toNode).append('|').append(edge.toPort).append('\n')
+        }
+        metadata?.inputs?.forEach { append("input|").append(it).append('\n') }
+    }
+    val hash = MessageDigest.getInstance("SHA-256").digest(executable.toByteArray())
+    return hash.joinToString("") { "%02x".format(it) }
+}
+
+fun GraphSnapshot.toWorkflowRevision(capturedAtMs: Long, source: String): WorkflowRevision {
+    val fingerprint = executionFingerprint()
+    return WorkflowRevision(
+        id = "rev-${fingerprint.take(12)}",
+        fingerprint = fingerprint,
+        capturedAtMs = capturedAtMs,
+        source = source,
+        snapshot = this,
+    )
+}
 
 /** Imported flows never carry an armed local recurring schedule across trust boundaries. */
 internal fun GraphSnapshot.withoutSchedule(): GraphSnapshot =

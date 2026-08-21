@@ -1,8 +1,11 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 
 /**
@@ -69,5 +72,40 @@ class GraphSnapshotTest {
 
         assertEquals("Shared", imported.metadata?.name)
         assertNull(imported.metadata?.schedule)
+    }
+
+    @Test
+    fun `workflow revision ignores layout but captures executable edits`() {
+        val base = GraphSnapshot(
+            nodes = listOf(
+                NodeModel(
+                    "n1", "HTTP", "Fetch claim", 20f, 30f,
+                    JsonObject(mapOf("url" to JsonPrimitive("https://a"))),
+                ),
+            ),
+            metadata = FlowMeta(name = "Claims", version = 7),
+        )
+
+        val moved = base.copy(nodes = base.nodes.map { it.copy(x = 900f, y = 500f) })
+        val reconfigured = base.copy(
+            nodes = base.nodes.map {
+                it.copy(config = JsonObject(mapOf("url" to JsonPrimitive("https://b"))))
+            },
+        )
+
+        assertEquals(base.executionFingerprint(), moved.executionFingerprint())
+        assertEquals(base.toWorkflowRevision(10L, "canvas").id, moved.toWorkflowRevision(20L, "canvas").id)
+        assertFalse(base.executionFingerprint() == reconfigured.executionFingerprint())
+    }
+
+    @Test
+    fun `workflow revision snapshot round-trips with a run`() {
+        val revision = GraphSnapshot(nodes = listOf(NodeModel("n1", "TRIGGER", "Start", 1f, 2f)))
+            .toWorkflowRevision(123L, "headless")
+        val job = RunJob("run-1", "flow-1", RunJobState.SUCCEEDED, workflowRevision = revision)
+
+        val restored = json.decodeFromString(RunJob.serializer(), json.encodeToString(RunJob.serializer(), job))
+
+        assertEquals(revision, restored.workflowRevision)
     }
 }

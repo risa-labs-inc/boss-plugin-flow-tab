@@ -11,6 +11,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -40,6 +41,8 @@ data class RunJob(
     val nodeCount: Int = 0,
     val error: String? = null,
     val nodes: Map<String, NodeRunSnap> = emptyMap(),
+    /** Frozen graph definition used by this execution (null only for legacy runs). */
+    val workflowRevision: WorkflowRevision? = null,
     /** False only for a scrubbed in-process progress snapshot; durable jobs default to complete. */
     val contentComplete: Boolean = true,
 ) {
@@ -53,6 +56,7 @@ data class RunSummary(
     val state: RunJobState,
     val startedAtMs: Long,
     val nodeCount: Int,
+    val revisionId: String? = null,
 )
 
 /** Lightweight discovery record used by the launcher and detailed MCP listing. */
@@ -715,6 +719,24 @@ class FlowController(
     fun startRun(tabId: String, depth: Int = 0, ancestry: Set<String> = emptySet()): String {
         val runId = "run-${UUID.randomUUID()}"
         val startedAtMs = nextRunStartedAtMs()
+        // Freeze under the flow lock before dispatch. The executor must never read a
+        // later autosave after this point: edits are a new revision, not a mutation of
+        // this run's definition.
+        val revision = runCatching {
+            runBlocking(Dispatchers.IO) {
+                FlowPersistenceCoordinator.withFlowLock(tabId) {
+                    (FlowPersistenceCoordinator.latestLiveSnapshot(tabId) ?: getFlow(tabId))
+                        ?.toWorkflowRevision(startedAtMs, source = "headless")
+                        ?: throw IllegalStateException("No flow '$tabId'")
+                }
+            }
+        }.getOrElse { failure ->
+            jobs[runId] = RunJob(
+                runId = runId, tabId = tabId, state = RunJobState.FAILED,
+                startedAtMs = startedAtMs, error = failure.message ?: failure.toString(),
+            )
+            return runId
+        }
         val disposalError = "Flow controller disposed"
         if (synchronized(toolSyncLock) { disposed }) {
             jobs[runId] = RunJob(
@@ -726,7 +748,10 @@ class FlowController(
             )
             return runId
         }
-        jobs[runId] = RunJob(runId, tabId, RunJobState.RUNNING, startedAtMs = startedAtMs)
+        jobs[runId] = RunJob(
+            runId, tabId, RunJobState.RUNNING, startedAtMs = startedAtMs,
+            nodeCount = revision.snapshot.nodes.size, workflowRevision = revision,
+        )
         ownedRunIds += runId
         val states = ConcurrentHashMap<String, NodeRun>()
         runStates[runId] = states
@@ -734,7 +759,7 @@ class FlowController(
             // Persist RUNNING before executing so a reload can still diagnose an in-flight run.
             persistRun(jobs[runId] ?: RunJob(runId, tabId, RunJobState.RUNNING, startedAtMs = startedAtMs))
             val candidate = try {
-                val snap = getFlow(tabId) ?: throw IllegalStateException("No flow '$tabId'")
+                val snap = revision.snapshot
                 jobs.computeIfPresent(runId) { _, current -> current.copy(nodeCount = snap.nodes.size) }
                 jobs[runId]?.let { persistRun(it) }
                 val plan = snap.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
@@ -771,6 +796,7 @@ class FlowController(
                     nodeCount = snap.nodes.size,
                     error = firstError?.error,
                     nodes = states.toRunSnapshot().states,
+                    workflowRevision = revision,
                 )
             } catch (cancelled: CancellationException) {
                 val message = cancelled.message?.let { "Flow run cancelled: $it" }
@@ -977,9 +1003,20 @@ class FlowController(
                     state = job.state,
                     startedAtMs = job.startedAtMs,
                     nodeCount = maxOf(job.nodeCount, job.nodes.size),
+                    revisionId = job.workflowRevision?.id,
                 )
             }
     }
+
+    /** Meaningful workflow versions: only immutable revisions that were actually
+     * executed. Repeated runs of unchanged executable content share one entry. */
+    suspend fun listWorkflowRevisions(
+        tabId: String,
+        limit: Int = DEFAULT_RUN_HISTORY_LIMIT,
+    ): List<WorkflowRevision> = listRuns(tabId, limit)
+        .mapNotNull { summary -> runSnapshot(summary.runId)?.workflowRevision }
+        .distinctBy { it.id }
+        .sortedByDescending { it.capturedAtMs }
 
     private suspend fun evictOldRuns(tabId: String) {
         // One storage enumeration/decode pass per terminal persist. listRuns() would
@@ -1134,6 +1171,7 @@ class FlowController(
             nodeCount = jobs[runId]?.nodeCount ?: states.size,
             error = message,
             nodes = terminalNodes,
+            workflowRevision = jobs[runId]?.workflowRevision,
         )
     }
 

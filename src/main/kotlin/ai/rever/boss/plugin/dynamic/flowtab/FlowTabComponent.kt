@@ -239,6 +239,7 @@ class FlowTabComponent(
     override fun Content() {
         var viewportSize by remember { mutableStateOf(Size.Zero) }
         var followExecution by remember { mutableStateOf(true) }
+        var viewingHistoricalRevision by remember { mutableStateOf<WorkflowRevision?>(null) }
         val focusRequester = remember { FocusRequester() }
 
         val storage = remember {
@@ -373,8 +374,12 @@ class FlowTabComponent(
             if (storage == null) return@LaunchedEffect
             while (!initialized) delay(20)
             snapshotFlow {
-                Triple(persistenceSyncRevision, appliedGraphRevision, state.toSnapshot())
-            }.collectLatest { (_, appliedRevision, snapshot) ->
+                Triple(persistenceSyncRevision, appliedGraphRevision, state.toSnapshot()) to viewingHistoricalRevision?.id
+            }.collectLatest { (saved, historicalRevisionId) ->
+                val (_, appliedRevision, snapshot) = saved
+                // The canvas temporarily renders an old revision for diagnosis. It
+                // must never autosave that immutable display over today's workflow.
+                if (historicalRevisionId != null) return@collectLatest
                 delay(400)
                 runCatching {
                     FlowPersistenceCoordinator.persistAutosave(
@@ -412,6 +417,10 @@ class FlowTabComponent(
         // ---- run wiring ---- (state/executor/runJobs/toggles are component fields,
         // so an in-flight run survives the split-induced composition recreation)
         fun startRun() {
+            if (viewingHistoricalRevision != null) {
+                state.notice = "Return to the current workflow before starting a new run"
+                return
+            }
             if (state.isRunning) return
             // Claim the next generation before touching shared UI state. This makes
             // every late callback/finalizer from the previous run stale immediately;
@@ -424,8 +433,14 @@ class FlowTabComponent(
             }
             val plan = state.nodes.map { PlanNode(it.id, it.kind, it.title, it.config) }
             val edges = state.edges.toList()
+            // Freeze the graph before the queued worker can yield. Later canvas edits
+            // are deliberately outside this run and receive a different revision id.
+            val workflowRevision = state.toSnapshot().toWorkflowRevision(
+                capturedAtMs = controller.nextRunStartedAtMs(),
+                source = "canvas",
+            )
             val historyRunId = "run-${java.util.UUID.randomUUID()}"
-            val historyStartedAtMs = controller.nextRunStartedAtMs()
+            val historyStartedAtMs = workflowRevision.capturedAtMs
             currentCanvasHistoryRunId.set(historyRunId)
             lastCanvasHistoryRunId.set(historyRunId)
             canvasRunOwned = true
@@ -464,6 +479,7 @@ class FlowTabComponent(
                             state = RunJobState.RUNNING,
                             startedAtMs = historyStartedAtMs,
                             nodeCount = plan.size,
+                            workflowRevision = workflowRevision,
                         )
                     )
                     // Catches Stop arriving while withContext resumes from Main back
@@ -518,6 +534,7 @@ class FlowTabComponent(
                                 startedAtMs = historyStartedAtMs,
                                 nodeCount = plan.size,
                                 nodes = historyStates.toRunSnapshot().states,
+                                workflowRevision = workflowRevision,
                             ),
                             persist = false,
                         )
@@ -546,6 +563,7 @@ class FlowTabComponent(
                                 nodeCount = plan.size,
                                 error = terminalError,
                                 nodes = historyStates.toRunSnapshot().states,
+                                workflowRevision = workflowRevision,
                             )
                         )
                         // Persist the run results (capped) so they survive reopening.
@@ -771,6 +789,9 @@ class FlowTabComponent(
         var showRunHistory by remember { mutableStateOf(false) }
         var runHistory by remember { mutableStateOf<List<RunSummary>>(emptyList()) }
         var runHistoryLoading by remember { mutableStateOf(false) }
+        var showVersionHistory by remember { mutableStateOf(false) }
+        var versionHistory by remember { mutableStateOf<List<WorkflowRevision>>(emptyList()) }
+        var versionHistoryLoading by remember { mutableStateOf(false) }
         var showRename by remember { mutableStateOf(false) }
         var renameInProgress by remember { mutableStateOf(false) }
         val renameEnabled = initialized && !renameInProgress
@@ -814,6 +835,16 @@ class FlowTabComponent(
                         }
                     }
                 },
+                onVersions = {
+                    showVersionHistory = true
+                    versionHistoryLoading = true
+                    uiScope.launch {
+                        versionHistory = runCatching {
+                            withContext(Dispatchers.IO) { controller.listWorkflowRevisions(config.id) }
+                        }.getOrDefault(emptyList())
+                        versionHistoryLoading = false
+                    }
+                },
                 onZoomIn = { state.zoomBy(1.2f, viewCenterScreen()) },
                 onZoomOut = { state.zoomBy(1f / 1.2f, viewCenterScreen()) },
                 tidyEnabled = state.nodes.size > 1,
@@ -848,6 +879,35 @@ class FlowTabComponent(
                     following = followExecution,
                     onToggleFollow = { followExecution = !followExecution },
                 )
+            }
+
+            viewingHistoricalRevision?.let { historical ->
+                Row(
+                    modifier = Modifier.fillMaxWidth().background(NoticeBg).padding(horizontal = 12.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Viewing ${historical.id}",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        "Return to current",
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clickable {
+                            uiScope.launch {
+                                withContext(Dispatchers.IO) { controller.getFlow(config.id) }?.let(state::load)
+                                state.clearRun()
+                                viewingHistoricalRevision = null
+                            }
+                        }.padding(horizontal = 8.dp, vertical = 4.dp),
+                    )
+                }
             }
 
             // One status bar at a time, prioritized: clear-confirm > run error > notice.
@@ -1043,8 +1103,11 @@ class FlowTabComponent(
                                                         if (job.state == RunJobState.RUNNING) {
                                                             state.notice = "That run is still in progress; live status appears automatically"
                                                         } else {
+                                                            job.workflowRevision?.snapshot?.let(state::load)
                                                             state.applyRunJob(job)
-                                                            state.notice = "Loaded run ${summary.runId}"
+                                                            viewingHistoricalRevision = job.workflowRevision
+                                                            val revision = job.workflowRevision?.id ?: "legacy workflow"
+                                                            state.notice = "Viewing run ${summary.runId} · $revision"
                                                         }
                                                     }
                                                     showRunHistory = false
@@ -1061,7 +1124,11 @@ class FlowTabComponent(
                                                 fontSize = 11.sp,
                                             )
                                         }
-                                        Text("${summary.state} · ${summary.nodeCount} nodes", fontSize = 11.sp)
+                                        Text(
+                                            "${summary.state} · ${summary.nodeCount} nodes" +
+                                                (summary.revisionId?.let { " · $it" } ?: ""),
+                                            fontSize = 11.sp,
+                                        )
                                     }
                                 }
                             }
@@ -1070,6 +1137,46 @@ class FlowTabComponent(
                     confirmButton = {
                         TextButton(onClick = { showRunHistory = false }) { Text("Close") }
                     },
+                )
+            }
+
+            if (showVersionHistory) {
+                AlertDialog(
+                    onDismissRequest = { showVersionHistory = false },
+                    title = { Text("Workflow versions") },
+                    text = {
+                        Column(
+                            Modifier.fillMaxWidth().heightIn(max = 420.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            when {
+                                versionHistoryLoading -> Text("Loading…")
+                                versionHistory.isEmpty() -> Text("Versions are created when a workflow is run")
+                                else -> versionHistory.forEach { revision ->
+                                    Row(
+                                        Modifier.fillMaxWidth().clickable {
+                                            state.load(revision.snapshot)
+                                            state.clearRun()
+                                            viewingHistoricalRevision = revision
+                                            state.notice = "Viewing ${revision.id}; return to current to edit"
+                                            showVersionHistory = false
+                                        }.padding(vertical = 8.dp),
+                                    ) {
+                                        Column(Modifier.weight(1f)) {
+                                            Text(revision.id)
+                                            Text(
+                                                "${formatRunStarted(revision.capturedAtMs)} · ${revision.source}",
+                                                color = FlowTheme.TextMuted,
+                                                fontSize = 11.sp,
+                                            )
+                                        }
+                                        Text("${revision.snapshot.nodes.size} nodes", fontSize = 11.sp)
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    confirmButton = { TextButton(onClick = { showVersionHistory = false }) { Text("Close") } },
                 )
             }
         }
@@ -1145,6 +1252,7 @@ private fun Toolbar(
     externalMcpAvailable: Boolean,
     onExternalMcp: () -> Unit,
     onHistory: () -> Unit,
+    onVersions: () -> Unit,
     onZoomIn: () -> Unit,
     onZoomOut: () -> Unit,
     tidyEnabled: Boolean,
@@ -1184,6 +1292,7 @@ private fun Toolbar(
         )
         ToolbarButton(Icons.Filled.Edit, "Rename flow", onRename, enabled = renameEnabled)
         ToolbarButton(Icons.Filled.History, "Run history", onHistory)
+        ToolbarButton(Icons.Filled.History, "Workflow versions", onVersions)
 
         Spacer(Modifier.width(4.dp))
         // Run / Stop
