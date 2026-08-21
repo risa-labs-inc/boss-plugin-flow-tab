@@ -308,7 +308,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode, displayNumber: Int) {
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(horizontal = 12f.wdp(), vertical = 8f.wdp()),
-                verticalAlignment = Alignment.CenterVertically
+                verticalAlignment = Alignment.Top,
             ) {
                 // Colored icon tile.
                 Box(
@@ -356,7 +356,7 @@ fun FlowNodeView(state: FlowGraphState, node: FlowNode, displayNumber: Int) {
                     Text(
                         text = nodeSummary(node),
                         color = FlowTheme.TextMuted,
-                        fontSize = 10.sp,
+                        fontSize = 11.sp,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.offset(y = 1f.wdp())
