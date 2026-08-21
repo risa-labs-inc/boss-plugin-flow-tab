@@ -102,10 +102,10 @@ class GraphSnapshotTest {
     fun `workflow revision snapshot round-trips with a run`() {
         val revision = GraphSnapshot(nodes = listOf(NodeModel("n1", "TRIGGER", "Start", 1f, 2f)))
             .toWorkflowRevision(123L, "headless")
-        val job = RunJob("run-1", "flow-1", RunJobState.SUCCEEDED, workflowRevision = revision)
+        val job = RunJob("run-1", "flow-1", RunJobState.SUCCEEDED, revisionId = revision.id)
 
         val restored = json.decodeFromString(RunJob.serializer(), json.encodeToString(RunJob.serializer(), job))
 
-        assertEquals(revision, restored.workflowRevision)
+        assertEquals(revision.id, restored.revisionId)
     }
 }
