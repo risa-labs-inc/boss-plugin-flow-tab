@@ -117,7 +117,9 @@ internal class ProcessStderrTail(private val maxChars: Int = 4_096, private val 
         val bounded = line.takeLast(maxChars)
         lines.addLast(bounded)
         chars += bounded.length + 1
-        while (lines.size > maxLines || chars > maxChars) {
+        // The delimiter is accounted for while retaining multiple lines, but must not
+        // evict the sole bounded line (whose visible snapshot is already maxChars).
+        while (lines.size > maxLines || (chars > maxChars && lines.size > 1)) {
             chars -= lines.removeFirst().length + 1
         }
     }
