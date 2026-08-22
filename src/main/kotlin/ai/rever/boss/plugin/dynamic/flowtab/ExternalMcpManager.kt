@@ -541,14 +541,14 @@ class ExternalMcpManager(
                 open[name] = Live(cfg, opened, ExternalMcpToolSource(name, opened), resolvedSecret)
             } catch (_: TimeoutCancellationException) {
                 transport?.let { closeFailedOpen(it) }
-                val detail = timeoutDetail("Connection")
+                val detail = failureDetail(timeoutDetail("Connection"), transport, resolvedSecret)
                 setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
                 logFailure("external MCP server", name, "timed out while connecting", detail)
             } catch (cancelled: CancellationException) {
                 transport?.let { opened ->
                     closeFailedOpen(opened)
                 }
-                val detail = failureDetail("Connection cancelled", cancelled, resolvedSecret)
+                val detail = failureDetail("Connection cancelled", cancelled, transport, resolvedSecret)
                 setStatus(
                     name,
                     ExternalMcpServerStatus(
@@ -565,7 +565,7 @@ class ExternalMcpManager(
                 )
             } catch (failure: Exception) {
                 transport?.let { closeFailedOpen(it) }
-                val detail = failureDetail("Connection failed", failure, resolvedSecret)
+                val detail = failureDetail("Connection failed", failure, transport, resolvedSecret)
                 setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
                 logFailure("external MCP server", name, "failed to connect", detail)
             } catch (fatal: Error) {
@@ -589,13 +589,13 @@ class ExternalMcpManager(
                 } catch (_: TimeoutCancellationException) {
                     open.remove(name, live)
                     closeFailedOpen(live.transport)
-                    val detail = timeoutDetail("Tool discovery")
+                    val detail = failureDetail(timeoutDetail("Tool discovery"), live.transport, live.resolvedSecret)
                     setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
                     logFailure("external MCP server", name, "timed out while listing tools", detail)
                 } catch (cancelled: CancellationException) {
                     open.remove(name, live)
                     closeFailedOpen(live.transport)
-                    val detail = failureDetail("Tool discovery cancelled", cancelled, live.resolvedSecret)
+                    val detail = failureDetail("Tool discovery cancelled", cancelled, live.transport, live.resolvedSecret)
                     setStatus(
                         name,
                         ExternalMcpServerStatus(
@@ -606,7 +606,7 @@ class ExternalMcpManager(
                     if (!currentCoroutineContext().isActive) throw cancelled
                     logFailure("external MCP server", name, "cancelled while listing tools", detail)
                 } catch (failure: Exception) {
-                    val detail = failureDetail("Tool discovery failed", failure, live.resolvedSecret)
+                    val detail = failureDetail("Tool discovery failed", failure, live.transport, live.resolvedSecret)
                     setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
                     logFailure("external MCP server", name, "failed to list tools", detail)
                 }
@@ -630,14 +630,14 @@ class ExternalMcpManager(
             }
             logFailure("external MCP server", name, "timed out while closing", detail)
         } catch (cancelled: CancellationException) {
-            val detail = failureDetail("Close cancelled", cancelled, live.resolvedSecret)
+            val detail = failureDetail("Close cancelled", cancelled, live.transport, live.resolvedSecret)
             if (name in mutableServerStatuses.value) {
                 setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
             }
             logFailure("external MCP server", name, "failed to close", detail)
             if (!currentCoroutineContext().isActive) throw cancelled
         } catch (failure: Exception) {
-            val detail = failureDetail("Close failed", failure, live.resolvedSecret)
+            val detail = failureDetail("Close failed", failure, live.transport, live.resolvedSecret)
             if (name in mutableServerStatuses.value) {
                 setStatus(name, ExternalMcpServerStatus(ExternalMcpServerState.ERROR, detail))
             }
@@ -778,12 +778,26 @@ class ExternalMcpManager(
         }
     }
 
-    private fun failureDetail(prefix: String, failure: Throwable, resolvedSecret: String? = null): String =
+    private fun failureDetail(
+        prefix: String,
+        failure: Throwable,
+        transport: McpTransport? = null,
+        resolvedSecret: String? = null,
+    ): String =
         boundedExternalMcpDiagnostic(
-            raw = "$prefix: ${failure.message.orEmpty()}",
+            raw = listOf(prefix, failure.message.orEmpty(), transport.diagnostic()).filterNot { it.isNullOrBlank() }.joinToString(": "),
             fallback = prefix,
             redactions = listOfNotNull(resolvedSecret),
         )
+
+    private fun failureDetail(prefix: String, transport: McpTransport?, resolvedSecret: String? = null): String =
+        boundedExternalMcpDiagnostic(
+            raw = listOf(prefix, transport.diagnostic()).filterNot { it.isNullOrBlank() }.joinToString(": "),
+            fallback = prefix,
+            redactions = listOfNotNull(resolvedSecret),
+        )
+
+    private fun McpTransport?.diagnostic(): String? = (this as? McpTransportDiagnostics)?.diagnostic()
 
     private fun publicCancellation(): CancellationException = CancellationException(CANCELLED_MESSAGE)
 

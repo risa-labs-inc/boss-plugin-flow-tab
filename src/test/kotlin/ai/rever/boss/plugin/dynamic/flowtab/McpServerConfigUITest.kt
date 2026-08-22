@@ -34,6 +34,32 @@ class McpServerConfigUITest {
     }
 
     @Test
+    fun `stdio draft parses shell-style quoted arguments without executing a shell`() {
+        val config = McpServerDraft(
+            name = "local",
+            kind = McpTransportKind.STDIO,
+            command = "/bin/sh",
+            args = "-c \"cd /project with spaces && exec python3 -m app.server\" '' plain\\ value",
+            url = "",
+            secretRef = "",
+        ).toConfigOrNull()
+
+        assertNotNull(config)
+        assertEquals(
+            listOf("-c", "cd /project with spaces && exec python3 -m app.server", "", "plain value"),
+            config.args,
+        )
+    }
+
+    @Test
+    fun `stdio draft rejects unterminated argument quotes`() {
+        assertNull(
+            McpServerDraft("local", McpTransportKind.STDIO, "node", "--flag 'unfinished", "", "")
+                .toConfigOrNull(),
+        )
+    }
+
+    @Test
     fun `http draft requires URL and never treats secret reference as a value`() {
         assertNull(
             McpServerDraft("linear", McpTransportKind.HTTP_SSE, "", "", "", "LINEAR_TOKEN")

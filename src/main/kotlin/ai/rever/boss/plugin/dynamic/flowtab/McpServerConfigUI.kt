@@ -210,7 +210,7 @@ fun McpServerConfigPanel(
         KindToggle(kind) { kind = it }
         if (kind == McpTransportKind.STDIO) {
             Field("Command (npx, uvx, node…)", command) { command = it }
-            Field("Args (space-separated)", args) { args = it }
+            Field("Args (shell-style quotes supported)", args) { args = it }
             Field("Working directory (optional)", workingDirectory) { workingDirectory = it }
         } else {
             Field("URL", url) { url = it }
@@ -227,9 +227,13 @@ fun McpServerConfigPanel(
         )
         val newConfig = draft.toConfigOrNull()
         val invalidServerName = name.isNotBlank() && normalizedExternalMcpServerName(name) == null
+        val invalidArgs = kind == McpTransportKind.STDIO && parseExternalMcpArgs(args) == null
         val duplicateName = newConfig != null && servers.any { it.name == newConfig.name }
         if (invalidServerName) {
             Text("Server name cannot contain '/' or control characters.", color = FlowTheme.Error, fontSize = 11.sp)
+        }
+        if (invalidArgs) {
+            Text("Args contain an unterminated quote or escape.", color = FlowTheme.Error, fontSize = 11.sp)
         }
         if (duplicateName) {
             Text("A server named '${newConfig.name}' already exists.", color = FlowTheme.Error, fontSize = 11.sp)
@@ -368,15 +372,13 @@ internal data class McpServerDraft(
         val normalizedName = normalizedExternalMcpServerName(name) ?: return null
         if (kind == McpTransportKind.STDIO && command.isBlank()) return null
         if (kind == McpTransportKind.HTTP_SSE && url.isBlank()) return null
+        val parsedArgs = if (kind == McpTransportKind.STDIO) parseExternalMcpArgs(args) else emptyList()
+        if (kind == McpTransportKind.STDIO && parsedArgs == null) return null
         return McpServerConfig(
             name = normalizedName,
             kind = kind,
             command = if (kind == McpTransportKind.STDIO) command.trim() else "",
-            args = if (kind == McpTransportKind.STDIO) {
-                args.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-            } else {
-                emptyList()
-            },
+            args = parsedArgs.orEmpty(),
             workingDirectory = if (kind == McpTransportKind.STDIO) workingDirectory.trim() else "",
             url = if (kind == McpTransportKind.HTTP_SSE) url.trim() else "",
             enabled = false,
@@ -385,6 +387,48 @@ internal data class McpServerDraft(
             secretRef = if (kind == McpTransportKind.HTTP_SSE) secretRef.trim().ifBlank { null } else null,
         )
     }
+}
+
+/** Parse command arguments without invoking a shell. Quotes group whitespace and a
+ * backslash escapes the following character outside single quotes. Returns null for an
+ * unterminated quote/escape so a broken command is never persisted. */
+internal fun parseExternalMcpArgs(raw: String): List<String>? {
+    val result = mutableListOf<String>()
+    val token = StringBuilder()
+    var quote: Char? = null
+    var escaped = false
+    var tokenStarted = false
+    for (char in raw) {
+        if (escaped) {
+            token.append(char)
+            tokenStarted = true
+            escaped = false
+        } else when {
+            char == '\\' && quote != '\'' -> {
+                escaped = true
+                tokenStarted = true
+            }
+            quote != null && char == quote -> quote = null
+            quote == null && (char == '\'' || char == '"') -> {
+                quote = char
+                tokenStarted = true
+            }
+            quote == null && char.isWhitespace() -> {
+                if (tokenStarted) {
+                    result += token.toString()
+                    token.clear()
+                    tokenStarted = false
+                }
+            }
+            else -> {
+                token.append(char)
+                tokenStarted = true
+            }
+        }
+    }
+    if (escaped || quote != null) return null
+    if (tokenStarted) result += token.toString()
+    return result
 }
 
 @Composable
