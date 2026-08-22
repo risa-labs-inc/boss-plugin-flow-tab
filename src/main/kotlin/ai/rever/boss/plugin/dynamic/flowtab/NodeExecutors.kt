@@ -57,15 +57,40 @@ private val CONDITION_NUMBER = Regex("""[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?
 internal suspend fun BrowserIntegration.awaitElement(
     selectorType: String,
     selector: String,
+    frameSelector: String = "",
     timeoutMs: Int = ELEMENT_WAIT_MS,
     pollMs: Int = ELEMENT_POLL_MS,
 ): Boolean {
     val existsScript =
-        "(function(){try{return !!(${BrowserScripts.elementExpr(selectorType, selector)});}catch(e){return false;}})()"
+        "(function(){try{return !!(${BrowserScripts.elementExpr(selectorType, selector, frameSelector)});}catch(e){return false;}})()"
     var waited = 0
     while (true) {
         if (executeJavaScript(existsScript) == true) return true
         if (waited >= timeoutMs) return false
+        delay(pollMs.toLong()); waited += pollMs
+    }
+}
+
+/** The browser bridge can script same-origin child documents, but not third-party ones. */
+internal suspend fun BrowserIntegration.requireAccessibleFrame(
+    frameSelector: String,
+    timeoutMs: Int = ELEMENT_WAIT_MS,
+    pollMs: Int = ELEMENT_POLL_MS,
+) {
+    if (frameSelector.isBlank()) return
+    var waited = 0
+    while (true) {
+        when (executeJavaScript(BrowserScripts.frameProbeScript(frameSelector)) as? String) {
+            "ok" -> return
+            "cross-origin" -> throw ExecError(
+                "Frame '$frameSelector' is cross-origin and cannot be automated. " +
+                    "For Google sign-in, sign in manually in the visible browser profile, then use Await Login.",
+            )
+            "missing", null -> if (waited >= timeoutMs) {
+                throw ExecError("Frame '$frameSelector' was not found within ${timeoutMs}ms")
+            }
+            else -> throw ExecError("Frame '$frameSelector' could not be accessed")
+        }
         delay(pollMs.toLong()); waited += pollMs
     }
 }
@@ -300,12 +325,14 @@ object NodeCatalog {
             val selector = cfg.str("selector").trim()
             if (selector.isEmpty()) throw ExecError("$gateLabel needs a $markerName")
             val selectorType = cfg.str("selectorType", "css")
+            val frame = cfg.str("frame").trim()
             val waitMs = cfg.elementWaitMs(defaultWaitMs)
             val message = cfg.str("message", defaultMessage).ifBlank { defaultMessage }
             val session = ctx.requireSession()
+            session.requireAccessibleFrame(frame, waitMs)
 
             val promptGraceMs = minOf(waitMs, LOGIN_PROMPT_GRACE_MS)
-            if (session.awaitElement(selectorType, selector, timeoutMs = promptGraceMs)) {
+            if (session.awaitElement(selectorType, selector, frame, timeoutMs = promptGraceMs)) {
                 log(if (isLogin) "Sign-in already detected" else "Approval already detected")
                 return@NodeExecutor NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
             }
@@ -339,6 +366,7 @@ object NodeCatalog {
                 if (!session.awaitElement(
                         selectorType,
                         selector,
+                        frame,
                         timeoutMs = promptedWaitMs,
                         pollMs = LOGIN_POLL_MS,
                     )
@@ -357,12 +385,14 @@ object NodeCatalog {
         NodeType.CLICK -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
             val type = cfg.str("selectorType", "css")
+            val frame = cfg.str("frame").trim()
             val waitMs = cfg.elementWaitMs()
             val session = ctx.requireSession()
-            if (!session.awaitElement(type, sel, timeoutMs = waitMs)) {
+            session.requireAccessibleFrame(frame, waitMs)
+            if (!session.awaitElement(type, sel, frame, timeoutMs = waitMs)) {
                 throw ExecError("Click: no element matched '$sel' within ${waitMs}ms")
             }
-            val ok = session.executeJavaScript(BrowserScripts.clickScript(type, sel)) == true
+            val ok = session.executeJavaScript(BrowserScripts.clickScript(type, sel, frame)) == true
             if (!ok) throw ExecError("Click: no element matched '$sel'")
             log("Clicked '$sel'")
             NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
@@ -371,13 +401,15 @@ object NodeCatalog {
         NodeType.TYPE -> NodeExecutor { ctx, cfg, inputs, log ->
             val sel = cfg.str("selector")
             val type = cfg.str("selectorType", "css")
+            val frame = cfg.str("frame").trim()
             val waitMs = cfg.elementWaitMs()
             val text = SecretTemplateResolver(ctx.secrets).resolve(cfg.raw("text"), cfg::interpolate)
             val session = ctx.requireSession()
-            if (!session.awaitElement(type, sel, timeoutMs = waitMs)) {
+            session.requireAccessibleFrame(frame, waitMs)
+            if (!session.awaitElement(type, sel, frame, timeoutMs = waitMs)) {
                 throw ExecError("Type: no element matched '$sel' within ${waitMs}ms")
             }
-            val ok = session.executeJavaScript(BrowserScripts.inputScript(type, sel, text)) == true
+            val ok = session.executeJavaScript(BrowserScripts.inputScript(type, sel, text, frame)) == true
             if (!ok) throw ExecError("Type: no element matched '$sel'")
             log("Typed into '$sel'")
             NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
@@ -386,20 +418,23 @@ object NodeCatalog {
         NodeType.EXTRACT -> NodeExecutor { ctx, cfg, _, log ->
             val sel = cfg.str("selector")
             val type = cfg.str("selectorType", "css")
+            val frame = cfg.str("frame").trim()
             val multiple = cfg.bool("multiple")
             val optional = cfg.bool("optional")
             val waitMs = cfg.elementWaitMs()
             val field = cfg.str("field", "value").ifEmpty { "value" }
             val session = ctx.requireSession()
+            session.requireAccessibleFrame(frame, waitMs)
             // Best-effort wait so extraction doesn't race a still-loading page;
             // for `multiple` an empty result is still valid, so we proceed regardless.
-            session.awaitElement(type, sel, timeoutMs = waitMs)
+            session.awaitElement(type, sel, frame, timeoutMs = waitMs)
             val script = BrowserScripts.extractScript(
                 selectorType = type,
                 selector = sel,
                 mode = cfg.str("mode", "text"),
                 attr = cfg.str("attr"),
-                multiple = multiple
+                multiple = multiple,
+                frameSelector = frame,
             )
             val raw = session.executeJavaScript(script)
             val str = raw as? String ?: throw ExecError("Extract returned non-string: $raw")

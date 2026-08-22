@@ -43,34 +43,55 @@ object BrowserScripts {
         }
     }
 
+    /**
+     * JS expression for the document in which an action should run.  The browser
+     * bridge evaluates in the top-level frame, so a child frame must be resolved
+     * explicitly. Callers probe it first to provide a useful cross-origin error.
+     */
+    private fun documentExpr(frameSelector: String): String = if (frameSelector.isBlank()) {
+        "document"
+    } else {
+        "document.querySelector('${escapeSingleQuotedContent(frameSelector)}').contentDocument"
+    }
+
     /** JS expression evaluating to the first matching element (or null). */
-    fun elementExpr(selectorType: String, selector: String): String {
+    fun elementExpr(selectorType: String, selector: String, frameSelector: String = ""): String {
         val v = escapeSingleQuotedContent(selector)
+        val document = documentExpr(frameSelector)
         return when (selectorType) {
-            "xpath" -> "document.evaluate('$v', document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue"
-            "text" -> "Array.from(document.querySelectorAll('*')).find(function(e){return e.textContent && e.textContent.trim()==='$v';})"
-            else -> "document.querySelector('$v')"
+            "xpath" -> "($document).evaluate('$v', $document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue"
+            "text" -> "Array.from(($document).querySelectorAll('*')).find(function(e){return e.textContent && e.textContent.trim()==='$v';})"
+            else -> "($document).querySelector('$v')"
         }
     }
 
     /** JS expression evaluating to an array of all matching elements. */
-    private fun allElementsExpr(selectorType: String, selector: String): String {
+    private fun allElementsExpr(selectorType: String, selector: String, frameSelector: String): String {
         val v = escapeSingleQuotedContent(selector)
+        val document = documentExpr(frameSelector)
         return when (selectorType) {
-            "xpath" -> "(function(){var r=document.evaluate('$v',document,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null);var a=[];for(var i=0;i<r.snapshotLength;i++)a.push(r.snapshotItem(i));return a;})()"
-            "text" -> "Array.from(document.querySelectorAll('*')).filter(function(e){return e.textContent && e.textContent.trim()==='$v';})"
-            else -> "Array.from(document.querySelectorAll('$v'))"
+            "xpath" -> "(function(){var d=$document;var r=d.evaluate('$v',d,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null);var a=[];for(var i=0;i<r.snapshotLength;i++)a.push(r.snapshotItem(i));return a;})()"
+            "text" -> "Array.from(($document).querySelectorAll('*')).filter(function(e){return e.textContent && e.textContent.trim()==='$v';})"
+            else -> "Array.from(($document).querySelectorAll('$v'))"
         }
     }
 
+    /** Reports whether an optional frame can be scripted from the top-level page. */
+    fun frameProbeScript(frameSelector: String): String {
+        if (frameSelector.isBlank()) return "'ok'"
+        val selector = escapeSingleQuotedContent(frameSelector)
+        return "(function(){var f=document.querySelector('$selector');if(!f)return 'missing';" +
+            "try{return f.contentDocument?'ok':'cross-origin';}catch(e){return 'cross-origin';}})()"
+    }
+
     /** Returns true if clicked, false if no element matched. */
-    fun clickScript(selectorType: String, selector: String): String =
-        "(function(){var el=${elementExpr(selectorType, selector)}; if(!el) return false; el.click(); return true;})()"
+    fun clickScript(selectorType: String, selector: String, frameSelector: String = ""): String =
+        "(function(){var el=${elementExpr(selectorType, selector, frameSelector)}; if(!el) return false; el.click(); return true;})()"
 
     /** Sets a field's value + fires input/change events. Returns true/false. */
-    fun inputScript(selectorType: String, selector: String, value: String): String {
+    fun inputScript(selectorType: String, selector: String, value: String, frameSelector: String = ""): String {
         val tv = escapeSingleQuotedContent(value)
-        return "(function(){var el=${elementExpr(selectorType, selector)}; if(!el) return false; " +
+        return "(function(){var el=${elementExpr(selectorType, selector, frameSelector)}; if(!el) return false; " +
             "el.focus(); el.value='$tv'; " +
             "el.dispatchEvent(new Event('input',{bubbles:true})); " +
             "el.dispatchEvent(new Event('change',{bubbles:true})); return true;})()"
@@ -85,7 +106,8 @@ object BrowserScripts {
         selector: String,
         mode: String,
         attr: String,
-        multiple: Boolean
+        multiple: Boolean,
+        frameSelector: String = "",
     ): String {
         val a = escapeSingleQuotedContent(attr)
         val readOne = when (mode) {
@@ -94,11 +116,11 @@ object BrowserScripts {
             else -> "function(e){return (e.textContent||'').trim();}"
         }
         return if (multiple) {
-            "(function(){try{var els=${allElementsExpr(selectorType, selector)}; var f=$readOne; " +
+            "(function(){try{var els=${allElementsExpr(selectorType, selector, frameSelector)}; var f=$readOne; " +
                 "return JSON.stringify({ok:true, value: els.map(f)});}" +
                 "catch(e){return JSON.stringify({ok:false, error:String(e)});}})()"
         } else {
-            "(function(){try{var el=${elementExpr(selectorType, selector)}; " +
+            "(function(){try{var el=${elementExpr(selectorType, selector, frameSelector)}; " +
                 "if(!el) return JSON.stringify({ok:false, error:'$EXTRACT_NO_MATCH_ERROR'}); var f=$readOne; " +
                 "return JSON.stringify({ok:true, value: f(el)});}" +
                 "catch(e){return JSON.stringify({ok:false, error:String(e)});}})()"

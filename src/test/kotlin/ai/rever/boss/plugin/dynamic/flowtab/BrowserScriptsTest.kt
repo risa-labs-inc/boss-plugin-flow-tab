@@ -3,6 +3,9 @@ package ai.rever.boss.plugin.dynamic.flowtab
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertFalse
+import kotlin.test.assertFailsWith
+import kotlinx.coroutines.runBlocking
+import ai.rever.boss.plugin.api.BrowserIntegration
 
 class BrowserScriptsTest {
 
@@ -55,5 +58,34 @@ class BrowserScriptsTest {
         )
 
         assertContains(script, EXTRACT_NO_MATCH_ERROR)
+    }
+
+    @Test
+    fun `browser actions scope selectors to an optional same origin frame`() {
+        val frame = "iframe[name='content']"
+
+        assertContains(BrowserScripts.clickScript("css", ".save", frame), "contentDocument")
+        assertContains(BrowserScripts.inputScript("xpath", "//input", "Ada", frame), "contentDocument")
+        assertContains(
+            BrowserScripts.extractScript("text", "Welcome", "text", "", false, frame),
+            "contentDocument",
+        )
+        assertContains(BrowserScripts.frameProbeScript(frame), "cross-origin")
+    }
+
+    @Test
+    fun `cross origin frame reports an actionable sign in message`() = runBlocking {
+        val browser = object : BrowserIntegration {
+            override suspend fun executeJavaScript(script: String): Any? = "cross-origin"
+            override suspend fun navigate(url: String) = Unit
+            override fun isBrowserAvailable() = true
+            override suspend fun getCurrentUrl(): String? = null
+        }
+
+        val error = assertFailsWith<ExecError> {
+            browser.requireAccessibleFrame("iframe[src*='accounts.google.com']", timeoutMs = 0)
+        }
+        assertContains(error.message!!, "cross-origin")
+        assertContains(error.message!!, "sign in manually")
     }
 }

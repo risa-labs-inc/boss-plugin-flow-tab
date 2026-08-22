@@ -118,6 +118,7 @@ enum class NodeType(
         HUMAN_GATE -> listOf(
             ConfigField("selectorType", "Completion marker type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
             ConfigField("selector", "Completion marker", FieldType.TEXT, placeholder = "[data-approved], .approval-complete"),
+            frameConfigField(),
             ConfigField("waitMs", "Wait timeout (ms)", FieldType.NUMBER, default = HUMAN_GATE_WAIT_MS.toString()),
             ConfigField(
                 "message",
@@ -129,6 +130,7 @@ enum class NodeType(
         AWAIT_LOGIN -> listOf(
             ConfigField("selectorType", "Signed-in marker type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
             ConfigField("selector", "Signed-in marker", FieldType.TEXT, placeholder = "[data-user-id], .account-menu"),
+            frameConfigField(),
             ConfigField("waitMs", "Wait timeout (ms)", FieldType.NUMBER, default = LOGIN_WAIT_MS.toString()),
             ConfigField(
                 "message",
@@ -140,17 +142,20 @@ enum class NodeType(
         CLICK -> listOf(
             ConfigField("selectorType", "Selector type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
             ConfigField("selector", "Selector", FieldType.TEXT, placeholder = "button.submit"),
+            frameConfigField(),
             ConfigField("waitMs", "Wait for element (ms)", FieldType.NUMBER, default = ELEMENT_WAIT_MS.toString()),
         )
         TYPE -> listOf(
             ConfigField("selectorType", "Selector type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
             ConfigField("selector", "Selector", FieldType.TEXT, placeholder = "input[name=q]"),
+            frameConfigField(),
             ConfigField("text", "Text", FieldType.TEXT, placeholder = "{{ \$json.q }} or {{ \$secret.account_password }}"),
             ConfigField("waitMs", "Wait for element (ms)", FieldType.NUMBER, default = ELEMENT_WAIT_MS.toString()),
         )
         EXTRACT -> listOf(
             ConfigField("selectorType", "Selector type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
             ConfigField("selector", "Selector", FieldType.TEXT, placeholder = "h1, .title"),
+            frameConfigField(),
             ConfigField("mode", "Extract", FieldType.SELECT, listOf("text", "html", "attr"), default = "text"),
             ConfigField("attr", "Attribute", FieldType.TEXT, placeholder = "href (when mode = attr)"),
             ConfigField("field", "Output field", FieldType.TEXT, default = "value"),
@@ -212,6 +217,14 @@ enum class NodeType(
         )
         else -> emptyList()
     }
+
+    private fun frameConfigField() = ConfigField(
+        "frame",
+        "Frame selector (optional)",
+        FieldType.TEXT,
+        placeholder = "iframe[name=content], iframe[src*='example.com']",
+        note = "Same-origin frames only. Third-party sign-in frames (such as Google) require manual sign-in in the visible browser.",
+    )
 }
 
 // ---------------------------------------------------------------------------

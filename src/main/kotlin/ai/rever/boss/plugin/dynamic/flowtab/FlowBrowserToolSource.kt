@@ -100,8 +100,11 @@ class FlowBrowserToolSource(
         val id = args.sessionId("browser_click")
         val sel = args.str("selector").ifBlank { return err("browser_click needs a 'selector'") }
         val type = args.str("selectorType", "css")
+        val frame = args.str("frame").trim()
         val matched = sessions.withSession(id) { session ->
-            session.awaitElement(type, sel) && session.executeJavaScript(BrowserScripts.clickScript(type, sel)) == true
+            session.requireAccessibleFrame(frame)
+            session.awaitElement(type, sel, frame) &&
+                session.executeJavaScript(BrowserScripts.clickScript(type, sel, frame)) == true
         }
         return if (matched) ok(buildJsonObject { put("clicked", sel) })
         else err("browser_click: no element matched '$sel'")
@@ -111,9 +114,12 @@ class FlowBrowserToolSource(
         val id = args.sessionId("browser_type")
         val sel = args.str("selector").ifBlank { return err("browser_type needs a 'selector'") }
         val type = args.str("selectorType", "css")
+        val frame = args.str("frame").trim()
         val text = args.str("text")
         val matched = sessions.withSession(id) { session ->
-            session.awaitElement(type, sel) && session.executeJavaScript(BrowserScripts.inputScript(type, sel, text)) == true
+            session.requireAccessibleFrame(frame)
+            session.awaitElement(type, sel, frame) &&
+                session.executeJavaScript(BrowserScripts.inputScript(type, sel, text, frame)) == true
         }
         return if (matched) ok(buildJsonObject { put("typed", sel) })
         else err("browser_type: no element matched '$sel'")
@@ -123,6 +129,7 @@ class FlowBrowserToolSource(
         val id = args.sessionId("browser_extract")
         val sel = args.str("selector").ifBlank { return err("browser_extract needs a 'selector'") }
         val type = args.str("selectorType", "css")
+        val frame = args.str("frame").trim()
         val multiple = args.bool("multiple")
         val script = BrowserScripts.extractScript(
             selectorType = type,
@@ -130,9 +137,11 @@ class FlowBrowserToolSource(
             mode = args.str("mode", "text"),
             attr = args.str("attr"),
             multiple = multiple,
+            frameSelector = frame,
         )
         val raw = sessions.withSession(id) { session ->
-            session.awaitElement(type, sel)
+            session.requireAccessibleFrame(frame)
+            session.awaitElement(type, sel, frame)
             session.executeJavaScript(script)
         }
         val str = raw as? String ?: return err("browser_extract returned non-string: $raw")
@@ -203,6 +212,8 @@ class FlowBrowserToolSource(
         private const val SESSION_PROP = """"session_id":{"type":"string"}"""
         private const val SELECTOR_PROPS =
             """"selector":{"type":"string"},"selectorType":{"type":"string","enum":["css","xpath","text"]}"""
+        private const val FRAME_PROP =
+            """"frame":{"type":"string","description":"Optional same-origin iframe CSS selector"}"""
 
         private fun schema(properties: String, required: List<String>): String {
             val requiredJson = if (required.isEmpty()) {
@@ -251,13 +262,13 @@ class FlowBrowserToolSource(
                 desc(
                     "browser_click",
                     "Click the first element matching a selector in a browser session.$sessionHint",
-                    schema("$SESSION_PROP,$SELECTOR_PROPS", session + listOf("selector")),
+                    schema("$SESSION_PROP,$SELECTOR_PROPS,$FRAME_PROP", session + listOf("selector")),
                 ),
                 desc(
                     "browser_type",
                     "Type text into the first element matching a selector in a browser session.$sessionHint",
                     schema(
-                        """$SESSION_PROP,$SELECTOR_PROPS,"text":{"type":"string"}""",
+                        """$SESSION_PROP,$SELECTOR_PROPS,$FRAME_PROP,"text":{"type":"string"}""",
                         session + listOf("selector", "text"),
                     ),
                 ),
@@ -265,7 +276,7 @@ class FlowBrowserToolSource(
                     "browser_extract",
                     "Extract text/html/attribute from element(s) in a browser session.$sessionHint",
                     schema(
-                        """$SESSION_PROP,$SELECTOR_PROPS,"mode":{"type":"string","enum":["text","html","attr"]},"attr":{"type":"string"},"multiple":{"type":"boolean"}""",
+                        """$SESSION_PROP,$SELECTOR_PROPS,$FRAME_PROP,"mode":{"type":"string","enum":["text","html","attr"]},"attr":{"type":"string"},"multiple":{"type":"boolean"}""",
                         session + listOf("selector"),
                     ),
                 ),
