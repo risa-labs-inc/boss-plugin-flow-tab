@@ -482,7 +482,10 @@ object NodeCatalog {
         NodeType.SET -> NodeExecutor { _, cfg, inputs, _ ->
             val current = inputs.firstOrNull()?.json ?: JsonObject(emptyMap())
             val assignments = try {
-                EXEC_JSON.parseToJsonElement(cfg.str("assignments").ifEmpty { "{}" }).jsonObject
+                // Parse first, then resolve every JSON value in the template. Resolving the
+                // complete text before parsing loses arrays/objects (and used to resolve
+                // $node references against an empty output map).
+                cfg.jsonTemplate("assignments")?.jsonObject ?: JsonObject(emptyMap())
             } catch (e: TemplateResolutionException) {
                 throw e
             } catch (_: Exception) {
@@ -490,10 +493,10 @@ object NodeCatalog {
             }
             val merged = buildJsonObject {
                 current.forEach { (k, v) -> put(k, v) }
-                // assignment values are templates resolved against the current item
+                // jsonTemplate has already resolved nested templates and preserved their
+                // native JSON types, including arrays, objects, booleans, and numbers.
                 assignments.forEach { (k, v) ->
-                    val template = (v as? JsonPrimitive)?.content ?: v.toString()
-                    put(k, ExpressionEval.interpolate(template, current, emptyMap()))
+                    put(k, v)
                 }
             }
             NodeOutput.single(listOf(Item(merged)))

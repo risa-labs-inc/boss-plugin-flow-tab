@@ -221,6 +221,37 @@ class FlowExecutorTest {
     }
 
     @Test
+    fun `set preserves nested arrays and resolves node-output references`() {
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            n(
+                "source",
+                NodeType.SET,
+                "assignments" to """{"payload":[{"id":7},{"id":9}],"enabled":true}""",
+                title = "Source",
+            ),
+            n(
+                "target",
+                NodeType.SET,
+                "assignments" to """
+                    {"copy":"{{ ${'$'}node[\"Source\"].json.payload }}",
+                     "first":"{{ ${'$'}node[\"Source\"].json.payload[0].id }}",
+                     "nested":["{{ ${'$'}json.payload[1].id }}",{"ok":"{{ ${'$'}node[\"Source\"].json.enabled }}"}],
+                     "label":"id={{ ${'$'}node[\"Source\"].json.payload[0].id }}"}
+                """.trimIndent(),
+            ),
+        )
+        val states = runGraph(nodes, listOf(e("t", "source"), e("source", "target")))
+
+        assertEquals(RunStatus.SUCCESS, states["target"]?.status)
+        val out = states["target"]!!.output.single().json
+        assertEquals("[{\"id\":7},{\"id\":9}]", out["copy"].toString())
+        assertEquals("7", out["first"]?.jsonPrimitive?.content)
+        assertEquals("[9,{\"ok\":true}]", out["nested"].toString())
+        assertEquals("id=7", out.str("label"))
+    }
+
+    @Test
     fun `per-item run mode runs once per input item`() {
         val handle = FakeHandle(responder = { """{"ok":true,"value":["a","b","c"]}""" })
         val nodes = listOf(
