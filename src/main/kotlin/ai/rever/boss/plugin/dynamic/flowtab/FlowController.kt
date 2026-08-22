@@ -707,6 +707,7 @@ class FlowController(
         scheduleFailureTypes.remove(tabId)
         invalidScheduleIntervals.remove(tabId)
         FlowPersistenceCoordinator.forget(tabId)
+        FlowPersistenceCoordinator.publishFlowListChange()
         true
     }
 
@@ -1168,7 +1169,9 @@ class FlowController(
     private suspend fun writeUnlocked(tabId: String, snapshot: GraphSnapshot) {
         // Read-modify-write callers already hold the per-flow mutex. Never acquire it
         // in this helper: kotlinx Mutex is non-reentrant and would deadlock.
-        storage?.putJson(graphKey(tabId), json.encodeToString(GraphSnapshot.serializer(), snapshot))
+        val store = storage ?: return
+        store.putJson(graphKey(tabId), json.encodeToString(GraphSnapshot.serializer(), snapshot))
+        FlowPersistenceCoordinator.publishFlowListChange()
     }
 
     private suspend fun loadScheduleState(tabId: String): FlowScheduleState? {
