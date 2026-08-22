@@ -72,6 +72,8 @@ class FlowExecutor(
         depth: Int = 0,
         /** Flow ids already on the call stack, so a nested lanager can detect cycles. */
         ancestry: Set<String> = emptySet(),
+        /** State copy staged for this run. The caller persists it on successful completion. */
+        flowState: FlowStateBuffer = FlowStateBuffer(),
         onStatus: (nodeId: String, NodeRun) -> Unit
     ) {
         topoSort(nodes, edges) // validate: throws on cycle (else awaits would deadlock)
@@ -93,6 +95,7 @@ class FlowExecutor(
             closeVisibleTabsOnClose = closeVisibleTabsOnClose,
             depth = depth,
             ancestry = ancestry,
+            flowState = flowState,
         )
 
         try {
@@ -227,7 +230,7 @@ class FlowExecutor(
                 for (item in inputs.ifEmpty { SEED_ITEMS }) {
                     val output = exec.run(
                         ctx,
-                        ConfigReader(node.config, item, ctx.outputsByTitle),
+                        ConfigReader(node.config, item, ctx.outputsByTitle, ctx.flowState),
                         listOf(item),
                         log,
                     )
@@ -245,7 +248,7 @@ class FlowExecutor(
             }
             RunMode.ONCE -> {
                 val item = inputs.firstOrNull() ?: SEED_ITEMS.first()
-                exec.run(ctx, ConfigReader(node.config, item, ctx.outputsByTitle), inputs, log)
+                exec.run(ctx, ConfigReader(node.config, item, ctx.outputsByTitle, ctx.flowState), inputs, log)
             }
         }
     }

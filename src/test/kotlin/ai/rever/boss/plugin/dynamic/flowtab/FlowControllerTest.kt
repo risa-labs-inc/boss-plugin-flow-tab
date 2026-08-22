@@ -37,6 +37,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.util.concurrent.CountDownLatch
@@ -83,6 +84,26 @@ class FlowControllerTest {
         runTimeoutMs: Long = FlowController.DEFAULT_RUN_TIMEOUT_MS,
         tabUpdates: TabUpdateProviderFactory? = null,
     ) = FlowController(context(storage, tabUpdates), { scope }, registry, runTimeoutMs)
+
+    @Test
+    fun `flow state persists locally merges concurrent keys and is removed with the flow`() = runBlocking {
+        val storage = DesktopStorage()
+        val fc = controller(storage)
+        val tabId = fc.createFlow()
+        try {
+            fc.commitFlowState(tabId, buildJsonObject { put("lastSeen", "one") })
+            fc.commitFlowState(tabId, buildJsonObject { put("cursor", 2) })
+
+            val saved = fc.loadFlowState(tabId)
+            assertEquals("one", saved["lastSeen"]?.jsonPrimitive?.content)
+            assertEquals(2, saved["cursor"]?.jsonPrimitive?.int)
+            assertTrue(fc.deleteFlow(tabId))
+            assertEquals(0, fc.loadFlowState(tabId).size)
+        } finally {
+            fc.dispose()
+            FlowPersistenceCoordinator.forget(tabId)
+        }
+    }
 
     @Test
     fun `canvas run history publishes live and retains only the newest twenty per flow`() = runBlocking {

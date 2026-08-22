@@ -70,6 +70,7 @@ enum class NodeType(
     INJECT("Inject", 1, 1, 0xFFEC407A, "Run JS / push data to the page", RunMode.ONCE),
     HTTP("HTTP Request", 1, 1, 0xFF2196F3, "Call an API endpoint", RunMode.PER_ITEM),
     SET("Set", 1, 1, 0xFF00BCD4, "Set or edit fields", RunMode.PER_ITEM),
+    STATE("State", 1, 1, 0xFF009688, "Persist values for a later run", RunMode.PER_ITEM),
     CODE("Code", 1, 1, 0xFF9C27B0, "Transform each item with a JSON template", RunMode.PER_ITEM),
     IF("If", 1, 2, 0xFFFF9800, "Route each item by a condition", RunMode.PER_ITEM),
     MERGE("Merge", 2, 1, 0xFF607D8B, "Combine two inputs", RunMode.ONCE);
@@ -198,6 +199,14 @@ enum class NodeType(
         )
         SET -> listOf(
             ConfigField("assignments", "Fields (JSON: key → value/expr)", FieldType.TEXTAREA, placeholder = "{\"name\":\"{{ \$json.first }}\"}")
+        )
+        STATE -> listOf(
+            ConfigField(
+                "assignments",
+                "State values (JSON: key → value/expr)",
+                FieldType.TEXTAREA,
+                placeholder = "{\"lastSeen\":\"{{ \$json.id }}\"}",
+            )
         )
         CODE -> listOf(
             ConfigField(
