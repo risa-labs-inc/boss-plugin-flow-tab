@@ -4,9 +4,26 @@ import ai.rever.boss.plugin.api.PluginStorageProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 
 internal const val JSON_STORAGE_PREFIX = "json:"
 internal const val RUN_STATE_PREFIX = "runstate:"
+/** A per-flow display preference, deliberately separate from durable run history. */
+internal const val RUN_VIEW_PREFIX = "runview:"
+
+/**
+ * A reset means "do not automatically reopen a result from before this instant".
+ *
+ * The timestamp is a cutoff rather than a boolean so that a run started after Reset
+ * becomes visible normally, even if the app is closed before its final UI state is
+ * written. Run records themselves are never modified or removed.
+ */
+@Serializable
+internal data class RunViewPreference(val freshAfterMs: Long)
+
+internal fun RunViewPreference.allowsAutoDisplay(startedAtMs: Long): Boolean =
+    startedAtMs >= freshAfterMs
 
 /**
  * Remove a JSON value across both storage-provider key conventions.
@@ -53,5 +70,33 @@ internal suspend fun PluginStorageProvider.removeJsonValue(key: String) {
 internal suspend fun clearPersistedRunState(storage: PluginStorageProvider?, tabId: String) {
     withContext(NonCancellable) {
         storage?.removeJsonValue("$RUN_STATE_PREFIX$tabId")
+    }
+}
+
+/** Persist a fresh canvas view without touching the workflow or its durable run history. */
+internal suspend fun resetPersistedRunView(
+    storage: PluginStorageProvider?,
+    tabId: String,
+    freshAfterMs: Long,
+) {
+    withContext(NonCancellable) {
+        storage?.putJson(
+            "$RUN_VIEW_PREFIX$tabId",
+            Json.encodeToString(RunViewPreference.serializer(), RunViewPreference(freshAfterMs)),
+        )
+        storage?.removeJsonValue("$RUN_STATE_PREFIX$tabId")
+    }
+}
+
+internal suspend fun loadRunViewPreference(
+    storage: PluginStorageProvider?,
+    tabId: String,
+): RunViewPreference? = storage?.getJson("$RUN_VIEW_PREFIX$tabId")
+    ?.let { raw -> runCatching { Json.decodeFromString(RunViewPreference.serializer(), raw) }.getOrNull() }
+
+/** Used when the workflow itself is deleted; a newly-created flow must not inherit it. */
+internal suspend fun clearPersistedRunViewPreference(storage: PluginStorageProvider?, tabId: String) {
+    withContext(NonCancellable) {
+        storage?.removeJsonValue("$RUN_VIEW_PREFIX$tabId")
     }
 }
