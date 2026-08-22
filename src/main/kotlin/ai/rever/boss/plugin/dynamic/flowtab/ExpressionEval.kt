@@ -12,6 +12,7 @@ import kotlinx.serialization.json.JsonPrimitive
  * Supports path access against:
  *  - `$json` — the current item's json object
  *  - `$node["Title"].json` — the first output item of the node titled "Title"
+ *  - `$state` — the durable, flow-local JSON state from the preceding successful run
  *
  * Paths use `.key`, `.0`, `["key"]`, and `[index]`. An unresolved or malformed
  * expression throws [TemplateResolutionException] so the consuming node fails at
@@ -33,14 +34,20 @@ object ExpressionEval {
     fun interpolate(
         template: String,
         json: JsonObject,
-        nodeOutputsByTitle: Map<String, List<Item>>
+        nodeOutputsByTitle: Map<String, List<Item>>,
+        state: JsonObject = JsonObject(emptyMap()),
     ): String = EXPR.replace(template) { m ->
         val expression = m.groupValues[1].trim()
-        render(requireResolved(expression, json, nodeOutputsByTitle))
+        render(requireResolved(expression, json, nodeOutputsByTitle, state))
     }
 
     /** Evaluate a single expression to a JSON element (or null). */
-    fun eval(expr: String, json: JsonObject, nodeOutputsByTitle: Map<String, List<Item>>): JsonElement? {
+    fun eval(
+        expr: String,
+        json: JsonObject,
+        nodeOutputsByTitle: Map<String, List<Item>>,
+        state: JsonObject = JsonObject(emptyMap()),
+    ): JsonElement? {
         val (root, rest) = when {
             expr == "\$json" || expr.startsWith("\$json.") || expr.startsWith("\$json[") ->
                 json to expr.removePrefix("\$json")
@@ -55,6 +62,8 @@ object ExpressionEval {
                 val first = nodeOutputsByTitle[title]?.firstOrNull()?.json ?: return null
                 first to after
             }
+            expr == "\$state" || expr.startsWith("\$state.") || expr.startsWith("\$state[") ->
+                state to expr.removePrefix("\$state")
             else -> return null
         }
         var cur: JsonElement? = root
@@ -76,11 +85,12 @@ object ExpressionEval {
         template: JsonElement,
         json: JsonObject,
         nodeOutputsByTitle: Map<String, List<Item>>,
+        state: JsonObject = JsonObject(emptyMap()),
     ): JsonElement = when (template) {
         is JsonObject -> JsonObject(
-            template.mapValues { (_, value) -> interpolateJson(value, json, nodeOutputsByTitle) }
+            template.mapValues { (_, value) -> interpolateJson(value, json, nodeOutputsByTitle, state) }
         )
-        is JsonArray -> JsonArray(template.map { interpolateJson(it, json, nodeOutputsByTitle) })
+        is JsonArray -> JsonArray(template.map { interpolateJson(it, json, nodeOutputsByTitle, state) })
         is JsonPrimitive -> {
             if (!template.isString) template
             else {
@@ -90,9 +100,9 @@ object ExpressionEval {
                 val whole = EXPR.find(trimmed)?.takeIf { it.range.first == 0 && it.value.length == trimmed.length }
                 if (whole != null) {
                     val expression = whole.groupValues[1].trim()
-                    requireResolved(expression, json, nodeOutputsByTitle)
+                    requireResolved(expression, json, nodeOutputsByTitle, state)
                 } else {
-                    JsonPrimitive(interpolate(template.content, json, nodeOutputsByTitle))
+                    JsonPrimitive(interpolate(template.content, json, nodeOutputsByTitle, state))
                 }
             }
         }
@@ -108,7 +118,8 @@ object ExpressionEval {
         expression: String,
         json: JsonObject,
         nodeOutputsByTitle: Map<String, List<Item>>,
-    ): JsonElement = eval(expression, json, nodeOutputsByTitle)
+        state: JsonObject,
+    ): JsonElement = eval(expression, json, nodeOutputsByTitle, state)
         ?: throw TemplateResolutionException(expression)
 
     private sealed interface Segment {

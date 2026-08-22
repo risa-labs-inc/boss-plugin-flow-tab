@@ -99,6 +99,8 @@ class RunContext(
      *  A [LanagerNode] refuses to launch a sub-flow already in here — cycle detection so
      *  nested lanagers can't recurse unbounded. */
     val ancestry: Set<String> = emptySet(),
+    /** Mutable staging area committed by the caller only after a successful run. */
+    val flowState: FlowStateBuffer = FlowStateBuffer(),
 ) {
     /** The id of this run's default browser session in [sessions] (native nodes use it). */
     val defaultSessionId: String = sessions.newSessionId()
@@ -187,19 +189,20 @@ internal class SecretTemplateResolver(private val secrets: SecretResolver) {
 class ConfigReader(
     private val config: JsonObject,
     private val item: Item,
-    private val outputsByTitle: Map<String, List<Item>>
+    private val outputsByTitle: Map<String, List<Item>>,
+    private val flowState: FlowStateBuffer = FlowStateBuffer(),
 ) {
     /** Raw scalar template, before current-item expressions are resolved. */
     internal fun raw(key: String): String = (config[key] as? JsonPrimitive)?.content ?: ""
 
     /** Resolve expressions in an arbitrary fragment against this reader's current item. */
     internal fun interpolate(template: String): String =
-        ExpressionEval.interpolate(template, item.json, outputsByTitle)
+        ExpressionEval.interpolate(template, item.json, outputsByTitle, flowState.snapshot())
 
     /** Field value with `{{ }}` resolved. */
     fun str(key: String, default: String = ""): String {
         val template = raw(key).ifEmpty { return default }
-        return ExpressionEval.interpolate(template, item.json, outputsByTitle)
+        return ExpressionEval.interpolate(template, item.json, outputsByTitle, flowState.snapshot())
     }
 
     fun bool(key: String): Boolean = raw(key).equals("true", ignoreCase = true)
@@ -248,7 +251,7 @@ class ConfigReader(
         } else {
             configured
         }
-        return ExpressionEval.interpolateJson(template, item.json, outputsByTitle)
+        return ExpressionEval.interpolateJson(template, item.json, outputsByTitle, flowState.snapshot())
     }
 }
 
@@ -500,6 +503,24 @@ object NodeCatalog {
                 }
             }
             NodeOutput.single(listOf(Item(merged)))
+        }
+
+        NodeType.STATE -> NodeExecutor { ctx, cfg, inputs, log ->
+            val assignments = try {
+                cfg.jsonTemplate("assignments")?.jsonObject ?: JsonObject(emptyMap())
+            } catch (e: TemplateResolutionException) {
+                throw e
+            } catch (_: Exception) {
+                throw ExecError("State: 'assignments' must be a JSON object")
+            }
+            if (assignments.isEmpty()) throw ExecError("State needs at least one assignment")
+            try {
+                ctx.flowState.putAll(assignments)
+            } catch (e: IllegalArgumentException) {
+                throw ExecError(e.message ?: "State value is too large")
+            }
+            log("Saved ${assignments.size} state value(s)")
+            NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
         }
 
         NodeType.CODE -> NodeExecutor { _, cfg, _, log ->

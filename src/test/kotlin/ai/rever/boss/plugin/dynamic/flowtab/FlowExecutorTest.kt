@@ -178,10 +178,13 @@ private fun runGraph(
     registry: NodeRegistry = builtinNodeRegistry(),
     secrets: SecretResolver = SecretResolver.constant(null),
     notifications: NotificationProvider? = null,
+    flowState: FlowStateBuffer = FlowStateBuffer(),
 ): Map<String, NodeRun> {
     val states = ConcurrentHashMap<String, NodeRun>()
     runBlocking(Dispatchers.Default) {
-        FlowExecutor(FakeContext(service, notifications), registry, secrets).run(nodes, edges) { id, r -> states[id] = r }
+        FlowExecutor(FakeContext(service, notifications), registry, secrets).run(
+            nodes, edges, flowState = flowState,
+        ) { id, r -> states[id] = r }
     }
     return states
 }
@@ -189,6 +192,21 @@ private fun runGraph(
 private fun JsonObject.str(key: String) = this[key]?.jsonPrimitive?.content
 
 class FlowExecutorTest {
+
+    @Test
+    fun `state node stages current values and later nodes read prior-run state`() {
+        val state = FlowStateBuffer(buildJsonObject { put("lastSeen", "before") })
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            n("set", NodeType.SET, "assignments" to """{"was":"{{ ${'$'}state.lastSeen }}","now":"after"}"""),
+            n("state", NodeType.STATE, "assignments" to """{"lastSeen":"{{ ${'$'}json.now }}"}"""),
+        )
+        val states = runGraph(nodes, listOf(e("t", "set"), e("set", "state")), flowState = state)
+
+        assertEquals("before", states["set"]?.output?.single()?.json?.str("was"))
+        assertEquals(RunStatus.SUCCESS, states["state"]?.status)
+        assertEquals("after", state.changes()["lastSeen"]?.jsonPrimitive?.content)
+    }
 
     @Test
     fun `cycle is rejected`() {

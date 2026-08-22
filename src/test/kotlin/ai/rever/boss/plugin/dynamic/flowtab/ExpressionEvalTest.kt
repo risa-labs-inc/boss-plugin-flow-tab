@@ -52,6 +52,21 @@ class ExpressionEvalTest {
     }
 
     @Test
+    fun `resolves durable flow state with the same path grammar as json`() {
+        val state = buildJsonObject {
+            put("cursor", buildJsonObject { put("id", "last-item") })
+            put("count", 7)
+        }
+
+        assertEquals("last-item", ExpressionEval.interpolate("{{ \$state.cursor.id }}", empty, emptyMap(), state))
+        assertEquals("7", ExpressionEval.interpolate("{{ \$state.count }}", empty, emptyMap(), state))
+        assertEquals(
+            "{\"cursor\":{\"id\":\"last-item\"},\"count\":7}",
+            ExpressionEval.interpolate("{{ \$state }}", empty, emptyMap(), state),
+        )
+    }
+
+    @Test
     fun `missing and unsupported paths fail with the expression named`() {
         val missing = assertFailsWith<TemplateResolutionException> {
             ExpressionEval.interpolate("{{ \$json.nope }}", empty, emptyMap())

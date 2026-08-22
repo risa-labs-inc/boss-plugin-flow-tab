@@ -470,6 +470,7 @@ class FlowTabComponent(
                 var runFailure: String? = null
                 var persistedRevisionId: String? = null
                 val historyStates = ConcurrentHashMap<String, NodeRun>()
+                var stagedState = FlowStateBuffer()
                 try {
                     // Do not erase the preceding run's results or close its browser tab
                     // until the fence actually admits this run. A wedged predecessor
@@ -494,6 +495,10 @@ class FlowTabComponent(
                         Snapshot.sendApplyNotifications()
                     }
                     if (!admissionAccepted) return@launch
+                    // Read after the canvas-run fence admits us: a queued fresh run must
+                    // not use a stale cursor captured while its predecessor was finishing.
+                    stagedState = FlowStateBuffer(runCatching { controller.loadFlowState(config.id) }
+                        .getOrDefault(JsonObject(emptyMap())))
                     // Revision persistence is audit metadata, not an execution
                     // dependency. A transient storage failure must not fail a flow
                     // whose plan was already frozen in memory.
@@ -553,6 +558,7 @@ class FlowTabComponent(
                         // Seed this flow's own id so a lanager pointing back at it is caught
                         // as a cycle at depth 0, not only one level deeper (red-team S7).
                         ancestry = setOf(config.id),
+                        flowState = stagedState,
                     ) { id, run ->
                         // A check/write can straddle Clear, but orphaned ids do not render
                         // and the separately gated finalizer cannot persist them.
@@ -585,7 +591,13 @@ class FlowTabComponent(
                         // remains the fallback for a queued job cancelled before this block.
                         if (runStatePersistence.isCurrent(runToken)) state.isRunning = false
                         val firstNodeError = historyStates.values.firstOrNull { it.status == RunStatus.ERROR }?.error
-                        val terminalError = runFailure ?: firstNodeError
+                        var terminalError = runFailure ?: firstNodeError
+                        if (terminalError == null) {
+                            runCatching { controller.commitFlowState(config.id, stagedState.changes()) }
+                                .onFailure { failure ->
+                                    terminalError = "Run completed, but state could not be saved: ${failure.message}"
+                                }
+                        }
                         controller.publishCanvasRun(
                             RunJob(
                                 runId = historyRunId,

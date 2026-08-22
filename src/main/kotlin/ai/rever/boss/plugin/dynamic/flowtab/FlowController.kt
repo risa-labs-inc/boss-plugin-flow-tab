@@ -686,6 +686,7 @@ class FlowController(
                     if (store.getJson(graphKey(tabId)) != null) {
                         store.removeJsonValue(graphKey(tabId))
                         store.removeJsonValue("$RUN_STATE_PREFIX$tabId")
+                        store.removeJsonValue(stateKey(tabId))
                         store.removeJsonValue(scheduleKey(tabId))
                         storedRuns().filter { it.second.tabId == tabId }.forEach { (runId, _) ->
                             store.removeJsonValue(runKey(runId))
@@ -712,6 +713,37 @@ class FlowController(
     }
 
     // ---- async run jobs (F1) ------------------------------------------------
+
+    /**
+     * Load the durable state for a flow. Corrupt or older absent values safely behave
+     * as empty state; state is an optional automation aid, never a reason a flow cannot
+     * start. The state is intentionally not exposed by `flow_result`.
+     */
+    suspend fun loadFlowState(tabId: String): JsonObject {
+        val raw = storage?.getJson(stateKey(tabId)) ?: return JsonObject(emptyMap())
+        return runCatching {
+            json.decodeFromString(FlowStateSnapshot.serializer(), raw).values.also(::validateFlowState)
+        }.getOrDefault(JsonObject(emptyMap()))
+    }
+
+    /**
+     * Persist the staged state after a successful run. Each commit writes a complete,
+     * bounded object under the flow's private key. Concurrent commits merge keys so
+     * independent branches/runs do not erase each other; a same-key collision has
+     * deterministic last-successful-commit-wins semantics.
+     */
+    suspend fun commitFlowState(tabId: String, staged: JsonObject) {
+        validateFlowState(staged)
+        val store = storage ?: return
+        FlowPersistenceCoordinator.withFlowLock(tabId) {
+            withContext(NonCancellable + Dispatchers.IO) {
+                val existing = loadFlowState(tabId)
+                val merged = JsonObject(existing + staged)
+                validateFlowState(merged)
+                store.putJson(stateKey(tabId), json.encodeToString(FlowStateSnapshot.serializer(), FlowStateSnapshot(merged)))
+            }
+        }
+    }
 
     /**
      * Launch flow [tabId] on [scopeProvider] and return a runId immediately. The run drives
@@ -742,9 +774,9 @@ class FlowController(
             val candidate = try {
                 // This is the first operation in the dispatched coroutine. The graph is
                 // frozen and durably content-addressed before the executor sees it.
-                val revision = FlowPersistenceCoordinator.withFlowLock(tabId) {
+                val (revision, initialState) = FlowPersistenceCoordinator.withFlowLock(tabId) {
                     val snapshot = getFlow(tabId) ?: throw IllegalStateException("No flow '$tabId'")
-                    persistRevision(tabId, snapshot.toWorkflowRevision(startedAtMs, "headless"))
+                    persistRevision(tabId, snapshot.toWorkflowRevision(startedAtMs, "headless")) to loadFlowState(tabId)
                 }
                 val snap = revision.snapshot
                 jobs.computeIfPresent(runId) { _, current ->
@@ -756,12 +788,14 @@ class FlowController(
                 val plan = snap.nodes.map { PlanNode(it.id, it.type, it.title, it.config) }
                 // This flow is now on the call stack: a nested lanager pointing back at it
                 // is a cycle. Depth is threaded so the nesting bound can be enforced.
+                val stagedState = FlowStateBuffer(initialState)
                 FlowExecutor(context, registry).run(
                     plan,
                     snap.edges,
                     closeVisibleTabsOnClose = true,
                     depth = depth,
                     ancestry = ancestry + tabId,
+                    flowState = stagedState,
                 ) { id, r ->
                     states[id] = r
                     // flow_result must be a non-blocking snapshot even while the
@@ -779,6 +813,7 @@ class FlowController(
                     lifecycleScope.launch { jobs[runId]?.let { persistRun(it, publish = false) } }
                 }
                 val firstError = states.values.firstOrNull { it.status == RunStatus.ERROR }
+                if (firstError == null) commitFlowState(tabId, stagedState.changes())
                 RunJob(
                     runId = runId,
                     tabId = tabId,
@@ -1266,6 +1301,7 @@ class FlowController(
     }
 
     private fun graphKey(tabId: String) = "$GRAPH_PREFIX$tabId"
+    private fun stateKey(tabId: String) = "$STATE_PREFIX$tabId"
     private fun runKey(runId: String) = "$RUN_PREFIX$runId"
     private fun revisionPrefix(tabId: String) = "$REVISION_PREFIX$tabId:"
     private fun revisionKey(tabId: String, revisionId: String) = "${revisionPrefix(tabId)}$revisionId"
@@ -1289,6 +1325,7 @@ class FlowController(
         const val MAX_FLOW_NAME_LENGTH = 100
         const val STORAGE_NAMESPACE = "ai.rever.boss.plugin.dynamic.flowtab"
         const val GRAPH_PREFIX = "graph:"
+        const val STATE_PREFIX = "state:"
         const val RUN_PREFIX = "run:"
         const val REVISION_PREFIX = "revision:"
         const val SCHEDULE_STATE_PREFIX = "schedule:"
