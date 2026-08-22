@@ -37,6 +37,8 @@ private val EXEC_JSON = Json { ignoreUnknownKeys = true; isLenient = true }
 // still loading its content. Generic across every browser node.
 internal const val ELEMENT_WAIT_MS = 20_000
 internal const val LOGIN_WAIT_MS = 300_000
+/** Approval steps commonly take longer than sign-in, while remaining below the run watchdog. */
+internal const val HUMAN_GATE_WAIT_MS = 600_000
 internal const val MAX_ELEMENT_WAIT_MS = 14 * 60 * 1_000
 internal const val LOGIN_PROMPT_GRACE_MS = 1_000
 internal const val LOGIN_POLL_MS = 1_000
@@ -283,24 +285,32 @@ object NodeCatalog {
             NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
         }
 
-        NodeType.AWAIT_LOGIN -> NodeExecutor { ctx, cfg, inputs, log ->
+        NodeType.HUMAN_GATE, NodeType.AWAIT_LOGIN -> NodeExecutor { ctx, cfg, inputs, log ->
+            val isLogin = type == NodeType.AWAIT_LOGIN
+            val gateLabel = if (isLogin) "Await Login" else "Human Approval"
+            val markerName = if (isLogin) "signed-in marker" else "completion marker"
+            // Keep the legacy timeout wording byte-for-byte stable for saved Await Login flows.
+            val timeoutMarkerName = if (isLogin) "sign-in marker" else markerName
+            val defaultWaitMs = if (isLogin) LOGIN_WAIT_MS else HUMAN_GATE_WAIT_MS
+            val defaultMessage = if (isLogin) {
+                "Sign in in the browser to continue this flow."
+            } else {
+                "Complete the required approval in the browser to continue this flow."
+            }
             val selector = cfg.str("selector").trim()
-            if (selector.isEmpty()) throw ExecError("Await Login needs a signed-in marker")
+            if (selector.isEmpty()) throw ExecError("$gateLabel needs a $markerName")
             val selectorType = cfg.str("selectorType", "css")
-            val waitMs = cfg.elementWaitMs(LOGIN_WAIT_MS)
-            val message = cfg.str(
-                "message",
-                "Sign in in the browser to continue this flow.",
-            ).ifBlank { "Sign in in the browser to continue this flow." }
+            val waitMs = cfg.elementWaitMs(defaultWaitMs)
+            val message = cfg.str("message", defaultMessage).ifBlank { defaultMessage }
             val session = ctx.requireSession()
 
             val promptGraceMs = minOf(waitMs, LOGIN_PROMPT_GRACE_MS)
             if (session.awaitElement(selectorType, selector, timeoutMs = promptGraceMs)) {
-                log("Sign-in already detected")
+                log(if (isLogin) "Sign-in already detected" else "Approval already detected")
                 return@NodeExecutor NodeOutput.single(inputs.ifEmpty { SEED_ITEMS })
             }
             if (waitMs <= promptGraceMs) {
-                throw ExecError("Await Login: sign-in marker '$selector' not found within ${waitMs}ms")
+                throw ExecError("$gateLabel: $timeoutMarkerName '$selector' not found within ${waitMs}ms")
             }
 
             // Focusing is helpful but not required for correctness: host tab state can
@@ -320,7 +330,7 @@ object NodeCatalog {
                         message = message,
                         type = NotificationType.INFO,
                         duration = NotificationDuration.INDEFINITE,
-                        title = "Flow waiting for sign-in",
+                        title = if (isLogin) "Flow waiting for sign-in" else "Flow waiting for approval",
                     )
                 }.getOrNull()
             }
@@ -333,9 +343,9 @@ object NodeCatalog {
                         pollMs = LOGIN_POLL_MS,
                     )
                 ) {
-                    throw ExecError("Await Login: sign-in marker '$selector' not found within ${waitMs}ms")
+                    throw ExecError("$gateLabel: $timeoutMarkerName '$selector' not found within ${waitMs}ms")
                 }
-                log("Sign-in detected; continuing flow")
+                log(if (isLogin) "Sign-in detected; continuing flow" else "Approval detected; continuing flow")
             } finally {
                 notificationId?.let { id ->
                     runCatching { ctx.context.notificationProvider?.dismiss(id) }

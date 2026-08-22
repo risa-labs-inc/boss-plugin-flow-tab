@@ -41,6 +41,7 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Language
 import androidx.compose.material.icons.filled.Navigation
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Tune
@@ -97,6 +98,7 @@ fun iconForKind(kind: String): ImageVector = when (kind) {
     "TRIGGER" -> Icons.Filled.Bolt
     "OPEN_BROWSER" -> Icons.Filled.Public
     "NAVIGATE" -> Icons.Filled.Navigation
+    "HUMAN_GATE" -> Icons.Filled.Person
     "AWAIT_LOGIN" -> Icons.AutoMirrored.Filled.Login
     "CLICK" -> Icons.Filled.TouchApp
     "TYPE" -> Icons.Filled.Keyboard
@@ -145,6 +147,7 @@ fun nodeSummary(node: FlowNode): String {
         "TRIGGER" -> "Starts this flow"
         "OPEN_BROWSER" -> withTarget("Opens", c("url"), "Opens a browser session")
         "NAVIGATE" -> withTarget("Navigates to", c("url"), "Navigates to a URL")
+        "HUMAN_GATE" -> withTarget("Waits for approval marker", c("selector"), "Waits for a human approval")
         "AWAIT_LOGIN" -> withTarget("Waits for sign-in marker", c("selector"), "Waits for a human to sign in")
         "CLICK" -> withTarget("Clicks", c("selector"), "Clicks a page element")
         "TYPE" -> withTarget("Types into", c("selector"), "Types text into a page field")
@@ -193,6 +196,10 @@ fun nodeMetaChips(node: FlowNode): List<String> {
     }
     return when (node.kind) {
         "OPEN_BROWSER" -> listOf(if (c("headless").equals("true", true)) "headless" else "visible")
+        "HUMAN_GATE" -> {
+            val waitMs = c("waitMs").toIntOrNull()?.coerceIn(0, MAX_ELEMENT_WAIT_MS) ?: HUMAN_GATE_WAIT_MS
+            listOf(c("selectorType").ifBlank { "css" }, "${waitMs}ms wait")
+        }
         "AWAIT_LOGIN" -> {
             val waitMs = c("waitMs").toIntOrNull()?.coerceIn(0, MAX_ELEMENT_WAIT_MS) ?: LOGIN_WAIT_MS
             listOf(c("selectorType").ifBlank { "css" }, "${waitMs}ms wait")

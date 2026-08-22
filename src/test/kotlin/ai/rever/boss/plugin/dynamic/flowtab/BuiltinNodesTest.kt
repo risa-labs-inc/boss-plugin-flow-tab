@@ -52,7 +52,7 @@ class BuiltinNodesTest {
     }
 
     @Test
-    fun `selector actions expose waits and await login defaults to five minutes`() {
+    fun `selector actions and human gates expose their intended wait defaults`() {
         listOf(NodeType.CLICK, NodeType.TYPE, NodeType.EXTRACT).forEach { type ->
             val wait = reg[type.name]!!.configFields.single { it.key == "waitMs" }
             assertEquals(FieldType.NUMBER, wait.type, type.name)
@@ -65,5 +65,13 @@ class BuiltinNodesTest {
             "Sign in in the browser to continue this flow.",
             login.configFields.single { it.key == "message" }.default,
         )
+
+        val approval = reg[NodeType.HUMAN_GATE.name]!!
+        assertEquals(HUMAN_GATE_WAIT_MS.toString(), approval.configFields.single { it.key == "waitMs" }.default)
+        assertEquals(
+            "Complete the required approval in the browser to continue this flow.",
+            approval.configFields.single { it.key == "message" }.default,
+        )
+        assertEquals("Completion marker", approval.configFields.single { it.key == "selector" }.label)
     }
 }

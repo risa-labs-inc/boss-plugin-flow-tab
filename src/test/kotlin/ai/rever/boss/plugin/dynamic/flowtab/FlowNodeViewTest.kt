@@ -1,5 +1,7 @@
 package ai.rever.boss.plugin.dynamic.flowtab
 
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Person
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -125,6 +127,20 @@ class FlowNodeViewTest {
             nodeSummary(login),
         )
         assertEquals(listOf("xpath", "300000ms wait"), nodeMetaChips(login))
+    }
+
+    @Test
+    fun `human approval card is generic while preserving its completion marker`() {
+        val approval = node(
+            NodeType.HUMAN_GATE,
+            "selectorType" to "css",
+            "selector" to "[data-approved]",
+            "waitMs" to "600000",
+        )
+
+        assertEquals("Waits for approval marker [data-approved]", nodeSummary(approval))
+        assertEquals(listOf("css", "600000ms wait"), nodeMetaChips(approval))
+        assertEquals(Icons.Filled.Person, iconForKind("HUMAN_GATE"))
     }
 
     @Test

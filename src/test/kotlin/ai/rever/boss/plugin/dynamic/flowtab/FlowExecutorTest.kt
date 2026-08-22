@@ -503,6 +503,59 @@ class FlowExecutorTest {
     }
 
     @Test
+    fun `human gate shares the waiting behavior with an approval-specific presentation`() {
+        val notifications = FakeNotifications()
+        var markerPolls = 0
+        val states = runGraph(
+            listOf(
+                n("open", NodeType.OPEN_BROWSER),
+                n(
+                    "approval",
+                    NodeType.HUMAN_GATE,
+                    "selector" to "[data-approved]",
+                    "waitMs" to "3000",
+                    "message" to "Scientist approval required",
+                ),
+            ),
+            listOf(e("open", "approval")),
+            service = FakeService(FakeHandle(responder = { script ->
+                if (script.contains("return !!")) {
+                    markerPolls++
+                    notifications.shown.isNotEmpty()
+                } else {
+                    true
+                }
+            })),
+            notifications = notifications,
+        )
+
+        assertEquals(RunStatus.SUCCESS, states["approval"]?.status)
+        assertEquals(
+            listOf(
+                FakeNotifications.Shown(
+                    "Scientist approval required",
+                    NotificationType.INFO,
+                    NotificationDuration.INDEFINITE,
+                    "Flow waiting for approval",
+                ),
+            ),
+            notifications.shown,
+        )
+        assertEquals(
+            listOf("Scientist approval required", "Approval detected; continuing flow"),
+            states["approval"]?.logs,
+        )
+    }
+
+    @Test
+    fun `human gate requires a completion marker`() {
+        val states = runGraph(listOf(n("approval", NodeType.HUMAN_GATE)), emptyList())
+
+        assertEquals(RunStatus.ERROR, states["approval"]?.status)
+        assertEquals("Human Approval needs a completion marker", states["approval"]?.error)
+    }
+
+    @Test
     fun `browser value nodes resolve secrets at runtime without logging them`() {
         val password = "line one\nline'two"
         val token = "token line one\ntoken'two"
