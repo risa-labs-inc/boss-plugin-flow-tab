@@ -26,8 +26,10 @@ object AgentNode {
     const val MODEL_KEY = "model"
     const val TEMPERATURE_KEY = "temperature"
     const val MAX_STEPS_KEY = "maxSteps"
+    const val MAX_STEPS_INFO_KEY = "maxStepsInfo"
     const val TIMEOUT_KEY = "timeoutMs"
     const val MAX_TOKENS_KEY = "maxTokens"
+    const val MAX_TOKENS_INFO_KEY = "maxTokensInfo"
     const val OUTPUT_SCHEMA_KEY = "outputSchema"
 
     const val ACCENT = 0xFF6D4AFF
@@ -76,6 +78,14 @@ object AgentNode {
         ),
         ConfigField(MAX_STEPS_KEY, "Max steps", FieldType.NUMBER, default = "8"),
         ConfigField(
+            MAX_STEPS_INFO_KEY,
+            "Step budget notes",
+            FieldType.INFO,
+            note = "Maximum model requests. If a non-final response reaches this limit, the Agent fails before " +
+                "running that response's pending tools because no next request could use their results. " +
+                "Raise Max steps to allow another tool round and a final answer.",
+        ),
+        ConfigField(
             TIMEOUT_KEY,
             "Timeout (ms, max 720000)",
             FieldType.NUMBER,
@@ -84,9 +94,22 @@ object AgentNode {
         ),
         ConfigField(
             MAX_TOKENS_KEY,
-            "Max tokens",
+            "Max tokens (whole run)",
             FieldType.NUMBER,
-            placeholder = "unbounded if blank; otherwise must be greater than 0",
+            placeholder = "blank = unbounded cumulative input + output usage",
+        ),
+        ConfigField(
+            MAX_TOKENS_INFO_KEY,
+            "Token budget notes",
+            FieldType.INFO,
+            note = "Soft whole-run threshold checked between model requests. Once cumulative provider-reported " +
+                "input + output usage reaches it, the Agent stops before the next request; the crossing request " +
+                "is not interrupted, so actual usage may exceed the value by one full turn. Replayed transcript " +
+                "and tool results count again as input; tool-call arguments count as output when generated and " +
+                "as input when replayed. Enforced only when the provider reports usage. For tool-using Agents, " +
+                "values in the hundreds commonly stop before the final answer; start with several thousand and tune. " +
+                "Separate from the gateway's fixed ${GatewayAgentProvider.DEFAULT_MAX_TOKENS}-token output cap " +
+                "on each individual model request.",
         ),
     )
 }
@@ -140,25 +163,46 @@ class AgentNodeExecutor(
                 outputSchema = settings.outputSchema,
                 log = log,
             )
-        if (result.stopReason == StopReason.TIMEOUT) {
-            if (result.finalText.isNotBlank()) {
-                log("agent partial text withheld (${result.finalText.length} chars)")
-            }
-            throw ExecError(
-                "Agent stopped: TIMEOUT after ${result.steps} completed step(s), " +
-                    "${result.toolCalls} attempted tool call(s); timeout was ${settings.budget.timeoutMs}ms" +
-                    if (settings.outputSchema == null) "" else "; no valid structured output was produced",
+        return when (result.stopReason) {
+            StopReason.COMPLETED -> completedOutput(settings, result, log)
+            StopReason.MAX_STEPS -> failIncompleteRun(
+                settings,
+                result,
+                "configured maxSteps was ${settings.budget.maxSteps}",
+                log,
+            )
+            StopReason.TOKEN_BUDGET -> failIncompleteRun(
+                settings,
+                result,
+                "configured maxTokens was ${settings.budget.maxTokens}",
+                log,
+            )
+            StopReason.TIMEOUT -> failIncompleteRun(
+                settings,
+                result,
+                "effective timeoutMs was ${settings.budget.timeoutMs}ms",
+                log,
             )
         }
+    }
+
+    private fun completedOutput(
+        settings: AgentSettings,
+        result: AgentResult,
+        log: (String) -> Unit,
+    ): NodeOutput {
         if (settings.outputSchema != null) {
+            // Defensive internal invariant: structured runtime completion must always
+            // carry the locally validated object accepted by flow_submit_output.
             val structured = result.structuredOutput
             if (structured == null) {
                 if (result.finalText.isNotBlank()) {
                     log("agent non-structured final text withheld (${result.finalText.length} chars)")
                 }
                 throw ExecError(
-                    "Agent stopped: ${result.stopReason} after ${result.steps} completed step(s), " +
-                        "${result.toolCalls} attempted tool call(s); no valid structured output was produced",
+                    "Agent contract violation: runtime reported COMPLETED after ${result.steps} completed step(s), " +
+                        "${result.toolCalls} attempted tool call(s), but returned no valid structured output; " +
+                        usageClause(result),
                 )
             }
             return NodeOutput.single(listOf(Item(structured)))
@@ -171,6 +215,34 @@ class AgentNodeExecutor(
                 put("toolCalls", result.toolCalls)
             })
         ))
+    }
+
+    private fun failIncompleteRun(
+        settings: AgentSettings,
+        result: AgentResult,
+        configuredLimit: String,
+        log: (String) -> Unit,
+    ): Nothing {
+        if (result.finalText.isNotBlank()) {
+            log("agent partial text withheld (${result.finalText.length} chars)")
+        }
+        val usage = usageClause(result)
+        val missingOutput = if (settings.outputSchema == null) {
+            "no final response was completed"
+        } else {
+            "no valid structured output was produced"
+        }
+        throw ExecError(
+            "Agent stopped: ${result.stopReason} after ${result.steps} completed step(s), " +
+                "${result.toolCalls} attempted tool call(s); $configuredLimit; $usage; $missingOutput",
+        )
+    }
+
+    private fun usageClause(result: AgentResult): String = if (result.usageReported) {
+        "provider-reported usage was ${result.usage.total} token(s) " +
+            "(input ${result.usage.input} + output ${result.usage.output})"
+    } else {
+        "provider-reported usage was unavailable"
     }
 
     private suspend fun resolveSystem(settings: AgentSettings): String {

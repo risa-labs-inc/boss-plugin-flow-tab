@@ -60,26 +60,50 @@ comfortably below the 15-minute flow controller watchdog, then forwarded to rela
 shorter per-turn default; `AgentRuntime` still enforces the decreasing whole-run time remaining and
 fires first.
 
-`maxTokens` is still overridden per request (4096, not the provider's chat-completion default of
-2000) because a bounded tool-use loop needs the headroom. A run is bounded by `AgentBudget`.
+There are two intentionally separate token controls. The Agent node's optional `maxTokens` setting
+is the cumulative whole-run budget: it sums provider-reported input plus output usage across every
+model turn. Because each request replays the conversation and completed tool rounds, earlier
+transcript, tool calls, and tool results count again as input on later turns. Tool-call arguments
+count as output when the model generates them and as input when that round is replayed. `maxTokens`
+is a pre-request soft threshold: after a completed turn brings accumulated usage to or above the
+configured value, the runtime stops before the next model request. It does not interrupt the crossing
+request, so actual usage can exceed the value by one full turn. Enforcement is also best-effort: a
+provider that omits usage contributes nothing to the counter, so `maxTokens` cannot be a hard bound
+for that provider. Blank remains unbounded. Budgets in the hundreds commonly stop a tool-using Agent
+before its final answer; several thousand is a more realistic starting point, then tune from observed
+usage. In contrast, `GatewayAgentProvider` always asks the gateway for at most
+`GatewayAgentProvider.DEFAULT_MAX_TOKENS` (currently 4096) output tokens on each individual model
+request (rather than the provider's chat-completion default of 2000) because a tool-use turn needs
+the headroom. This documents the existing semantics; it does not change either default or split the
+`AgentBudget` API.
+
+`maxSteps` counts model requests. After any non-completing turn, the runtime checks `maxTokens`
+first and then `maxSteps` before executing generic tool calls. If no next model request is permitted,
+pending tools are skipped without invocation and without incrementing the attempted-tool counter;
+their side effects would be pointless because their results could never reach the model. Raise
+`maxSteps` to permit another tool round and a final answer. A valid `flow_submit_output` is still
+accepted on the final permitted step because it completes the structured contract without another
+request. Token-budget precedence is intentional when the same turn reaches both thresholds.
 
 `timeoutMs` is a hard node deadline, not merely a check between agent steps. `AgentRuntime` owns
 its loop on a 64-call, concurrency-limited elastic IO view so a non-cooperative provider or tool
 boundary cannot prevent the caller from publishing TIMEOUT or consume every unrelated host IO
 permit. The budget clock starts only after the loop is admitted to that lane. If all slots remain
 occupied, a short bounded admission wait fails explicitly as Agent capacity exhaustion instead of
-pretending a provider timed out without running. The loop gets the configured cooperative deadline;
+pretending a provider timed out without running. The loop gets the effective cooperative deadline
+(the configured value capped below the flow watchdog);
 a watchdog grace (at least 500ms, or 5% for longer runs) lets it publish complete counters normally
 before the hard caller deadline abandons a non-cooperative call. The scope is cancelled best-effort,
 no new host work starts after the deadline, and progress counters are snapshotted for the timeout
 diagnostic. A call that ignores cancellation may still finish against run-scoped state while cleanup
 is running; the lane bound contains that residue but cannot interrupt arbitrary host code. A
 serialized log gate closes before return so late completion cannot mutate the already-published node
-state. An agent TIMEOUT is converted to `ExecError` by `AgentNodeExecutor`;
-it must be a red node failure rather than a successful output carrying `stopReason: TIMEOUT`.
-`MAX_STEPS` and `TOKEN_BUDGET` remain successful bounded results because they may carry a usable
-partial answer. User-configured step, timeout, and token budgets must be positive whole numbers;
-zero does not mean unlimited.
+state. `AgentRuntime` reports which bound stopped its loop, but `AgentNodeExecutor` converts TIMEOUT,
+MAX_STEPS, and TOKEN_BUDGET into `ExecError`: none proves that the model produced a final response.
+Any intermediate prose is withheld, so downstream nodes never receive a preamble or unfinished
+answer as successful Agent output. Structured mode keeps its stricter contract and succeeds only
+after a locally validated `flow_submit_output` call. User-configured step, timeout, and token budgets
+must be positive whole numbers; zero does not mean unlimited.
 
 Agent diagnostics are incremental and sanitized. The runtime logs each model step before the
 provider call, each tool's name plus started/succeeded/failed status, and a terminal stop line.

@@ -76,7 +76,11 @@ class AgentNodeTest {
             listOf(EdgeModel("e", "t", 0, "a", 0)),
         )
         assertEquals(RunStatus.SUCCESS, states["a"]!!.status)
-        assertEquals("final answer", states["a"]!!.output.single().json["text"]!!.jsonPrimitive.content)
+        val output = states["a"]!!.output.single().json
+        assertEquals("final answer", output["text"]!!.jsonPrimitive.content)
+        assertEquals("COMPLETED", output["stopReason"]!!.jsonPrimitive.content)
+        assertEquals("2", output["steps"]!!.jsonPrimitive.content)
+        assertEquals("1", output["toolCalls"]!!.jsonPrimitive.content)
         assertTrue(source.invoked.contains("lookup"))
         assertTrue(states["a"]!!.logs.contains("agent tools resolved: 1 (lookup)"))
     }
@@ -198,6 +202,7 @@ class AgentNodeTest {
                 toolCalls = listOf(
                     ToolCall("out-1", AgentStructuredOutput.TOOL_NAME, """{"selector":"#main","found":true}"""),
                 ),
+                usage = TokenUsage(input = 1, output = 1),
             )
         }
         val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
@@ -218,6 +223,8 @@ class AgentNodeTest {
             put(AgentNode.SYSTEM_KEY, "Use the page evidence.")
             put(AgentNode.INPUT_KEY, "locate the section")
             put(AgentNode.OUTPUT_SCHEMA_KEY, schema)
+            put(AgentNode.MAX_STEPS_KEY, "1")
+            put(AgentNode.MAX_TOKENS_KEY, "1")
             put(AgentNode.ALLOWLIST_KEY, buildJsonArray { add(JsonPrimitive("lookup")) })
         }
 
@@ -480,12 +487,13 @@ class AgentNodeTest {
         assertEquals(RunStatus.ERROR, state.status)
         assertEquals(
             "Agent stopped: MAX_STEPS after 2 completed step(s), 0 attempted tool call(s); " +
+                "configured maxSteps was 2; provider-reported usage was unavailable; " +
                 "no valid structured output was produced",
             state.error,
         )
         assertTrue(sawCorrection)
         assertTrue(state.output.isEmpty())
-        assertTrue(state.logs.contains("agent non-structured final text withheld (28 chars)"))
+        assertTrue(state.logs.contains("agent partial text withheld (28 chars)"))
         assertFalse(state.logs.joinToString("\n").contains("secret prose instead of json"))
     }
 
@@ -615,7 +623,12 @@ class AgentNodeTest {
         ).getValue("token")
 
         assertEquals(RunStatus.ERROR, tokenState.status)
-        assertContains(tokenState.error.orEmpty(), "Agent stopped: TOKEN_BUDGET")
+        assertEquals(
+            "Agent stopped: TOKEN_BUDGET after 1 completed step(s), 0 attempted tool call(s); " +
+                "configured maxTokens was 1; provider-reported usage was 2 token(s) (input 1 + output 1); " +
+                "no valid structured output was produced",
+            tokenState.error,
+        )
         assertTrue(tokenState.output.isEmpty())
         assertFalse(tokenState.logs.joinToString("\n").contains("token-limited prose"))
 
@@ -642,7 +655,8 @@ class AgentNodeTest {
         assertEquals(RunStatus.ERROR, timeoutState.status)
         assertEquals(
             "Agent stopped: TIMEOUT after 0 completed step(s), 0 attempted tool call(s); " +
-                "timeout was 100ms; no valid structured output was produced",
+                "effective timeoutMs was 100ms; provider-reported usage was unavailable; " +
+                "no valid structured output was produced",
             timeoutState.error,
         )
         assertTrue(timeoutState.output.isEmpty())
@@ -713,6 +727,27 @@ class AgentNodeTest {
             "legacy-model-that-must-not-run",
             restored.nodes.single().config[AgentNode.MODEL_KEY]?.jsonPrimitive?.content,
         )
+    }
+
+    @Test
+    fun `max tokens metadata distinguishes whole-run usage from the per-request output cap`() {
+        val budgetField = AgentNode.CONFIG_FIELDS.single { it.key == AgentNode.MAX_TOKENS_KEY }
+        assertEquals("Max tokens (whole run)", budgetField.label)
+        assertTrue(budgetField.placeholder.contains("cumulative input + output"))
+        assertTrue(budgetField.default.isEmpty(), "the documented semantics must not change the existing default")
+
+        val helpField = AgentNode.CONFIG_FIELDS.single { it.key == AgentNode.MAX_TOKENS_INFO_KEY }
+        assertEquals(FieldType.INFO, helpField.type)
+        assertTrue(helpField.note.contains("Soft whole-run threshold checked between model requests"))
+        assertTrue(helpField.note.contains("may exceed the value by one full turn"))
+        assertTrue(helpField.note.contains("only when the provider reports usage"))
+        assertTrue(helpField.note.contains("values in the hundreds commonly stop before the final answer"))
+        assertTrue(helpField.note.contains("${GatewayAgentProvider.DEFAULT_MAX_TOKENS}-token output cap"))
+
+        val stepsHelp = AgentNode.CONFIG_FIELDS.single { it.key == AgentNode.MAX_STEPS_INFO_KEY }
+        assertEquals(FieldType.INFO, stepsHelp.type)
+        assertTrue(stepsHelp.note.contains("fails before running that response's pending tools"))
+        assertTrue(stepsHelp.note.contains("Raise Max steps"))
     }
 
     @Test
@@ -792,6 +827,7 @@ class AgentNodeTest {
                 AssistantTurn(
                     text = "working answer",
                     toolCalls = listOf(ToolCall("1", "step", "{}")),
+                    usage = TokenUsage(input = 2, output = 1),
                 )
             } else {
                 delay(10_000)
@@ -816,7 +852,9 @@ class AgentNodeTest {
 
         assertEquals(RunStatus.ERROR, states["a"]?.status)
         assertEquals(
-            "Agent stopped: TIMEOUT after 1 completed step(s), 1 attempted tool call(s); timeout was 100ms",
+            "Agent stopped: TIMEOUT after 1 completed step(s), 1 attempted tool call(s); " +
+                "effective timeoutMs was 100ms; provider-reported usage was 3 token(s) (input 2 + output 1); " +
+                "no final response was completed",
             states["a"]?.error,
         )
         assertTrue(states["a"]?.logs.orEmpty().any { it.startsWith("agent stopped: TIMEOUT") })
@@ -955,10 +993,15 @@ class AgentNodeTest {
     }
 
     @Test
-    fun `max steps remains a successful bounded result`() {
+    fun `max steps without final completion fails closed and withholds partial prose`() {
         val source = RecordingSource(listOf("spin"))
+        val partial = "still working through tools"
         val provider = FakeProvider { _, _, _, _ ->
-            AssistantTurn(toolCalls = listOf(ToolCall("1", "spin", "{}")))
+            AssistantTurn(
+                text = partial,
+                toolCalls = listOf(ToolCall("1", "spin", "{}")),
+                usage = TokenUsage(input = 3, output = 4),
+            )
         }
         val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
         val reg = builtinNodeRegistry().also { it.register(spec) }
@@ -972,15 +1015,27 @@ class AgentNodeTest {
 
         val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
 
-        assertEquals(RunStatus.SUCCESS, states["a"]?.status)
-        assertEquals("MAX_STEPS", states["a"]?.output?.single()?.json?.get("stopReason")?.jsonPrimitive?.content)
+        val state = states.getValue("a")
+        assertEquals(RunStatus.ERROR, state.status)
+        assertEquals(
+            "Agent stopped: MAX_STEPS after 1 completed step(s), 0 attempted tool call(s); " +
+                "configured maxSteps was 1; provider-reported usage was 7 token(s) (input 3 + output 4); " +
+                "no final response was completed",
+            state.error,
+        )
+        assertTrue(state.output.isEmpty())
+        assertTrue(source.invoked.isEmpty())
+        assertTrue(state.logs.contains("agent partial text withheld (${partial.length} chars)"))
+        assertFalse(state.logs.joinToString("\n").contains(partial))
     }
 
     @Test
-    fun `token budget remains a successful bounded result`() {
+    fun `token budget without final completion fails closed and withholds partial prose`() {
         val source = RecordingSource(listOf("spin"))
+        val partial = "selector search is still running"
         val provider = FakeProvider { _, _, _, _ ->
             AssistantTurn(
+                text = partial,
                 toolCalls = listOf(ToolCall("1", "spin", "{}")),
                 usage = TokenUsage(input = 5, output = 5),
             )
@@ -997,8 +1052,43 @@ class AgentNodeTest {
 
         val states = runFlow(reg, listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)), emptyList())
 
-        assertEquals(RunStatus.SUCCESS, states["a"]?.status)
-        assertEquals("TOKEN_BUDGET", states["a"]?.output?.single()?.json?.get("stopReason")?.jsonPrimitive?.content)
+        val state = states.getValue("a")
+        assertEquals(RunStatus.ERROR, state.status)
+        assertEquals(
+            "Agent stopped: TOKEN_BUDGET after 1 completed step(s), 0 attempted tool call(s); " +
+                "configured maxTokens was 1; provider-reported usage was 10 token(s) (input 5 + output 5); " +
+                "no final response was completed",
+            state.error,
+        )
+        assertTrue(state.output.isEmpty())
+        assertTrue(source.invoked.isEmpty())
+        assertTrue(state.logs.contains("agent partial text withheld (${partial.length} chars)"))
+        assertFalse(state.logs.joinToString("\n").contains(partial))
+    }
+
+    @Test
+    fun `limit without partial text emits no withheld-text log`() {
+        val source = RecordingSource(listOf("spin"))
+        val provider = FakeProvider { _, _, _, _ ->
+            AssistantTurn(toolCalls = listOf(ToolCall("1", "spin", "{}")))
+        }
+        val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val cfg = buildJsonObject {
+            put(AgentNode.MAX_STEPS_KEY, "1")
+            put(AgentNode.ALLOWLIST_KEY, buildJsonArray { add(JsonPrimitive("spin")) })
+        }
+
+        val state = runFlow(
+            reg,
+            listOf(PlanNode("a", AgentNode.KIND, "Agent", cfg)),
+            emptyList(),
+        ).getValue("a")
+
+        assertEquals(RunStatus.ERROR, state.status)
+        assertTrue(state.output.isEmpty())
+        assertTrue(source.invoked.isEmpty())
+        assertFalse(state.logs.any { "text withheld" in it })
     }
 
     @Test

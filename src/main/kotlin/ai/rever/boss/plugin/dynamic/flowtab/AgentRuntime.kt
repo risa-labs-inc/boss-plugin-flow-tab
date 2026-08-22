@@ -25,7 +25,14 @@ data class ToolCall(val id: String, val name: String, val argsJson: String)
 /** The outcome of one [ToolCall], fed back to the model as DATA (never as instructions). */
 data class ToolOutcome(val id: String, val name: String, val content: String, val isError: Boolean)
 
-/** Token accounting a provider may report per turn; summed to enforce the budget. */
+/**
+ * Token accounting a provider may report per turn. [input] includes the transcript and
+ * completed tool rounds replayed on that request. [output] includes generated model text
+ * and tool-call arguments; those arguments and their tool results count again as input
+ * when replayed on later turns. Both dimensions are summed across all turns, so replayed
+ * content is charged on every request. Providers may omit usage, making token enforcement
+ * best-effort rather than a guaranteed bound.
+ */
 @Serializable
 data class TokenUsage(val input: Int = 0, val output: Int = 0) {
     val total: Int get() = input + output
@@ -64,14 +71,23 @@ fun interface AgentProvider {
     suspend fun step(system: String, messages: List<AgentMessage>, tools: List<ToolDescriptor>): AssistantTurn
 }
 
-/** Bounds on a single agent run. All three are enforced; whichever trips first wins. */
+/**
+ * Bounds on a single agent run. [maxTokens] is cumulative provider-reported input plus
+ * output usage across all model turns, including content replayed between requests,
+ * unlike a provider's per-request output cap. It is a soft threshold checked before each
+ * request: the request that crosses it finishes, and the run stops before another request,
+ * so actual usage can exceed [maxTokens] by one full turn. It is best-effort when usage
+ * is absent. [maxSteps] counts model requests. Step and token thresholds are evaluated
+ * between requests and before generic tools whose results could not be sent in another
+ * request; timeout also bounds an in-flight provider or tool call.
+ */
 data class AgentBudget(
     val maxSteps: Int = 8,
     val timeoutMs: Long = 120_000,
     val maxTokens: Int = Int.MAX_VALUE,
 )
 
-/** Why the loop stopped. [COMPLETED] = the model returned a final text with no tool calls. */
+/** Why the loop stopped. [COMPLETED] means final text or a valid structured result was produced. */
 enum class StopReason { COMPLETED, MAX_STEPS, TIMEOUT, TOKEN_BUDGET }
 
 /** The outcome of an agent run: its final [finalText], why it stopped, and run counters. */
@@ -81,6 +97,7 @@ data class AgentResult(
     val steps: Int,
     val toolCalls: Int,
     val usage: TokenUsage = TokenUsage(),
+    val usageReported: Boolean = false,
     val structuredOutput: JsonObject? = null,
 )
 
@@ -116,7 +133,8 @@ class AgentConfigurationError(message: String) : ExecError(message)
  *    interprets returned text as new instructions.
  *  - **Bounded:** the loop stops cleanly at [AgentBudget.maxSteps], [AgentBudget.timeoutMs],
  *    or [AgentBudget.maxTokens], reporting the [StopReason] rather than running away.
- *    [AgentNodeExecutor] escalates [StopReason.TIMEOUT] to a node error.
+ *    [AgentNodeExecutor] escalates every non-completed stop reason to a node error so
+ *    partial model prose never becomes successful downstream data.
  */
 class AgentRuntime(
     private val provider: AgentProvider,
@@ -129,6 +147,7 @@ class AgentRuntime(
         val steps: Int = 0,
         val toolCalls: Int = 0,
         val usage: TokenUsage = TokenUsage(),
+        val usageReported: Boolean = false,
     )
 
     /**
@@ -161,7 +180,14 @@ class AgentRuntime(
     ): AgentResult {
         val timeoutMs = budget.timeoutMs.coerceAtLeast(0)
         if (timeoutMs == 0L) {
-            return done("", StopReason.TIMEOUT, steps = 0, toolCalls = 0, usage = TokenUsage()).also {
+            return done(
+                text = "",
+                reason = StopReason.TIMEOUT,
+                steps = 0,
+                toolCalls = 0,
+                usage = TokenUsage(),
+                usageReported = false,
+            ).also {
                 log(stopLog(it))
             }
         }
@@ -237,6 +263,7 @@ class AgentRuntime(
                         snapshot.steps,
                         snapshot.toolCalls,
                         snapshot.usage,
+                        snapshot.usageReported,
                     )
                 }
             terminalLog(stopLog(completed))
@@ -326,12 +353,35 @@ class AgentRuntime(
         var steps = 0
         var toolCalls = 0
         var usage = TokenUsage()
+        var usageReported = false
         var lastText = ""
         var structuredFailures = 0
 
+        fun publishProgress() {
+            progress.set(
+                Progress(
+                    lastText = lastText,
+                    steps = steps,
+                    toolCalls = toolCalls,
+                    usage = usage,
+                    usageReported = usageReported,
+                ),
+            )
+        }
+
+        /** Token precedence is intentional when one turn reaches both soft thresholds. */
+        fun pendingModelLimit(): StopReason? = when {
+            usage.total >= budget.maxTokens -> StopReason.TOKEN_BUDGET
+            steps >= budget.maxSteps -> StopReason.MAX_STEPS
+            else -> null
+        }
+
+        fun stoppedAt(reason: StopReason): AgentResult =
+            done(lastText, reason, steps, toolCalls, usage, usageReported)
+
         suspend fun executeTool(call: ToolCall): ToolOutcome {
             toolCalls++
-            progress.set(Progress(lastText, steps, toolCalls, usage))
+            publishProgress()
             val prefix = "agent tool $toolCalls '${safeToolName(call.name)}'"
             if (call.name !in allowedNames) {
                 log("$prefix: blocked (not in allowlist)")
@@ -357,36 +407,46 @@ class AgentRuntime(
         }
 
         while (true) {
-            if (usage.total >= budget.maxTokens) {
-                return done(lastText, StopReason.TOKEN_BUDGET, steps, toolCalls, usage)
+            pendingModelLimit()?.let { reason ->
+                return stoppedAt(reason)
             }
-            if (steps >= budget.maxSteps) return done(lastText, StopReason.MAX_STEPS, steps, toolCalls, usage)
             if (System.currentTimeMillis() - started >= budget.timeoutMs)
-                return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
+                return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage, usageReported)
 
             // Bound the call itself, not just the gaps between steps: a hung model call
             // must be interrupted at the wall-clock budget (red-team S3).
             val stepRemaining = budget.timeoutMs - (System.currentTimeMillis() - started)
-            if (stepRemaining <= 0) return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
+            if (stepRemaining <= 0) {
+                return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage, usageReported)
+            }
             log("agent step ${steps + 1}: requesting model")
             val turn = withTimeoutOrNull(stepRemaining) { provider.step(effectiveSystem, messages.toList(), allowed) }
-                ?: return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage)
+                ?: return done(lastText, StopReason.TIMEOUT, steps, toolCalls, usage, usageReported)
             steps++
-            turn.usage?.let { usage += it }
+            turn.usage?.let {
+                usage += it
+                usageReported = true
+            }
             turn.text?.let { lastText = it }
-            progress.set(Progress(lastText, steps, toolCalls, usage))
+            publishProgress()
             messages.add(AssistantMsg(turn.text, turn.toolCalls))
 
             if (outputSchema != null) {
                 val submissions = turn.toolCalls.filter { it.name == AgentStructuredOutput.TOOL_NAME }
                 if (submissions.isNotEmpty()) {
                     val submissionIsAlone = turn.toolCalls.size == 1
+                    // A sole valid submission completes this turn even on the last permitted
+                    // request. Mixed calls are non-completing, so do not run their generic tools
+                    // when no following request could consume the outcomes.
+                    if (!submissionIsAlone) {
+                        pendingModelLimit()?.let { reason -> return stoppedAt(reason) }
+                    }
                     val outcomes = turn.toolCalls.map { call ->
                         if (call.name != AgentStructuredOutput.TOOL_NAME) {
                             executeTool(call)
                         } else if (submissionIsAlone) {
                             toolCalls++
-                            progress.set(Progress(lastText, steps, toolCalls, usage))
+                            publishProgress()
                             val parsed = AgentStructuredOutput.parseSubmission(call.argsJson, outputSchema)
                             val value = parsed.getOrNull()
                             if (value != null) {
@@ -400,6 +460,7 @@ class AgentRuntime(
                                     steps = steps,
                                     toolCalls = toolCalls,
                                     usage = usage,
+                                    usageReported = usageReported,
                                     structuredOutput = value,
                                 )
                             }
@@ -413,7 +474,7 @@ class AgentRuntime(
                             )
                         } else {
                             toolCalls++
-                            progress.set(Progress(lastText, steps, toolCalls, usage))
+                            publishProgress()
                             val prefix = "agent tool $toolCalls '${safeToolName(call.name)}'"
                             log("$prefix: blocked (structured output must be submitted exactly once, alone)")
                             ToolOutcome(
@@ -429,6 +490,7 @@ class AgentRuntime(
                         if (structuredFailures >= MAX_STRUCTURED_OUTPUT_FAILURES) {
                             throw ExecError(STRUCTURED_OUTPUT_FAILURE_MESSAGE)
                         }
+                        pendingModelLimit()?.let { reason -> return stoppedAt(reason) }
                     }
                     messages.add(ToolResultsMsg(outcomes))
                     continue
@@ -448,8 +510,12 @@ class AgentRuntime(
             }
 
             if (turn.toolCalls.isEmpty()) {
-                return done(lastText, StopReason.COMPLETED, steps, toolCalls, usage)
+                return done(lastText, StopReason.COMPLETED, steps, toolCalls, usage, usageReported)
             }
+
+            // Do not create side effects whose outcomes can never be presented to the model.
+            // These skipped calls are neither attempted nor included in the tool-call counter.
+            pendingModelLimit()?.let { reason -> return stoppedAt(reason) }
 
             val outcomes = turn.toolCalls.map { executeTool(it) }
             messages.add(ToolResultsMsg(outcomes))
@@ -463,8 +529,9 @@ class AgentRuntime(
         steps: Int,
         toolCalls: Int,
         usage: TokenUsage,
+        usageReported: Boolean,
         structuredOutput: JsonObject? = null,
-    ) = AgentResult(text, reason, steps, toolCalls, usage, structuredOutput)
+    ) = AgentResult(text, reason, steps, toolCalls, usage, usageReported, structuredOutput)
 
     private fun stopLog(result: AgentResult): String =
         "agent stopped: ${result.stopReason} " +

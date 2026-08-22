@@ -13,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
+import kotlin.test.assertContains
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
@@ -195,24 +196,43 @@ class AgentRuntimeTest {
     // ---- bounds -------------------------------------------------------------
 
     @Test
-    fun `max-steps stops a loop that never finishes`() = runBlocking {
+    fun `max steps skips pending tools when no next model request is permitted`() = runBlocking {
         val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("spin")))
         // Provider never yields a final text — always calls a tool.
         val provider = FakeProvider { _, _, _, _ -> AssistantTurn(toolCalls = listOf(call("spin"))) }
-        val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 3))
+        val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 1))
             .run(system = "s", input = "go", allowlist = setOf("spin"), log = logs::add)
 
         assertEquals(StopReason.MAX_STEPS, result.stopReason)
-        assertEquals(3, result.steps)
+        assertEquals(1, result.steps)
+        assertEquals(0, result.toolCalls)
+        assertTrue(source.invoked.isEmpty())
         assertEquals(
-            "agent stopped: MAX_STEPS (3 completed step(s), 3 attempted tool call(s))",
+            "agent stopped: MAX_STEPS (1 completed step(s), 0 attempted tool call(s))",
             logs.last(),
         )
     }
 
     @Test
-    fun `a token budget stops the loop`() = runBlocking {
+    fun `an answer on the final permitted step completes`() = runBlocking {
+        val source = RecordingSource(listOf(desc("lookup")))
+        val provider = FakeProvider.scripted(
+            AssistantTurn(toolCalls = listOf(call("lookup"))),
+            AssistantTurn(text = "final answer"),
+        )
+
+        val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 2))
+            .run(system = "s", input = "go", allowlist = setOf("lookup"))
+
+        assertEquals(StopReason.COMPLETED, result.stopReason)
+        assertEquals("final answer", result.finalText)
+        assertEquals(2, result.steps)
+        assertEquals(1, result.toolCalls)
+    }
+
+    @Test
+    fun `token budget skips pending tools after the crossing request`() = runBlocking {
         val logs = mutableListOf<String>()
         val source = RecordingSource(listOf(desc("spin")))
         val provider = FakeProvider { _, _, _, _ ->
@@ -223,10 +243,65 @@ class AgentRuntimeTest {
 
         assertEquals(StopReason.TOKEN_BUDGET, result.stopReason)
         assertTrue(result.usage.total >= 150)
+        assertEquals(0, result.toolCalls)
+        assertTrue(source.invoked.isEmpty())
         assertEquals(
-            "agent stopped: TOKEN_BUDGET (1 completed step(s), 1 attempted tool call(s))",
+            "agent stopped: TOKEN_BUDGET (1 completed step(s), 0 attempted tool call(s))",
             logs.last(),
         )
+    }
+
+    @Test
+    fun `token threshold sums reported usage and stops before the next request`() = runBlocking {
+        val providerCalls = AtomicInteger()
+        val source = RecordingSource(listOf(desc("spin")))
+        val provider = FakeProvider { step, _, _, _ ->
+            providerCalls.incrementAndGet()
+            if (step == 0) {
+                AssistantTurn(
+                    toolCalls = listOf(call("spin")),
+                    usage = TokenUsage(input = 30, output = 20),
+                )
+            } else {
+                AssistantTurn(
+                    toolCalls = listOf(call("spin")),
+                    usage = TokenUsage(input = 40, output = 30),
+                )
+            }
+        }
+
+        val result = AgentRuntime(provider, source, AgentBudget(maxSteps = 10, maxTokens = 120))
+            .run(system = "s", input = "go", allowlist = setOf("spin"))
+
+        assertEquals(StopReason.TOKEN_BUDGET, result.stopReason)
+        assertEquals(TokenUsage(input = 70, output = 50), result.usage)
+        assertEquals(120, result.usage.total)
+        assertEquals(2, result.steps)
+        assertEquals(1, result.toolCalls)
+        assertEquals(2, providerCalls.get(), "the cumulative limit must prevent a third model request")
+    }
+
+    @Test
+    fun `an answering turn that reaches or exceeds the token budget completes`() = runBlocking {
+        for (reportedTotal in listOf(100, 101)) {
+            val provider = FakeProvider.scripted(
+                AssistantTurn(
+                    text = "answer at $reportedTotal",
+                    usage = TokenUsage(input = 40, output = reportedTotal - 40),
+                ),
+            )
+
+            val result = AgentRuntime(
+                provider,
+                RecordingSource(emptyList()),
+                AgentBudget(maxTokens = 100),
+            ).run(system = "s", input = "go", allowlist = emptySet())
+
+            assertEquals(StopReason.COMPLETED, result.stopReason)
+            assertEquals("answer at $reportedTotal", result.finalText)
+            assertEquals(reportedTotal, result.usage.total)
+            assertTrue(result.usageReported)
+        }
     }
 
     @Test
@@ -244,7 +319,75 @@ class AgentRuntimeTest {
 
         assertEquals(StopReason.TOKEN_BUDGET, result.stopReason)
         assertEquals(1, result.steps)
-        assertEquals(1, result.toolCalls)
+        assertEquals(0, result.toolCalls)
+        assertTrue(source.invoked.isEmpty())
+    }
+
+    @Test
+    fun `mixed structured and generic calls are skipped at step and token limits`() = runBlocking {
+        val schema = AgentStructuredOutput.parse(
+            """{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"]}""",
+        )
+        val cases = listOf(
+            Triple(AgentBudget(maxSteps = 1), null, StopReason.MAX_STEPS),
+            Triple(
+                AgentBudget(maxSteps = 10, maxTokens = 1),
+                TokenUsage(input = 1, output = 1),
+                StopReason.TOKEN_BUDGET,
+            ),
+        )
+
+        for ((budget, usage, expectedReason) in cases) {
+            val source = RecordingSource(listOf(desc("write")))
+            val provider = FakeProvider.scripted(
+                AssistantTurn(
+                    toolCalls = listOf(
+                        call("write"),
+                        ToolCall("submit", AgentStructuredOutput.TOOL_NAME, """{"ok":true}"""),
+                    ),
+                    usage = usage,
+                ),
+            )
+
+            val result = AgentRuntime(provider, source, budget).run(
+                system = "s",
+                input = "go",
+                allowlist = setOf("write"),
+                outputSchema = schema,
+            )
+
+            assertEquals(expectedReason, result.stopReason)
+            assertEquals(0, result.toolCalls)
+            assertTrue(source.invoked.isEmpty())
+        }
+    }
+
+    @Test
+    fun `invalid sole structured submission cap wins over step and token limits`() = runBlocking {
+        val schema = AgentStructuredOutput.parse(
+            """{"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]}""",
+        )
+        val provider = FakeProvider { _, _, _, _ ->
+            AssistantTurn(
+                toolCalls = listOf(
+                    ToolCall("submit", AgentStructuredOutput.TOOL_NAME, """{"count":"wrong"}"""),
+                ),
+                usage = TokenUsage(input = 1),
+            )
+        }
+
+        val failure = runCatching {
+            AgentRuntime(
+                provider,
+                RecordingSource(emptyList()),
+                AgentBudget(maxSteps = 3, maxTokens = 3),
+            ).run(system = "s", input = "go", allowlist = emptySet(), outputSchema = schema)
+        }.exceptionOrNull()
+
+        assertTrue(failure is AgentRunFailure)
+        assertContains(failure.message.orEmpty(), "Agent did not produce valid structured output after 3 attempts")
+        assertEquals(3, failure.steps)
+        assertEquals(3, failure.toolCalls)
     }
 
     @Test
@@ -322,6 +465,7 @@ class AgentRuntimeTest {
         assertEquals(1, result.steps)
         assertEquals(1, result.toolCalls)
         assertEquals(TokenUsage(input = 4, output = 3), result.usage)
+        assertTrue(result.usageReported)
         assertTrue(elapsed < 2_000, "non-cooperative step held the caller for ${elapsed}ms")
         assertEquals(logsAtTimeout, logs, "late completion must not mutate published timeout logs")
         assertEquals(
