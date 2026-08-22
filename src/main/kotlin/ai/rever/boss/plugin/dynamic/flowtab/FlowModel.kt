@@ -61,6 +61,8 @@ enum class NodeType(
     TRIGGER("Trigger", 0, 1, 0xFF4CAF50, "Starts the workflow", RunMode.ONCE),
     OPEN_BROWSER("Open Browser", 1, 1, 0xFF26A69A, "Open a browser session", RunMode.ONCE),
     NAVIGATE("Navigate", 1, 1, 0xFF42A5F5, "Go to a URL", RunMode.ONCE),
+    HUMAN_GATE("Human Approval", 1, 1, 0xFF00897B, "Wait for a person to complete an approval", RunMode.ONCE),
+    /** Legacy sign-in-specific name retained so saved workflows remain compatible. */
     AWAIT_LOGIN("Await Login", 1, 1, 0xFF00897B, "Wait for a human to sign in", RunMode.ONCE),
     CLICK("Click", 1, 1, 0xFF5C6BC0, "Click an element", RunMode.ONCE),
     TYPE("Type", 1, 1, 0xFFAB47BC, "Type into a field", RunMode.ONCE),
@@ -90,7 +92,7 @@ enum class NodeType(
      * never touch the one page at once; dependency edges preserve their order.
      */
     fun usesSession(): Boolean = when (this) {
-        OPEN_BROWSER, NAVIGATE, AWAIT_LOGIN, CLICK, TYPE, EXTRACT, INJECT -> true
+        OPEN_BROWSER, NAVIGATE, HUMAN_GATE, AWAIT_LOGIN, CLICK, TYPE, EXTRACT, INJECT -> true
         else -> false
     }
 
@@ -100,7 +102,7 @@ enum class NodeType(
      * [nodeHeight] stays a pure function of type and ports never drift.
      */
     fun hasMetaRow(): Boolean = when (this) {
-        OPEN_BROWSER, HTTP, AWAIT_LOGIN, CLICK, TYPE, EXTRACT, INJECT -> true
+        OPEN_BROWSER, HTTP, HUMAN_GATE, AWAIT_LOGIN, CLICK, TYPE, EXTRACT, INJECT -> true
         else -> false
     }
 
@@ -112,6 +114,17 @@ enum class NodeType(
         )
         NAVIGATE -> listOf(
             ConfigField("url", "URL", FieldType.TEXT, placeholder = "https://example.com")
+        )
+        HUMAN_GATE -> listOf(
+            ConfigField("selectorType", "Completion marker type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
+            ConfigField("selector", "Completion marker", FieldType.TEXT, placeholder = "[data-approved], .approval-complete"),
+            ConfigField("waitMs", "Wait timeout (ms)", FieldType.NUMBER, default = HUMAN_GATE_WAIT_MS.toString()),
+            ConfigField(
+                "message",
+                "Prompt",
+                FieldType.TEXT,
+                default = "Complete the required approval in the browser to continue this flow.",
+            ),
         )
         AWAIT_LOGIN -> listOf(
             ConfigField("selectorType", "Signed-in marker type", FieldType.SELECT, listOf("css", "xpath", "text"), default = "css"),
