@@ -72,6 +72,7 @@ fun McpServerConfigPanel(
     var kind by remember { mutableStateOf(McpTransportKind.STDIO) }
     var command by remember { mutableStateOf("") }
     var args by remember { mutableStateOf("") }
+    var workingDirectory by remember { mutableStateOf("") }
     var url by remember { mutableStateOf("") }
     var secretRef by remember { mutableStateOf("") }
 
@@ -210,11 +211,20 @@ fun McpServerConfigPanel(
         if (kind == McpTransportKind.STDIO) {
             Field("Command (npx, uvx, node…)", command) { command = it }
             Field("Args (space-separated)", args) { args = it }
+            Field("Working directory (optional)", workingDirectory) { workingDirectory = it }
         } else {
             Field("URL", url) { url = it }
             Field("Secret name (optional, HTTP/SSE only)", secretRef) { secretRef = it }
         }
-        val draft = McpServerDraft(name, kind, command, args, url, secretRef)
+        val draft = McpServerDraft(
+            name = name,
+            kind = kind,
+            command = command,
+            args = args,
+            url = url,
+            secretRef = secretRef,
+            workingDirectory = workingDirectory,
+        )
         val newConfig = draft.toConfigOrNull()
         val invalidServerName = name.isNotBlank() && normalizedExternalMcpServerName(name) == null
         val duplicateName = newConfig != null && servers.any { it.name == newConfig.name }
@@ -230,7 +240,7 @@ fun McpServerConfigPanel(
                 if (!added) {
                     operationError = "A server named '${cfg.name}' already exists."
                 } else {
-                    name = ""; command = ""; args = ""; url = ""; secretRef = ""
+                    name = ""; command = ""; args = ""; workingDirectory = ""; url = ""; secretRef = ""
                 }
             }
         }
@@ -352,6 +362,7 @@ internal data class McpServerDraft(
     val args: String,
     val url: String,
     val secretRef: String,
+    val workingDirectory: String = "",
 ) {
     fun toConfigOrNull(): McpServerConfig? {
         val normalizedName = normalizedExternalMcpServerName(name) ?: return null
@@ -366,6 +377,7 @@ internal data class McpServerDraft(
             } else {
                 emptyList()
             },
+            workingDirectory = if (kind == McpTransportKind.STDIO) workingDirectory.trim() else "",
             url = if (kind == McpTransportKind.HTTP_SSE) url.trim() else "",
             enabled = false,
             // Stdio child-process environment injection is not implemented; only the

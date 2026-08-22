@@ -21,12 +21,14 @@ class McpServerConfigUITest {
             args = "  -y   @modelcontextprotocol/server-slack  ",
             url = "",
             secretRef = "  SLACK_TOKEN  ",
+            workingDirectory = "  /projects/slack-mcp  ",
         ).toConfigOrNull()
 
         assertNotNull(config)
         assertEquals("slack", config.name)
         assertEquals("npx", config.command)
         assertEquals(listOf("-y", "@modelcontextprotocol/server-slack"), config.args)
+        assertEquals("/projects/slack-mcp", config.workingDirectory)
         assertNull(config.secretRef)
         assertEquals(false, config.enabled)
     }
@@ -45,12 +47,14 @@ class McpServerConfigUITest {
             args = "ignored args",
             url = "  https://mcp.example.test/sse  ",
             secretRef = "   ",
+            workingDirectory = "/must-not-be-persisted-for-sse",
         ).toConfigOrNull()
 
         assertNotNull(config)
         assertEquals("https://mcp.example.test/sse", config.url)
         assertEquals("", config.command)
         assertTrue(config.args.isEmpty())
+        assertEquals("", config.workingDirectory)
         assertNull(config.secretRef)
     }
 

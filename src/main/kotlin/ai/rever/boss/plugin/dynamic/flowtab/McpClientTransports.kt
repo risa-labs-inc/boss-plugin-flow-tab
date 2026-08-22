@@ -22,6 +22,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
+import java.io.File
 
 /**
  * The real, network/process-touching MCP client transports (red-team F9). These are the
@@ -68,7 +69,7 @@ private class StdioMcpTransport(private val config: McpServerConfig) : SdkMcpTra
     private var process: Process? = null
 
     override suspend fun connect() {
-        val proc = ProcessBuilder(LoginShell.launchCommand(config.command, config.args))
+        val proc = stdioProcessBuilder(config)
             .redirectErrorStream(false)
             .start()
         process = proc
@@ -89,6 +90,12 @@ private class StdioMcpTransport(private val config: McpServerConfig) : SdkMcpTra
         process = null
     }
 }
+
+/** Build a stdio-server process without changing legacy blank-directory behavior. */
+internal fun stdioProcessBuilder(config: McpServerConfig): ProcessBuilder =
+    ProcessBuilder(LoginShell.launchCommand(config.command, config.args)).apply {
+        config.workingDirectory.trim().takeIf { it.isNotEmpty() }?.let { directory(File(it)) }
+    }
 
 /** HTTP/SSE transport: connects to a remote endpoint, presenting the resolved [secret]
  *  (never persisted) as an auth header. */
