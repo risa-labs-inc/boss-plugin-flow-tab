@@ -693,6 +693,10 @@ class FlowController(
                             ownedRunIds.remove(runId)
                             FlowPersistenceCoordinator.forgetRun(runId)
                         }
+                        store.getAllKeys().orEmpty()
+                            .map { it.removePrefix(JSON_STORAGE_PREFIX) }
+                            .filter { it.startsWith(revisionPrefix(tabId)) }
+                            .forEach { key -> store.removeJsonValue(key) }
                         deleted = true
                     }
                 }
@@ -1025,7 +1029,7 @@ class FlowController(
     private suspend fun evictOldRuns(tabId: String) {
         // One storage enumeration/decode pass per terminal persist. listRuns() would
         // enumerate and decode the same records again before deletion.
-        val stored = storedRuns().filter { it.second.tabId == tabId }
+        val (stored, revisionKeys) = storedRunsAndRevisionKeys(tabId)
         val candidates = LinkedHashMap<String, RunJob>()
         stored.forEach { (runId, job) -> candidates[runId] = job }
         jobs.values.filter { it.tabId == tabId }.forEach { candidates[it.runId] = it }
@@ -1052,6 +1056,31 @@ class FlowController(
                 ownedRunIds.remove(old.runId)
                 FlowPersistenceCoordinator.forgetRun(old.runId)
             }
+        // Revisions are independent records, but only retained runs need to keep
+        // them alive. This bounds storage while preserving every version reachable
+        // from Run history.
+        val referenced = buildSet {
+            stored.filter { it.first in retained }.forEach { add(it.second.revisionId) }
+            jobs.values.filter { it.tabId == tabId && (it.runId in retained || !it.isTerminal) }
+                .forEach { add(it.revisionId) }
+        }
+        revisionKeys
+            .filter { key -> key.removePrefix(revisionPrefix(tabId)) !in referenced }
+            .forEach { key -> storage?.removeJsonValue(key) }
+    }
+
+    /** One key scan feeds run eviction and the corresponding revision cleanup. */
+    private suspend fun storedRunsAndRevisionKeys(tabId: String): Pair<List<Pair<String, RunJob>>, List<String>> {
+        val keys = storage?.getAllKeys().orEmpty()
+            .asSequence()
+            .map { it.removePrefix(JSON_STORAGE_PREFIX) }
+            .toList()
+        val runs = buildList {
+            for (runId in keys.asSequence().filter { it.startsWith(RUN_PREFIX) }.map { it.removePrefix(RUN_PREFIX) }) {
+                loadStoredJob(runId)?.takeIf { it.tabId == tabId }?.let { add(runId to it) }
+            }
+        }
+        return runs to keys.filter { it.startsWith(revisionPrefix(tabId)) }
     }
 
     private suspend fun storedRuns(): List<Pair<String, RunJob>> {

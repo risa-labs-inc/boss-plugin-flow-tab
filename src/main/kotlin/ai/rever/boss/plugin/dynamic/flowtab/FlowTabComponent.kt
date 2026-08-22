@@ -191,6 +191,9 @@ class FlowTabComponent(
     // Component-scoped so composition recreation cannot drop the persistence guard
     // while the canvas still renders an immutable historical snapshot.
     private var viewingHistoricalRevision by mutableStateOf<WorkflowRevision?>(null)
+    // Graph updates arriving while an immutable revision is displayed are deliberately
+    // not painted onto it. Remember the revision so autosave can resume on return.
+    private var skippedHistoricalGraphRevision = 0L
     private val liveCanvas = object : LiveFlowCanvas {
         override val isInitialized: Boolean get() = initialized && viewingHistoricalRevision == null
         override val appliedGraphRevision: Long get() = this@FlowTabComponent.appliedGraphRevision
@@ -300,6 +303,7 @@ class FlowTabComponent(
         LaunchedEffect(config.id) {
             FlowPersistenceCoordinator.names.collect { renamed ->
                 renamed[config.id]?.let { name ->
+                    if (viewingHistoricalRevision != null) return@let
                     val metadata = (state.metadata ?: FlowMeta()).copy(name = name)
                     if (state.metadata != metadata) state.metadata = metadata
                     // Force one autosave even when an in-tab optimistic update already
@@ -329,7 +333,7 @@ class FlowTabComponent(
                     if (suppressed && update.job.isTerminal) {
                         suppressedRunId.compareAndSet(update.job.runId, null)
                     }
-                    if (currentCanvasHistoryRunId.get() == null && !suppressed &&
+                    if (viewingHistoricalRevision == null && currentCanvasHistoryRunId.get() == null && !suppressed &&
                         update.revision > displayedRunRevision &&
                         update.job.runId != lastCanvasHistoryRunId.get()
                     ) {
@@ -361,6 +365,10 @@ class FlowTabComponent(
             while (!initialized) delay(20)
             FlowPersistenceCoordinator.graphUpdates.collect { updates ->
                 updates[config.id]?.let { update ->
+                    if (viewingHistoricalRevision != null) {
+                        skippedHistoricalGraphRevision = maxOf(skippedHistoricalGraphRevision, update.revision)
+                        return@let
+                    }
                     val applied = state.applyExternalGraphUpdate(update, appliedGraphRevision)
                     if (applied != appliedGraphRevision) {
                         appliedGraphRevision = applied
@@ -449,6 +457,7 @@ class FlowTabComponent(
             val job = runJobs.launch(Dispatchers.Default) {
                 val admitted = AtomicBoolean(false)
                 var runFailure: String? = null
+                var persistedRevisionId: String? = null
                 val historyStates = ConcurrentHashMap<String, NodeRun>()
                 try {
                     // Do not erase the preceding run's results or close its browser tab
@@ -474,7 +483,16 @@ class FlowTabComponent(
                         Snapshot.sendApplyNotifications()
                     }
                     if (!admissionAccepted) return@launch
-                    controller.persistCanvasRevision(config.id, workflowRevision.snapshot, historyStartedAtMs)
+                    // Revision persistence is audit metadata, not an execution
+                    // dependency. A transient storage failure must not fail a flow
+                    // whose plan was already frozen in memory.
+                    persistedRevisionId = runCatching {
+                        withContext(Dispatchers.IO) {
+                            controller.persistCanvasRevision(config.id, workflowRevision.snapshot, historyStartedAtMs)
+                        }
+                    }.onFailure { failure ->
+                        println("[flow-tab] could not persist canvas revision: ${failure.message}")
+                    }.getOrNull()?.id
                     controller.publishCanvasRun(
                         RunJob(
                             runId = historyRunId,
@@ -482,7 +500,7 @@ class FlowTabComponent(
                             state = RunJobState.RUNNING,
                             startedAtMs = historyStartedAtMs,
                             nodeCount = plan.size,
-                            revisionId = workflowRevision.id,
+                            revisionId = persistedRevisionId,
                         )
                     )
                     // Catches Stop arriving while withContext resumes from Main back
@@ -537,7 +555,7 @@ class FlowTabComponent(
                                 startedAtMs = historyStartedAtMs,
                                 nodeCount = plan.size,
                                 nodes = historyStates.toRunSnapshot().states,
-                                revisionId = workflowRevision.id,
+                                revisionId = persistedRevisionId,
                             ),
                             persist = false,
                         )
@@ -566,7 +584,7 @@ class FlowTabComponent(
                                 nodeCount = plan.size,
                                 error = terminalError,
                                 nodes = historyStates.toRunSnapshot().states,
-                                revisionId = workflowRevision.id,
+                                revisionId = persistedRevisionId,
                             )
                         )
                         // Persist the run results (capped) so they survive reopening.
@@ -797,7 +815,7 @@ class FlowTabComponent(
         var versionHistoryLoading by remember { mutableStateOf(false) }
         var showRename by remember { mutableStateOf(false) }
         var renameInProgress by remember { mutableStateOf(false) }
-        val renameEnabled = initialized && !renameInProgress
+        val renameEnabled = initialized && !renameInProgress && viewingHistoricalRevision == null
         val currentFlowName = state.metadata?.name?.ifBlank { null }
             ?: config.title.ifBlank { "Flow" }
 
@@ -910,6 +928,11 @@ class FlowTabComponent(
                                 if (restored) {
                                     state.clearRun()
                                     viewingHistoricalRevision = null
+                                    FlowPersistenceCoordinator.latestGraphUpdate(config.id)?.let { update ->
+                                        appliedGraphRevision = maxOf(appliedGraphRevision, update.revision, skippedHistoricalGraphRevision)
+                                    }
+                                    skippedHistoricalGraphRevision = 0L
+                                    persistenceSyncRevision++
                                 } else {
                                     state.runError = "Could not return to the current workflow"
                                 }
@@ -973,7 +996,7 @@ class FlowTabComponent(
                         .focusable()
                         .onPreviewKeyEvent { event ->
                             // Don't steal Backspace/Delete while the picker's search box is open.
-                            if (event.type == KeyEventType.KeyDown &&
+                            if (viewingHistoricalRevision == null && event.type == KeyEventType.KeyDown &&
                                 state.pickerRequest == null &&
                                 (event.key == Key.Delete || event.key == Key.Backspace)
                             ) {
@@ -989,6 +1012,17 @@ class FlowTabComponent(
                         onViewportSize = { viewportSize = it },
                         onManualViewportChange = { followExecution = false },
                     )
+                    // Historical snapshots are for diagnosis. Let users pan/zoom only
+                    // after returning to current rather than accepting edits that are
+                    // intentionally discarded on exit.
+                    if (viewingHistoricalRevision != null) {
+                        Box(
+                            Modifier
+                                .matchParentSize()
+                                .background(FlowTheme.Surface.copy(alpha = 0.03f))
+                                .clickable { state.notice = "Historical workflow view is read-only" },
+                        )
+                    }
                 }
 
                 if (selectedNode != null) {
@@ -1050,6 +1084,11 @@ class FlowTabComponent(
                             enabled = renameText.isNotBlank(),
                             onClick = {
                                 val newName = renameText.trim()
+                                if (viewingHistoricalRevision != null) {
+                                    state.notice = "Return to the current workflow before renaming"
+                                    showRename = false
+                                    return@TextButton
+                                }
                                 val previousMetadata = state.metadata
                                 val renamedMetadata = (previousMetadata ?: FlowMeta()).copy(name = newName)
                                 val renamedSnapshot = state.toSnapshot().copy(metadata = renamedMetadata)
@@ -1117,8 +1156,9 @@ class FlowTabComponent(
                                                                 state.notice = "This legacy run has no saved workflow revision"
                                                             } else if (state.isRunning) {
                                                                 state.notice = "Stop the current run before viewing run history"
+                                                            } else if (!state.load(revision.snapshot)) {
+                                                                state.notice = "This workflow revision is not supported by this version of Flow"
                                                             } else {
-                                                                state.load(revision.snapshot)
                                                                 state.applyRunJob(job)
                                                                 viewingHistoricalRevision = revision
                                                                 state.notice = "Viewing run ${summary.runId} · ${revision.id}"
@@ -1172,8 +1212,9 @@ class FlowTabComponent(
                                         Modifier.fillMaxWidth().clickable {
                                             if (state.isRunning) {
                                                 state.notice = "Stop the current run before viewing a workflow version"
+                                            } else if (!state.load(revision.snapshot)) {
+                                                state.notice = "This workflow revision is not supported by this version of Flow"
                                             } else {
-                                                state.load(revision.snapshot)
                                                 state.clearRun()
                                                 viewingHistoricalRevision = revision
                                                 state.notice = "Viewing ${revision.id}; return to current to edit"

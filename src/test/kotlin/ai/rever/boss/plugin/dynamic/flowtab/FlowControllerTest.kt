@@ -1336,6 +1336,12 @@ class FlowControllerTest {
                 RunJob("run-delete-me", tabId, RunJobState.SUCCEEDED, startedAtMs = 1L),
             ),
         )
+        val revision = GraphSnapshot(nodes = listOf(NodeModel("n1", "TRIGGER", "Start", 1f, 2f)))
+            .toWorkflowRevision(1L, "test")
+        storage.putJson(
+            "${FlowController.REVISION_PREFIX}$tabId:${revision.id}",
+            kotlinx.serialization.json.Json.encodeToString(WorkflowRevision.serializer(), revision),
+        )
         FlowPersistenceCoordinator.publishRename(tabId, "Disposable renamed")
 
         assertTrue(fc.deleteFlow(tabId))
@@ -1343,6 +1349,7 @@ class FlowControllerTest {
         assertNull(storage.getJson("${FlowController.GRAPH_PREFIX}$tabId"))
         assertNull(storage.getJson("$RUN_STATE_PREFIX$tabId"))
         assertNull(storage.getJson("${FlowController.RUN_PREFIX}run-delete-me"))
+        assertNull(storage.getJson("${FlowController.REVISION_PREFIX}$tabId:${revision.id}"))
         assertFalse(tabId in fc.listFlows())
         assertNull(FlowPersistenceCoordinator.latestName(tabId))
         assertNull(FlowPersistenceCoordinator.latestGraphUpdate(tabId))

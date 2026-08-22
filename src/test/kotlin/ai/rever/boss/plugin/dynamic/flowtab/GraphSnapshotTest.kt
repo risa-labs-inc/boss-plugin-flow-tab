@@ -5,7 +5,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
-import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 
 /**
@@ -95,7 +95,20 @@ class GraphSnapshotTest {
 
         assertEquals(base.executionFingerprint(), moved.executionFingerprint())
         assertEquals(base.toWorkflowRevision(10L, "canvas").id, moved.toWorkflowRevision(20L, "canvas").id)
-        assertFalse(base.executionFingerprint() == reconfigured.executionFingerprint())
+        assertNotEquals(base.executionFingerprint(), reconfigured.executionFingerprint())
+    }
+
+    @Test
+    fun `workflow fingerprint canonicalizes config object key order`() {
+        val first = GraphSnapshot(nodes = listOf(NodeModel(
+            "n1", "HTTP", "Fetch", 0f, 0f,
+            JsonObject(mapOf("url" to JsonPrimitive("https://a"), "method" to JsonPrimitive("GET"))),
+        )))
+        val reordered = first.copy(nodes = first.nodes.map { node ->
+            node.copy(config = JsonObject(mapOf("method" to JsonPrimitive("GET"), "url" to JsonPrimitive("https://a"))))
+        })
+
+        assertEquals(first.executionFingerprint(), reordered.executionFingerprint())
     }
 
     @Test

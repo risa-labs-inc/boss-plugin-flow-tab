@@ -2,7 +2,11 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import androidx.compose.ui.geometry.Offset
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.security.MessageDigest
 import kotlin.math.max
 
@@ -347,18 +351,32 @@ data class WorkflowRevision(
  * do not participate, so moving cards or changing a label does not mint a version. */
 fun GraphSnapshot.executionFingerprint(): String {
     val executable = buildString {
+        // Length-prefix each value instead of relying on punctuation separators: titles
+        // and config values are user input and may themselves contain `|` or newlines.
+        fun field(value: String) = append(value.length).append(':').append(value)
+        field("schemaVersion"); field(schemaVersion.toString()); append('\n')
         nodes.sortedBy { it.id }.forEach { node ->
-            append(node.id).append('|').append(node.type).append('|').append(node.title).append('|').append(node.config)
-            append('\n')
+            field("node"); field(node.id); field(node.type); field(node.title); field(node.config.canonicalJson()); append('\n')
         }
         edges.sortedBy { it.id }.forEach { edge ->
-            append(edge.id).append('|').append(edge.fromNode).append('|').append(edge.fromPort)
-                .append('|').append(edge.toNode).append('|').append(edge.toPort).append('\n')
+            field("edge"); field(edge.id); field(edge.fromNode); field(edge.fromPort.toString())
+            field(edge.toNode); field(edge.toPort.toString()); append('\n')
         }
-        metadata?.inputs?.forEach { append("input|").append(it).append('\n') }
+        metadata?.inputs?.forEach { field("input"); field(it); append('\n') }
     }
-    val hash = MessageDigest.getInstance("SHA-256").digest(executable.toByteArray())
+    val hash = MessageDigest.getInstance("SHA-256").digest(executable.toByteArray(Charsets.UTF_8))
     return hash.joinToString("") { "%02x".format(it) }
+}
+
+/** JSON's normal string representation keeps insertion order. Revisions must not. */
+private fun JsonElement.canonicalJson(): String = when (this) {
+    is JsonObject -> entries.sortedBy { it.key }.joinToString(prefix = "{", postfix = "}", separator = ",") {
+        JsonPrimitive(it.key).toString() + ":" + it.value.canonicalJson()
+    }
+    is JsonArray -> joinToString(prefix = "[", postfix = "]", separator = ",") { it.canonicalJson() }
+    JsonNull -> "null"
+    is JsonPrimitive -> toString()
+    else -> toString()
 }
 
 fun GraphSnapshot.toWorkflowRevision(capturedAtMs: Long, source: String): WorkflowRevision {
