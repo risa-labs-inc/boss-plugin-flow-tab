@@ -39,6 +39,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -96,6 +97,11 @@ class FlowLauncherComponent(
         var operationError by remember { mutableStateOf<String?>(null) }
         var creatingFlow by remember { mutableStateOf(false) }
         var refreshGeneration by remember { mutableIntStateOf(0) }
+        // A StateFlow replays its latest value to a newly opened launcher. The initial
+        // discovery below already covers that state, so only reload for subsequent writes.
+        var observedFlowListRevision by remember {
+            mutableLongStateOf(FlowPersistenceCoordinator.flowListRevisions.value)
+        }
         var openingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
         var deletingFlowIds by remember { mutableStateOf<Set<String>>(emptySet()) }
         var pendingDelete by remember { mutableStateOf<FlowSummary?>(null) }
@@ -124,6 +130,18 @@ class FlowLauncherComponent(
                 loadError = failure.message ?: failure.toString()
             } finally {
                 if (refreshGeneration == requestGeneration) loading = false
+            }
+        }
+
+        // MCP/controller and other canvas instances write through the persistence
+        // coordinator. Reload the complete discovery list so new rows, deletions, node
+        // counts, and schedule changes all appear without a manual Refresh.
+        LaunchedEffect(controller) {
+            FlowPersistenceCoordinator.flowListRevisions.collect { revision ->
+                if (revision != observedFlowListRevision) {
+                    observedFlowListRevision = revision
+                    refreshGeneration++
+                }
             }
         }
 
@@ -189,7 +207,6 @@ class FlowLauncherComponent(
                             }
                         }
                         splitView?.openTab(FlowTabData(id = tabId, title = title))
-                        refreshGeneration++
                     } catch (failure: Exception) {
                         operationError = failure.message ?: failure.toString()
                     } finally {
@@ -313,7 +330,6 @@ class FlowLauncherComponent(
                                     }
                                     if (!deleted) error("Flow '${flow.tabId}' no longer exists")
                                     savedFlows = savedFlows.filterNot { it.tabId == flow.tabId }
-                                    refreshGeneration++
                                 } catch (failure: Exception) {
                                     operationError = failure.message ?: failure.toString()
                                 } finally {

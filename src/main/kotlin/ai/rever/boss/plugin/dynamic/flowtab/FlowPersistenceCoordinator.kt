@@ -42,6 +42,7 @@ internal object FlowPersistenceCoordinator {
     private val revisionCounter = AtomicLong()
     private val runStartedCounter = AtomicLong()
     private val mutableNames = MutableStateFlow<Map<String, String>>(emptyMap())
+    private val mutableFlowListRevision = MutableStateFlow(0L)
     private val mutableGraphUpdates = MutableStateFlow<Map<String, ExternalGraphUpdate>>(emptyMap())
     private val mutableRunUpdates = MutableStateFlow<Map<String, ExternalRunUpdate>>(emptyMap())
     private val runUpdatesById = ConcurrentHashMap<String, ExternalRunUpdate>()
@@ -49,6 +50,13 @@ internal object FlowPersistenceCoordinator {
 
     /** Latest successful rename per tab, used by toolbar/sidebar title synchronization. */
     val names = mutableNames.asStateFlow()
+
+    /**
+     * Monotonic notification that saved-flow discovery metadata changed. Unlike [names],
+     * this deliberately carries no per-flow payload: create/delete and node/schedule edits
+     * can all change what the launcher needs to display, so it should reload its summary.
+     */
+    val flowListRevisions = mutableFlowListRevision.asStateFlow()
 
     /** Latest controller-authored snapshot per tab, replayed to an open or newly opened canvas. */
     val graphUpdates = mutableGraphUpdates.asStateFlow()
@@ -110,6 +118,7 @@ internal object FlowPersistenceCoordinator {
             snapshot
         }
         persist(current)
+        publishFlowListChange()
 
         if (name != null && current.metadata?.name == name) forgetName(tabId)
         if (pendingUpdate != null && appliedGraphRevision >= pendingUpdate.revision) {
@@ -119,6 +128,11 @@ internal object FlowPersistenceCoordinator {
 
     fun publishRename(tabId: String, name: String) {
         mutableNames.update { current -> current + (tabId to name) }
+    }
+
+    /** Publish only after a graph write/delete has completed durably. */
+    fun publishFlowListChange() {
+        mutableFlowListRevision.update { revision -> revision + 1L }
     }
 
     fun latestName(tabId: String): String? = mutableNames.value[tabId]
