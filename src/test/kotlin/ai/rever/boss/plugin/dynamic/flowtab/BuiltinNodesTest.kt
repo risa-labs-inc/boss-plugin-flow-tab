@@ -74,4 +74,17 @@ class BuiltinNodesTest {
         )
         assertEquals("Completion marker", approval.configFields.single { it.key == "selector" }.label)
     }
+
+    @Test
+    fun `frame aware browser actions expose a same origin frame selector`() {
+        listOf(NodeType.HUMAN_GATE, NodeType.AWAIT_LOGIN, NodeType.CLICK, NodeType.TYPE, NodeType.EXTRACT).forEach { type ->
+            val frame = reg[type.name]!!.configFields.single { it.key == "frame" }
+            assertEquals(FieldType.TEXT, frame.type, type.name)
+            assertEquals("Frame selector (optional)", frame.label, type.name)
+            assertEquals("", frame.default, type.name)
+            requireNotNull(frame.note).let { note ->
+                kotlin.test.assertTrue(note.contains("Same-origin"), type.name)
+            }
+        }
+    }
 }
