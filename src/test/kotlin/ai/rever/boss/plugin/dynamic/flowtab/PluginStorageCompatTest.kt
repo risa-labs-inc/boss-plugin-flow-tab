@@ -11,6 +11,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class PluginStorageCompatTest {
 
@@ -100,6 +101,31 @@ class PluginStorageCompatTest {
     @Test
     fun `clearPersistedRunState accepts a missing storage provider`() = runBlocking {
         clearPersistedRunState(null, "flow-1")
+    }
+
+    @Test
+    fun `reset run view clears last snapshot and retains a fresh-view cutoff`() = runBlocking {
+        val storage = DesktopStorage()
+        storage.putJson("runstate:flow-1", "{\"states\":{}}")
+
+        resetPersistedRunView(storage, "flow-1", freshAfterMs = 1_000L)
+
+        assertNull(storage.getJson("runstate:flow-1"))
+        val preference = loadRunViewPreference(storage, "flow-1")
+        assertEquals(RunViewPreference(1_000L), preference)
+        assertTrue(preference!!.allowsAutoDisplay(1_001L))
+        assertTrue(preference.allowsAutoDisplay(1_000L))
+        assertTrue(!preference.allowsAutoDisplay(999L))
+    }
+
+    @Test
+    fun `clearing a workflow also clears its fresh-view preference`() = runBlocking {
+        val storage = DesktopStorage()
+        resetPersistedRunView(storage, "flow-1", freshAfterMs = 1_000L)
+
+        clearPersistedRunViewPreference(storage, "flow-1")
+
+        assertNull(loadRunViewPreference(storage, "flow-1"))
     }
 
     @Test

@@ -194,6 +194,8 @@ class FlowTabComponent(
     // Graph updates arriving while an immutable revision is displayed are deliberately
     // not painted onto it. Remember the revision so autosave can resume on return.
     private var skippedHistoricalGraphRevision = 0L
+    /** A user-requested fresh view. This only controls automatic result restoration. */
+    private var runViewPreference by mutableStateOf<RunViewPreference?>(null)
     private val liveCanvas = object : LiveFlowCanvas {
         override val isInitialized: Boolean get() = initialized && viewingHistoricalRevision == null
         override val appliedGraphRevision: Long get() = this@FlowTabComponent.appliedGraphRevision
@@ -272,10 +274,17 @@ class FlowTabComponent(
                     state.addNode(NodeType.TRIGGER.name, Offset(320f, 200f))
                     state.selection = null
                 }
-                // Restore the last run's per-node status/output, if any.
-                runCatching { storage?.getJson("$RUN_STATE_PREFIX${config.id}") }.getOrNull()?.let { rs ->
-                    runCatching {
-                        state.runStates.putAll(json.decodeFromString(RunSnapshot.serializer(), rs).toRuns())
+                runViewPreference = runCatching {
+                    loadRunViewPreference(storage, config.id)
+                }.getOrNull()
+                // Restore the legacy last-run snapshot only when the user has not
+                // explicitly asked for a fresh view. The durable run history below
+                // remains available either way through the History control.
+                if (runViewPreference == null) {
+                    runCatching { storage?.getJson("$RUN_STATE_PREFIX${config.id}") }.getOrNull()?.let { rs ->
+                        runCatching {
+                            state.runStates.putAll(json.decodeFromString(RunSnapshot.serializer(), rs).toRuns())
+                        }
                     }
                 }
                 // Prefer the newest durable controller/canvas run over the legacy
@@ -283,7 +292,8 @@ class FlowTabComponent(
                 runCatching {
                     withContext(Dispatchers.IO) {
                         controller.listRuns(config.id)
-                            .firstOrNull { it.state != RunJobState.RUNNING }
+                            .firstOrNull { it.state != RunJobState.RUNNING &&
+                                (runViewPreference?.allowsAutoDisplay(it.startedAtMs) != false) }
                             ?.let { controller.runSnapshot(it.runId) }
                     }
                 }.getOrNull()?.let(state::applyRunJob)
@@ -334,6 +344,7 @@ class FlowTabComponent(
                         suppressedRunId.compareAndSet(update.job.runId, null)
                     }
                     if (viewingHistoricalRevision == null && currentCanvasHistoryRunId.get() == null && !suppressed &&
+                        (runViewPreference?.allowsAutoDisplay(update.job.startedAtMs) != false) &&
                         update.revision > displayedRunRevision &&
                         update.job.runId != lastCanvasHistoryRunId.get()
                     ) {
@@ -694,6 +705,7 @@ class FlowTabComponent(
                 try {
                     val result = runStatePersistence.clearAfterInvalidation(invalidation) {
                         clearPersistedRunState(storage, config.id)
+                        clearPersistedRunViewPreference(storage, config.id)
                     }
                     // Exhaustiveness tripwire: a future result must choose explicit UI behavior.
                     when (result) {
@@ -714,6 +726,43 @@ class FlowTabComponent(
                             if (runStatePersistence.isCurrent(invalidation.generation)) {
                                 state.notice =
                                     "Flow cleared, but saved run state could not be removed: ${failure.message}"
+                                Snapshot.sendApplyNotifications()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fun resetRunState() {
+            // Resetting a result is intentionally distinct from clearing a flow: its
+            // nodes, wires, configuration, layout, and durable run/revision records
+            // are left untouched. It is available only while idle (also enforced by
+            // the toolbar's disabled state).
+            if (state.isRunning) return
+            val resetAtMs = System.currentTimeMillis()
+            val invalidation = runStatePersistence.invalidateRun()
+            runViewPreference = RunViewPreference(resetAtMs)
+            displayedRunId = null
+            state.clearRun()
+            state.notice = "Run state reset. This workflow is ready for a fresh run."
+            coroutineScope.launch(Dispatchers.IO) {
+                try {
+                    val result = runStatePersistence.clearAfterInvalidation(invalidation) {
+                        resetPersistedRunView(storage, config.id, resetAtMs)
+                    }
+                    // A newly-started run won the persistence race; its own result is
+                    // newer than this reset and should remain the automatic view.
+                    if (result == RunStateClearResult.PRESERVED_NEWER) {
+                        runViewPreference = null
+                    }
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (failure: Exception) {
+                    if (runStatePersistence.isCurrent(invalidation.generation)) {
+                        withContext(Dispatchers.Main) {
+                            if (runStatePersistence.isCurrent(invalidation.generation)) {
+                                state.notice = "Run state reset, but it could not be saved: ${failure.message}"
                                 Snapshot.sendApplyNotifications()
                             }
                         }
@@ -886,6 +935,8 @@ class FlowTabComponent(
                 },
                 onFit = { state.fitToContent(viewportSize) },
                 onReset = { state.resetView() },
+                resetRunEnabled = !state.isRunning && (state.runStates.isNotEmpty() || state.runError != null),
+                onResetRunState = ::resetRunState,
                 onClear = { confirmClear = true },
                 onExport = { exportFlow() },
                 onImport = { importFlow() }
@@ -1321,6 +1372,8 @@ private fun Toolbar(
     onUndoTidy: () -> Unit,
     onFit: () -> Unit,
     onReset: () -> Unit,
+    resetRunEnabled: Boolean,
+    onResetRunState: () -> Unit,
     onClear: () -> Unit,
     onExport: () -> Unit,
     onImport: () -> Unit
@@ -1502,6 +1555,12 @@ private fun Toolbar(
         ToolbarButton(Icons.AutoMirrored.Filled.Undo, "Undo tidy layout", onUndoTidy, enabled = undoTidyEnabled)
         ToolbarButton(Icons.Filled.FitScreen, "Fit to content", onFit)
         ToolbarButton(Icons.Filled.RestartAlt, "Reset view", onReset)
+        ToolbarButton(
+            Icons.Filled.RestartAlt,
+            "Reset run state (keep workflow and history)",
+            onResetRunState,
+            enabled = resetRunEnabled,
+        )
         ToolbarButton(Icons.Filled.DeleteOutline, "Clear canvas", onClear)
         ToolbarButton(Icons.Filled.SaveAlt, "Export workflow", onExport)
         ToolbarButton(Icons.Filled.FileOpen, "Import flow or recording", onImport)
