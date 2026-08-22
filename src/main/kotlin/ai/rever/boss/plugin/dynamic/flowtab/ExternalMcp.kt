@@ -43,6 +43,8 @@ enum class McpTransportKind { STDIO, HTTP_SSE }
  * @param command stdio server binary (e.g. `npx`, `uvx`, `node`) — resolved through a
  *   login shell so a packaged GUI app finds it (red-team F9).
  * @param args stdio server arguments.
+ * @param workingDirectory optional working directory for a stdio child process. A blank
+ *   value preserves the host working directory used by older configurations.
  * @param url HTTP/SSE endpoint.
  * @param enabled per-server explicit opt-in; only enabled servers connect on refresh.
  * @param secretRef logical secret name for an auth header/token (looked up, never stored).
@@ -55,6 +57,7 @@ data class McpServerConfig(
     val kind: McpTransportKind,
     val command: String = "",
     val args: List<String> = emptyList(),
+    val workingDirectory: String = "",
     val url: String = "",
     val enabled: Boolean = false,
     val secretRef: String? = null,

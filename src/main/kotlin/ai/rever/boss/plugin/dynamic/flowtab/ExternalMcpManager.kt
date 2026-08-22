@@ -107,6 +107,7 @@ internal fun normalizedExternalMcpConfig(config: McpServerConfig): McpServerConf
     val name = normalizedExternalMcpServerName(config.name) ?: return null
     return config.copy(
         name = name,
+        workingDirectory = if (config.kind == McpTransportKind.STDIO) config.workingDirectory.trim() else "",
         secretRef = if (config.kind == McpTransportKind.STDIO) null else config.secretRef,
     )
 }

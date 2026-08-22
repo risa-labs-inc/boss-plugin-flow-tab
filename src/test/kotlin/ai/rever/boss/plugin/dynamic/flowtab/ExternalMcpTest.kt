@@ -1283,6 +1283,25 @@ class ExternalMcpTest {
     }
 
     @Test
+    fun `stdio process uses configured nonblank working directory`() {
+        val config = McpServerConfig(
+            name = "local",
+            kind = McpTransportKind.STDIO,
+            command = "python3",
+            workingDirectory = "  /tmp/mcp-project  ",
+        )
+
+        assertEquals(java.io.File("/tmp/mcp-project"), stdioProcessBuilder(config).directory())
+    }
+
+    @Test
+    fun `stdio process preserves inherited directory when working directory is blank`() {
+        val config = McpServerConfig("local", McpTransportKind.STDIO, command = "python3")
+
+        assertEquals(null, stdioProcessBuilder(config).directory())
+    }
+
+    @Test
     fun `login shell defaults to the SHELL env or a POSIX fallback`() {
         // Never throws and always yields a non-blank shell path.
         assertTrue(LoginShell.shell().isNotBlank())
