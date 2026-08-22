@@ -23,6 +23,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import java.io.File
+import kotlin.concurrent.thread
 
 /**
  * The real, network/process-touching MCP client transports (red-team F9). These are the
@@ -65,14 +66,22 @@ private abstract class SdkMcpTransport : McpTransport {
 
 /** stdio transport: launches the server binary through a login shell (so `npx`/`uvx`/
  *  `node` resolve on a packaged macOS app — F9) and speaks MCP over its stdio. */
-private class StdioMcpTransport(private val config: McpServerConfig) : SdkMcpTransport() {
+private class StdioMcpTransport(private val config: McpServerConfig) : SdkMcpTransport(), McpTransportDiagnostics {
     private var process: Process? = null
+    private var stderrTail: ProcessStderrTail? = null
 
     override suspend fun connect() {
         val proc = stdioProcessBuilder(config)
             .redirectErrorStream(false)
             .start()
         process = proc
+        val tail = ProcessStderrTail()
+        stderrTail = tail
+        thread(name = "flow-mcp-stderr-${config.name}", isDaemon = true) {
+            runCatching {
+                proc.errorStream.bufferedReader().useLines { lines -> lines.forEach(tail::append) }
+            }
+        }
         val transport = StdioClientTransport(
             input = proc.inputStream.asSource().buffered(),
             output = proc.outputStream.asSink().buffered(),
@@ -89,6 +98,33 @@ private class StdioMcpTransport(private val config: McpServerConfig) : SdkMcpTra
         }
         process = null
     }
+
+    override fun diagnostic(): String? = stderrTail?.snapshot()
+}
+
+/** Optional diagnostics from a concrete transport. The manager sanitizes and redacts
+ * this provider-controlled text before it reaches UI/status state. */
+internal interface McpTransportDiagnostics {
+    fun diagnostic(): String?
+}
+
+/** A synchronized, fixed-size tail prevents a noisy child from consuming plugin memory. */
+internal class ProcessStderrTail(private val maxChars: Int = 4_096, private val maxLines: Int = 8) {
+    private val lines = ArrayDeque<String>()
+    private var chars = 0
+
+    @Synchronized fun append(line: String) {
+        val bounded = line.takeLast(maxChars)
+        lines.addLast(bounded)
+        chars += bounded.length + 1
+        // The delimiter is accounted for while retaining multiple lines, but must not
+        // evict the sole bounded line (whose visible snapshot is already maxChars).
+        while (lines.size > maxLines || (chars > maxChars && lines.size > 1)) {
+            chars -= lines.removeFirst().length + 1
+        }
+    }
+
+    @Synchronized fun snapshot(): String? = lines.joinToString("\n").takeIf { it.isNotBlank() }
 }
 
 /** Build a stdio-server process without changing legacy blank-directory behavior. */
