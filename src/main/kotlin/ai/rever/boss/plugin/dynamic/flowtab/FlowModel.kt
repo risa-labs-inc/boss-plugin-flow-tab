@@ -2,7 +2,12 @@ package ai.rever.boss.plugin.dynamic.flowtab
 
 import androidx.compose.ui.geometry.Offset
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import java.security.MessageDigest
 import kotlin.math.max
 
 /** How the executor feeds items to a node. */
@@ -330,6 +335,60 @@ data class GraphSnapshot(
     val schemaVersion: Int = 1,
     val metadata: FlowMeta? = null
 )
+
+/** Immutable workflow definition attached to a run. The snapshot keeps historical
+ * results interpretable even after nodes are renamed, moved, or deleted. */
+@Serializable
+data class WorkflowRevision(
+    val id: String,
+    val fingerprint: String,
+    val capturedAtMs: Long,
+    val source: String,
+    val snapshot: GraphSnapshot,
+)
+
+/** Stable executable identity. Layout and user-facing release labels intentionally
+ * do not participate, so moving cards or changing a label does not mint a version. */
+fun GraphSnapshot.executionFingerprint(): String {
+    val executable = buildString {
+        // Length-prefix each value instead of relying on punctuation separators: titles
+        // and config values are user input and may themselves contain `|` or newlines.
+        fun field(value: String) = append(value.length).append(':').append(value)
+        field("schemaVersion"); field(schemaVersion.toString()); append('\n')
+        nodes.sortedBy { it.id }.forEach { node ->
+            field("node"); field(node.id); field(node.type); field(node.title); field(node.config.canonicalJson()); append('\n')
+        }
+        edges.sortedBy { it.id }.forEach { edge ->
+            field("edge"); field(edge.id); field(edge.fromNode); field(edge.fromPort.toString())
+            field(edge.toNode); field(edge.toPort.toString()); append('\n')
+        }
+        metadata?.inputs?.forEach { field("input"); field(it); append('\n') }
+    }
+    val hash = MessageDigest.getInstance("SHA-256").digest(executable.toByteArray(Charsets.UTF_8))
+    return hash.joinToString("") { "%02x".format(it) }
+}
+
+/** JSON's normal string representation keeps insertion order. Revisions must not. */
+private fun JsonElement.canonicalJson(): String = when (this) {
+    is JsonObject -> entries.sortedBy { it.key }.joinToString(prefix = "{", postfix = "}", separator = ",") {
+        JsonPrimitive(it.key).toString() + ":" + it.value.canonicalJson()
+    }
+    is JsonArray -> joinToString(prefix = "[", postfix = "]", separator = ",") { it.canonicalJson() }
+    JsonNull -> "null"
+    is JsonPrimitive -> toString()
+    else -> toString()
+}
+
+fun GraphSnapshot.toWorkflowRevision(capturedAtMs: Long, source: String): WorkflowRevision {
+    val fingerprint = executionFingerprint()
+    return WorkflowRevision(
+        id = "rev-${fingerprint.take(12)}",
+        fingerprint = fingerprint,
+        capturedAtMs = capturedAtMs,
+        source = source,
+        snapshot = this,
+    )
+}
 
 /** Imported flows never carry an armed local recurring schedule across trust boundaries. */
 internal fun GraphSnapshot.withoutSchedule(): GraphSnapshot =

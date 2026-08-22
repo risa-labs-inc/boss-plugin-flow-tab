@@ -286,6 +286,14 @@ remain in controller/storage records. Retention is capped at the newest 20 runs 
 are never evicted); deleting a flow also
 deletes its run records. Legacy `runstate:<tabId>` remains readable for compatibility but is no longer
 the only canvas-visible history channel.
+Each execution also records a content-addressed `revision:<tabId>:<revisionId>` snapshot; the
+corresponding run stores only its `revisionId`, so per-node progress writes never duplicate the
+workflow definition. Revision fingerprints use canonical JSON and exclude layout, which makes a
+card move reuse the existing executable revision. Revision records are removed with their flow and
+are pruned once no retained or active run references them. The Versions dialog and historic run
+view are read-only diagnostic modes: while one is displayed, the live-canvas seam declines
+controller snapshots, autosave and live run overlays are paused, and returning to current reloads
+the durable graph before re-enabling normal synchronization.
 The launcher/controller and an open tab are independent full-snapshot writers for the same graph
 key. Controller/MCP mutations and open-tab autosave therefore serialize through
 `FlowPersistenceCoordinator`. Controller writes publish revisioned snapshots that an open canvas

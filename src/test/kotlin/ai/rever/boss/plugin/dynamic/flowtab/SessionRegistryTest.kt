@@ -119,6 +119,7 @@ class SessionRegistryTest {
         override fun setFullscreenHandler(tabId: String, onEnterFullscreen: () -> Unit, onExitFullscreen: () -> Unit) {}
         override fun requestExitFullscreen() {}
         override fun showDevTools() {}
+        override suspend fun fillCredentials(username: String, password: String, fillBoth: Boolean) = false
         @Composable override fun Content() {}
         override fun dispose() {}
     }
