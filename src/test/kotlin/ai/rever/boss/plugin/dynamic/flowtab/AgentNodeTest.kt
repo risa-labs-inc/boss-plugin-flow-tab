@@ -86,6 +86,43 @@ class AgentNodeTest {
     }
 
     @Test
+    fun `structured allowlist survives the inspector edit round trip and still resolves`() {
+        val source = RecordingSource(listOf("docker_ps"))
+        val provider = FakeProvider.scripted(
+            AssistantTurn(toolCalls = listOf(ToolCall("1", "docker_ps", "{}"))),
+            AssistantTurn(text = "done"),
+        )
+        val spec = agentNodeSpec(prompts = null, providerFor = { provider }, toolSourceFor = { source })
+        val allowlistField = spec.configFields.single { it.key == AgentNode.ALLOWLIST_KEY }
+        val node = FlowNode(
+            "a",
+            spec,
+            "Agent",
+            0f,
+            0f,
+            buildJsonObject {
+                put(AgentNode.INPUT_KEY, "run docker ps")
+                put(AgentNode.ALLOWLIST_KEY, buildJsonArray { add(JsonPrimitive("tool:boss:docker_ps")) })
+            },
+        )
+
+        setConfig(node, AgentNode.ALLOWLIST_KEY, configValue(node, allowlistField))
+        val stored = node.config.getValue(AgentNode.ALLOWLIST_KEY).jsonPrimitive
+        assertTrue(stored.isString)
+
+        val reg = builtinNodeRegistry().also { it.register(spec) }
+        val state = runFlow(
+            reg,
+            listOf(PlanNode(node.id, node.kind, node.title, node.config)),
+            emptyList(),
+        ).getValue(node.id)
+
+        assertEquals(RunStatus.SUCCESS, state.status)
+        assertEquals(setOf("docker_ps"), source.invoked)
+        assertTrue(state.logs.contains("agent tools resolved: 1 (docker_ps)"))
+    }
+
+    @Test
     fun `agent node rejects malformed JSON allowlist before requesting the model`() {
         val providerCalls = AtomicInteger()
         val provider = FakeProvider { _, _, _, _ ->

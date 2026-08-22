@@ -84,13 +84,25 @@ private val JsonStringColor = Color(0xFF9ECE6A)
 private val JsonNumberColor = Color(0xFFE0AF68)
 private val JsonBoolColor = Color(0xFFBB9AF7)
 
-/** Replace one config field on [node], preserving the rest. */
-private fun setConfig(node: FlowNode, key: String, value: String) {
+/** Replace one config field on [node], preserving the rest. Internal so tests can pin the edit round trip. */
+internal fun setConfig(node: FlowNode, key: String, value: String) {
     node.config = JsonObject(node.config + (key to JsonPrimitive(value)))
 }
 
-private fun configValue(node: FlowNode, field: ConfigField): String =
-    (node.config[field.key] as? JsonPrimitive)?.content ?: field.default
+/**
+ * Text shown by the Parameters editor for [field]. JSON fields may arrive from
+ * imported flow JSON or MCP authoring as a structured value rather than the
+ * inspector's usual string-backed representation, so serialize those values
+ * instead of presenting a destructive blank editor.
+ */
+internal fun configValue(node: FlowNode, field: ConfigField): String {
+    val value = node.config[field.key] ?: return field.default
+    return when {
+        value is JsonPrimitive -> value.content
+        field.type == FieldType.JSON -> prettyJson.encodeToString(JsonElement.serializer(), value)
+        else -> field.default
+    }
+}
 
 /**
  * Pretty-printed output for the inspector clipboard action. Large runs are
