@@ -28,6 +28,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.AlertDialog
+import androidx.compose.material.DropdownMenu
+import androidx.compose.material.DropdownMenuItem
 import androidx.compose.material.Icon
 import androidx.compose.material.IconButton
 import androidx.compose.material.Text
@@ -43,6 +45,7 @@ import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.FitScreen
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.SaveAlt
@@ -1546,6 +1549,29 @@ private fun Toolbar(
             Text("Templates", color = IconTint, fontSize = 12.sp, fontWeight = FontWeight.Medium)
         }
 
+        Spacer(Modifier.width(8.dp))
+        // Import sits with New Flow and Templates because it answers the same question -
+        // "how do I get a flow onto this canvas?" - and it is labelled rather than being
+        // a twelfth tail icon. This Row has no overflow handling, so the far-right icons
+        // are the first thing it clips on a narrow panel, and Import was last in that row.
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(7.dp))
+                .border(1.dp, ToolbarBorder, RoundedCornerShape(7.dp))
+                .clickable(onClick = onImport)
+                .padding(horizontal = 9.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                Icons.Filled.FileOpen,
+                contentDescription = "Import flow or recording",
+                tint = IconTint,
+                modifier = Modifier.size(13.dp)
+            )
+            Spacer(Modifier.width(4.dp))
+            Text("Import", color = IconTint, fontSize = 12.sp, fontWeight = FontWeight.Medium)
+        }
+
         Spacer(Modifier.weight(1f))
 
         ToolbarButton(
@@ -1564,18 +1590,63 @@ private fun Toolbar(
         )
         ToolbarButton(Icons.Filled.ZoomIn, "Zoom in", onZoomIn)
         ToolbarButton(Icons.Filled.AutoFixHigh, "Tidy layout", onTidy, enabled = tidyEnabled)
-        ToolbarButton(Icons.AutoMirrored.Filled.Undo, "Undo tidy layout", onUndoTidy, enabled = undoTidyEnabled)
         ToolbarButton(Icons.Filled.FitScreen, "Fit to content", onFit)
-        ToolbarButton(Icons.Filled.RestartAlt, "Reset view", onReset)
-        ToolbarButton(
-            Icons.Filled.RestartAlt,
-            "Reset run state (keep workflow and history)",
-            onResetRunState,
-            enabled = resetRunEnabled,
-        )
-        ToolbarButton(Icons.Filled.DeleteOutline, "Clear canvas", onClear)
-        ToolbarButton(Icons.Filled.SaveAlt, "Export workflow", onExport)
-        ToolbarButton(Icons.Filled.FileOpen, "Import flow or recording", onImport)
+
+        // Everything past this point is rare, destructive, or both, so it lives behind a
+        // single overflow button rather than six more icons. This Row has no overflow
+        // handling: non-weighted children are measured in source order against a width
+        // clamped at zero, so a narrow panel silently drops whichever controls are last
+        // rather than moving them somewhere reachable. Collapsing the tail bounds how wide
+        // the toolbar can want to be, and a labelled menu row beats an unlabelled icon for
+        // anyone who has not already learned where these actions live.
+        var overflowOpen by remember { mutableStateOf(false) }
+        Box {
+            ToolbarButton(Icons.Filled.MoreVert, "More actions", { overflowOpen = true })
+            DropdownMenu(expanded = overflowOpen, onDismissRequest = { overflowOpen = false }) {
+                OverflowItem(Icons.AutoMirrored.Filled.Undo, "Undo tidy layout", undoTidyEnabled) {
+                    overflowOpen = false
+                    onUndoTidy()
+                }
+                OverflowItem(Icons.Filled.RestartAlt, "Reset view", true) {
+                    overflowOpen = false
+                    onReset()
+                }
+                OverflowItem(
+                    Icons.Filled.RestartAlt,
+                    "Reset run state (keep workflow and history)",
+                    resetRunEnabled,
+                ) {
+                    overflowOpen = false
+                    onResetRunState()
+                }
+                OverflowItem(Icons.Filled.SaveAlt, "Export workflow", true) {
+                    overflowOpen = false
+                    onExport()
+                }
+                OverflowItem(Icons.Filled.DeleteOutline, "Clear canvas", true) {
+                    overflowOpen = false
+                    onClear()
+                }
+            }
+        }
+    }
+}
+
+// A menu row carries the same icon the toolbar button used to, so anyone who had already
+// learned the icon still recognises the action, while the label is there for anyone who
+// had not.
+@Composable
+private fun OverflowItem(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
+    val tint = if (enabled) IconTint else IconTint.copy(alpha = 0.4f)
+    DropdownMenuItem(onClick = onClick, enabled = enabled) {
+        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(13.dp))
+        Spacer(Modifier.width(8.dp))
+        Text(label, color = tint, fontSize = 12.sp)
     }
 }
 
