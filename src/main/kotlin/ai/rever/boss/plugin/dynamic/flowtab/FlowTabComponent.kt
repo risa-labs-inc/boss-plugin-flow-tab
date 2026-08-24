@@ -45,8 +45,10 @@ import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.FitScreen
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.SaveAlt
 import androidx.compose.material.icons.filled.Schedule
@@ -974,7 +976,7 @@ class FlowTabComponent(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        "Viewing ${historical.id}",
+                        "Viewing ${historical.id} · select a node to inspect its saved output",
                         color = Color.White,
                         fontSize = 12.sp,
                         maxLines = 1,
@@ -1078,17 +1080,6 @@ class FlowTabComponent(
                         onViewportSize = { viewportSize = it },
                         onManualViewportChange = { followExecution = false },
                     )
-                    // Historical snapshots are for diagnosis. Let users pan/zoom only
-                    // after returning to current rather than accepting edits that are
-                    // intentionally discarded on exit.
-                    if (viewingHistoricalRevision != null) {
-                        Box(
-                            Modifier
-                                .matchParentSize()
-                                .background(FlowTheme.Surface.copy(alpha = 0.03f))
-                                .clickable { state.notice = "Historical workflow view is read-only" },
-                        )
-                    }
                 }
 
                 if (selectedNode != null) {
@@ -1420,7 +1411,7 @@ private fun Toolbar(
         )
         ToolbarButton(Icons.Filled.Edit, "Rename flow", onRename, enabled = renameEnabled)
         ToolbarButton(Icons.Filled.History, "Run history", onHistory)
-        ToolbarButton(Icons.Filled.History, "Workflow versions", onVersions)
+        ToolbarButton(Icons.Filled.Layers, "Workflow versions", onVersions)
 
         Spacer(Modifier.width(4.dp))
         // Run / Stop
@@ -1591,7 +1582,6 @@ private fun Toolbar(
         ToolbarButton(Icons.Filled.ZoomIn, "Zoom in", onZoomIn)
         ToolbarButton(Icons.Filled.AutoFixHigh, "Tidy layout", onTidy, enabled = tidyEnabled)
         ToolbarButton(Icons.Filled.FitScreen, "Fit to content", onFit)
-
         // Everything past this point is rare, destructive, or both, so it lives behind a
         // single overflow button rather than six more icons. This Row has no overflow
         // handling: non-weighted children are measured in source order against a width
@@ -1612,7 +1602,7 @@ private fun Toolbar(
                     onReset()
                 }
                 OverflowItem(
-                    Icons.Filled.RestartAlt,
+                    Icons.Filled.Refresh,
                     "Reset run state (keep workflow and history)",
                     resetRunEnabled,
                 ) {
