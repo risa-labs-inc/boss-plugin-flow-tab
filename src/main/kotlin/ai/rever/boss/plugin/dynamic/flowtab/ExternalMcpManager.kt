@@ -45,6 +45,9 @@ data class FlowSettings(val externalMcpEnabled: Boolean = false)
 
 enum class ExternalMcpServerState { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
 
+/** Manager lifecycle exposed to UI so terminal crashes are not presented as retryable. */
+enum class ExternalMcpManagerState { ACTIVE, DISPOSED, CRASHED }
+
 /** User-facing, bounded connection state for one configured external MCP server. */
 data class ExternalMcpServerStatus(
     val state: ExternalMcpServerState,
@@ -124,6 +127,11 @@ class ExternalMcpManager(
     private val settings: SettingsStore,
     private val transportFactory: McpTransportFactory = ::defaultMcpTransport,
     private val log: (String) -> Unit = {},
+    /** Receives only actor-terminating JVM/plugin failures, with the original stack. */
+    private val logFatal: (String, Error) -> Unit = { message, failure ->
+        System.err.println(message)
+        failure.printStackTrace()
+    },
     private val ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
     /** Cooperative deadline applied independently to each server connect, discovery, and close. */
     private val serverOperationTimeoutMs: Long = DEFAULT_SERVER_OPERATION_TIMEOUT_MS,
@@ -159,8 +167,6 @@ class ExternalMcpManager(
         data class Dispose(val result: CompletableDeferred<Unit>) : ManagerRequest
     }
 
-    private enum class TerminalState { ACTIVE, DISPOSED, CRASHED }
-
     private val open = ConcurrentHashMap<String, Live>()
     private val configMutex = Mutex()
     private val implicitRetryMutex = Mutex()
@@ -168,12 +174,13 @@ class ExternalMcpManager(
     private val mutableChangeTick = MutableStateFlow(0L)
     private val mutableServerStatuses = MutableStateFlow<Map<String, ExternalMcpServerStatus>>(emptyMap())
     private val mutableDescriptors = MutableStateFlow<List<ToolDescriptor>>(emptyList())
+    private val mutableState = MutableStateFlow(ExternalMcpManagerState.ACTIVE)
     private val managerJob = SupervisorJob()
     private val managerScope = CoroutineScope(managerJob + ioDispatcher)
     private val requests = Channel<ManagerRequest>(Channel.UNLIMITED)
     private val requestLock = Any()
     private var acceptingRequests = true
-    private var terminalState = TerminalState.ACTIVE
+    private var terminalState = ExternalMcpManagerState.ACTIVE
     @Volatile
     private var initialized = false
     @Volatile
@@ -188,6 +195,9 @@ class ExternalMcpManager(
 
     /** Cached descriptor snapshot from the manager's single discovery pass. */
     val descriptors: StateFlow<List<ToolDescriptor>> = mutableDescriptors.asStateFlow()
+
+    /** Becomes terminal when disposal starts or an actor-ending [Error] escapes. */
+    val state: StateFlow<ExternalMcpManagerState> = mutableState.asStateFlow()
 
     private val worker = managerScope.async(start = CoroutineStart.LAZY) {
         try {
@@ -313,7 +323,10 @@ class ExternalMcpManager(
     private fun stopAcceptanceAndDrain() {
         synchronized(requestLock) {
             acceptingRequests = false
-            if (terminalState == TerminalState.ACTIVE) terminalState = TerminalState.DISPOSED
+            if (terminalState == ExternalMcpManagerState.ACTIVE) {
+                terminalState = ExternalMcpManagerState.DISPOSED
+                mutableState.value = terminalState
+            }
             requests.close()
             while (true) {
                 val pending = requests.tryReceive().getOrNull() ?: break
@@ -324,22 +337,35 @@ class ExternalMcpManager(
 
     private fun markCrashed(fatal: Error) {
         val shouldLog = synchronized(requestLock) {
-            if (terminalState == TerminalState.CRASHED) {
+            if (terminalState == ExternalMcpManagerState.CRASHED) {
                 false
             } else {
                 acceptingRequests = false
-                terminalState = TerminalState.CRASHED
+                terminalState = ExternalMcpManagerState.CRASHED
+                mutableState.value = terminalState
                 true
             }
         }
-        if (shouldLog) logActorFailure("crashed; reload the plugin", fatal)
+        if (shouldLog) {
+            try {
+                logFatal("external MCP manager crashed; reload the plugin", fatal)
+            } catch (_: Throwable) {
+                // Logging must never prevent the accepted request from receiving its
+                // bounded terminal failure. Do not include data from either throwable.
+                try {
+                    log("external MCP manager fatal diagnostic could not be recorded")
+                } catch (_: Throwable) {
+                    // A caller-owned logging sink is outside the actor's trust boundary.
+                }
+            }
+        }
     }
 
     private fun terminalMessage(): String = synchronized(requestLock) { terminalMessageLocked() }
 
     private fun terminalMessageLocked(): String = when (terminalState) {
-        TerminalState.CRASHED -> CRASHED_MESSAGE
-        TerminalState.ACTIVE, TerminalState.DISPOSED -> DISPOSED_MESSAGE
+        ExternalMcpManagerState.CRASHED -> CRASHED_MESSAGE
+        ExternalMcpManagerState.ACTIVE, ExternalMcpManagerState.DISPOSED -> DISPOSED_MESSAGE
     }
 
     private fun terminalFailureLocked(): IllegalStateException = publicFailure(terminalMessageLocked())
@@ -705,7 +731,10 @@ class ExternalMcpManager(
         val result = synchronized(requestLock) {
             disposeResult ?: CompletableDeferred<Unit>().also { completion ->
                 acceptingRequests = false
-                if (terminalState == TerminalState.ACTIVE) terminalState = TerminalState.DISPOSED
+                if (terminalState == ExternalMcpManagerState.ACTIVE) {
+                    terminalState = ExternalMcpManagerState.DISPOSED
+                    mutableState.value = terminalState
+                }
                 disposeResult = completion
                 if (requests.trySend(ManagerRequest.Dispose(completion)).isFailure) {
                     completion.completeExceptionally(terminalFailureLocked())
