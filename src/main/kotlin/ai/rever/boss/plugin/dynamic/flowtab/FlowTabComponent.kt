@@ -26,6 +26,7 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -903,13 +904,16 @@ class FlowTabComponent(
         var showRename by remember { mutableStateOf(false) }
         var renameInProgress by remember { mutableStateOf(false) }
         val renameEnabled = initialized && !renameInProgress && viewingHistoricalRevision == null
-        val currentFlowName = state.metadata?.name?.ifBlank { null }
-            ?: config.title.ifBlank { "Flow" }
+        val currentFlowName = currentFlowDisplayName(state.metadata?.name, config.title)
 
         Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().background(CanvasBackground)) {
-            Toolbar(
+            FlowIdentityBar(
                 flowName = currentFlowName,
+                renameEnabled = renameEnabled,
+                onRename = { showRename = true },
+            )
+            Toolbar(
                 scale = state.scale,
                 isRunning = state.isRunning,
                 canStop = canvasRunOwned,
@@ -924,8 +928,6 @@ class FlowTabComponent(
                         FlowTabData(id = "flow-${java.util.UUID.randomUUID()}", title = "Flow")
                     )
                 },
-                renameEnabled = renameEnabled,
-                onRename = { showRename = true },
                 onTemplates = { showGallery = true },
                 externalMcpAvailable = externalMcp != null,
                 onExternalMcp = { showMcpConfig = true },
@@ -1420,9 +1422,74 @@ private fun ExecutionProgressStrip(
 }
 
 @Composable
-private fun Toolbar(
+@OptIn(ExperimentalFoundationApi::class)
+private fun FlowIdentityBar(
     flowName: String,
     renameEnabled: Boolean,
+    onRename: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(34.dp)
+            .background(PaletteBg)
+            .border(width = 1.dp, color = ToolbarBorder)
+            .padding(start = 14.dp, end = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = FlowTabType.icon,
+            contentDescription = null,
+            tint = FlowTheme.PrimaryTint,
+            modifier = Modifier.size(16.dp),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text = "FLOW",
+            color = FlowTheme.TextMuted,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.SemiBold,
+        )
+        Spacer(Modifier.width(8.dp))
+        Box(Modifier.weight(1f)) {
+            TooltipArea(
+                delayMillis = 350,
+                tooltip = {
+                    Box(
+                        Modifier
+                            .shadow(4.dp, RoundedCornerShape(6.dp))
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0xFF111114))
+                            .border(1.dp, ToolbarBorder, RoundedCornerShape(6.dp))
+                            .widthIn(max = 360.dp)
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
+                    ) {
+                        Text(flowName, color = Color.White, fontSize = 11.sp)
+                    }
+                },
+            ) {
+                Text(
+                    text = flowName,
+                    color = Color.White,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+        ToolbarButton(Icons.Filled.Edit, "Rename flow", onRename, enabled = renameEnabled)
+    }
+}
+
+internal fun currentFlowDisplayName(metadataName: String?, tabTitle: String): String =
+    metadataName?.takeIf { it.isNotBlank() }
+        ?: tabTitle.takeIf { it.isNotBlank() }
+        ?: "Flow"
+
+@Composable
+private fun Toolbar(
     scale: Float,
     isRunning: Boolean,
     canStop: Boolean,
@@ -1433,7 +1500,6 @@ private fun Toolbar(
     onRun: () -> Unit,
     onStop: () -> Unit,
     onNewFlow: () -> Unit,
-    onRename: () -> Unit,
     onTemplates: () -> Unit,
     externalMcpAvailable: Boolean,
     onExternalMcp: () -> Unit,
@@ -1462,23 +1528,6 @@ private fun Toolbar(
             .padding(horizontal = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Icon(
-            imageVector = FlowTabType.icon,
-            contentDescription = null,
-            tint = FlowTheme.PrimaryTint,
-            modifier = Modifier.size(18.dp)
-        )
-        Spacer(Modifier.width(8.dp))
-        Text(
-            text = flowName,
-            color = Color.White,
-            fontSize = 14.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f, fill = false),
-        )
-        ToolbarButton(Icons.Filled.Edit, "Rename flow", onRename, enabled = renameEnabled)
         ToolbarButton(Icons.Filled.History, "Run history", onHistory)
         ToolbarButton(Icons.Filled.Layers, "Workflow versions", onVersions)
 

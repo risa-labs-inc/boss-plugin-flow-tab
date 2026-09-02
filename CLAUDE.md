@@ -251,8 +251,9 @@ a provider that exposes logical keys.
 readability. `flow_delete` permanently removes a graph and its UI run-state snapshot, closing a
 matching open tab first. The launcher uses the same controller and storage namespace as these MCP
 contracts, lets users rename readable flows, and asks for confirmation before deletion. An open
-flow shows its current name in the canvas toolbar with an edit action; that path persists the live
-snapshot immediately, so even a brand-new tab can be named before its debounced autosave runs.
+flow shows its current name in a dedicated editor identity bar with an edit action; that path
+persists the live snapshot immediately, so even a brand-new tab can be named before its debounced
+autosave runs.
 MCP authoring is mutable: `flow_rename` changes flow metadata, `flow_update_node` patches a title
 and/or merges config keys, and `flow_delete_node` removes the node plus incident edges while
 `flow_delete_edge` removes one connection. These operations use the same coordinator as open-tab
