@@ -368,8 +368,35 @@ data class GraphSnapshot(
     val edges: List<EdgeModel> = emptyList(),
     val nextId: Long = 1L,
     val schemaVersion: Int = 1,
-    val metadata: FlowMeta? = null
+    val metadata: FlowMeta? = null,
+    /** First persistence time. Null keeps snapshots saved by older builds compatible. */
+    val createdAtEpochMs: Long? = null,
+    /** Most recent graph persistence time. Null keeps legacy snapshots compatible. */
+    val modifiedAtEpochMs: Long? = null,
 )
+
+/**
+ * Add durable discovery timestamps while preserving a no-op autosave's prior values.
+ * Imported snapshots are new records, so callers pass null for [previous].
+ */
+internal fun GraphSnapshot.withPersistenceTimestamps(
+    previous: GraphSnapshot?,
+    nowEpochMs: Long,
+): GraphSnapshot {
+    val currentContent = copy(createdAtEpochMs = null, modifiedAtEpochMs = null)
+    val previousContent = previous?.copy(createdAtEpochMs = null, modifiedAtEpochMs = null)
+    if (previous != null && currentContent == previousContent) {
+        return copy(
+            createdAtEpochMs = previous.createdAtEpochMs,
+            modifiedAtEpochMs = previous.modifiedAtEpochMs,
+        )
+    }
+
+    return copy(
+        createdAtEpochMs = previous?.createdAtEpochMs ?: nowEpochMs,
+        modifiedAtEpochMs = nowEpochMs,
+    )
+}
 
 /** Immutable workflow definition attached to a run. The snapshot keeps historical
  * results interpretable even after nodes are renamed, moved, or deleted. */

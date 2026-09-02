@@ -83,7 +83,14 @@ class FlowControllerTest {
         registry: NodeRegistry = builtinNodeRegistry(),
         runTimeoutMs: Long = FlowController.DEFAULT_RUN_TIMEOUT_MS,
         tabUpdates: TabUpdateProviderFactory? = null,
-    ) = FlowController(context(storage, tabUpdates), { scope }, registry, runTimeoutMs)
+        nowMillis: () -> Long = System::currentTimeMillis,
+    ) = FlowController(
+        context = context(storage, tabUpdates),
+        scopeProvider = { scope },
+        registry = registry,
+        runTimeoutMs = runTimeoutMs,
+        nowMillis = nowMillis,
+    )
 
     @Test
     fun `flow state persists locally merges concurrent keys and is removed with the flow`() = runBlocking {
@@ -594,6 +601,41 @@ class FlowControllerTest {
         assertEquals(1, saved.nodeCount)
         assertTrue(saved.readable)
         assertFalse(corrupt.readable)
+    }
+
+    @Test
+    fun `listFlowDetails orders newest creation first then promotes modified flows`() = runBlocking {
+        var now = 100L
+        val fc = controller(nowMillis = { now })
+        val older = fc.createFlow(FlowMeta(name = "Older"))
+        now = 200L
+        val newer = fc.createFlow(FlowMeta(name = "Newer"))
+
+        assertEquals(listOf(newer, older), fc.listFlowDetails().map { it.tabId })
+        assertEquals(200L, fc.listFlowDetails().first().createdAtEpochMs)
+
+        now = 300L
+        fc.addNode(older, "TRIGGER")
+
+        val reordered = fc.listFlowDetails()
+        assertEquals(listOf(older, newer), reordered.map { it.tabId })
+        assertEquals(100L, reordered.first().createdAtEpochMs)
+        assertEquals(300L, reordered.first().modifiedAtEpochMs)
+    }
+
+    @Test
+    fun `listFlowDetails orders legacy flows deterministically after timestamped flows`() = runBlocking {
+        val storage = TestStorage()
+        storage.putJson("${FlowController.GRAPH_PREFIX}flow-b", "{}")
+        storage.putJson("${FlowController.GRAPH_PREFIX}flow-a", "{}")
+        val fc = controller(storage = storage, nowMillis = { 500L })
+        val timestamped = fc.createFlow(FlowMeta(name = "Current"))
+
+        val details = fc.listFlowDetails()
+
+        assertEquals(listOf(timestamped, "flow-a", "flow-b"), details.map { it.tabId })
+        assertNull(details[1].createdAtEpochMs)
+        assertNull(details[1].modifiedAtEpochMs)
     }
 
     @Test

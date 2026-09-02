@@ -63,6 +63,26 @@ class GraphSnapshotTest {
     }
 
     @Test
+    fun `persistence timestamps preserve no-op saves and mark real edits`() {
+        val legacy = GraphSnapshot(metadata = FlowMeta(name = "Legacy"))
+        val noOp = legacy.withPersistenceTimestamps(previous = legacy, nowEpochMs = 100L)
+        assertNull(noOp.createdAtEpochMs)
+        assertNull(noOp.modifiedAtEpochMs)
+
+        val created = legacy.withPersistenceTimestamps(previous = null, nowEpochMs = 200L)
+        assertEquals(200L, created.createdAtEpochMs)
+        assertEquals(200L, created.modifiedAtEpochMs)
+
+        val unchanged = created.withPersistenceTimestamps(previous = created, nowEpochMs = 300L)
+        assertEquals(created, unchanged)
+
+        val modified = created.copy(nextId = 2L)
+            .withPersistenceTimestamps(previous = created, nowEpochMs = 400L)
+        assertEquals(200L, modified.createdAtEpochMs)
+        assertEquals(400L, modified.modifiedAtEpochMs)
+    }
+
+    @Test
     fun `imported flow drops its armed schedule`() {
         val snapshot = GraphSnapshot(
             metadata = FlowMeta(name = "Shared", schedule = FlowSchedule(intervalMinutes = 1)),
