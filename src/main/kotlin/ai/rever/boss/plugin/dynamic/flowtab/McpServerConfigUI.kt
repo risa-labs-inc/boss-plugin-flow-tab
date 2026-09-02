@@ -66,6 +66,7 @@ fun McpServerConfigPanel(
     var operationError by remember { mutableStateOf<String?>(null) }
     var servers by remember { mutableStateOf<List<McpServerConfig>>(emptyList()) }
     val statuses by manager.serverStatuses.collectAsState()
+    val managerState by manager.state.collectAsState()
 
     // New-server form fields.
     var name by remember { mutableStateOf("") }
@@ -143,7 +144,8 @@ fun McpServerConfigPanel(
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.weight(1f),
             )
-            Pill("Refresh / retry", enabledLook = true) {
+            val refreshControl = externalMcpRefreshControl(managerState)
+            Pill(refreshControl.label, enabledLook = refreshControl.enabled) {
                 mutate({ manager.requestRefresh() }, allowWhileBusy = true)
             }
         }
@@ -251,6 +253,15 @@ fun McpServerConfigPanel(
     }
 }
 
+internal data class ExternalMcpRefreshControl(val label: String, val enabled: Boolean)
+
+internal fun externalMcpRefreshControl(state: ExternalMcpManagerState): ExternalMcpRefreshControl =
+    when (state) {
+        ExternalMcpManagerState.ACTIVE -> ExternalMcpRefreshControl("Refresh / retry", enabled = true)
+        ExternalMcpManagerState.CRASHED -> ExternalMcpRefreshControl("Reload plugin required", enabled = false)
+        ExternalMcpManagerState.DISPOSED -> ExternalMcpRefreshControl("Plugin unloaded", enabled = false)
+    }
+
 @Composable
 private fun ServerRow(
     cfg: McpServerConfig,
@@ -351,7 +362,7 @@ private fun Pill(text: String, enabledLook: Boolean, onClick: () -> Unit) {
             .clip(RoundedCornerShape(FlowTheme.rSm))
             .background(if (enabledLook) FlowTheme.Primary.copy(alpha = 0.25f) else FlowTheme.Canvas)
             .border(1.dp, if (enabledLook) FlowTheme.Primary else FlowTheme.Border, RoundedCornerShape(FlowTheme.rSm))
-            .pointerHoverIcon(PointerIcon.Hand)
+            .pointerHoverIcon(if (enabledLook) PointerIcon.Hand else PointerIcon.Default)
             .clickable(enabled = enabledLook, onClick = onClick)
             .padding(horizontal = 14.dp, vertical = 8.dp),
     )

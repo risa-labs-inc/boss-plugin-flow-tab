@@ -110,4 +110,20 @@ class McpServerConfigUITest {
         assertTrue(diagnostic.none { it.isISOControl() || it == '\u2028' || it == '\u2029' })
         assertTrue(diagnostic.length <= ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH)
     }
+
+    @Test
+    fun `refresh control accurately reflects manager lifecycle`() {
+        assertEquals(
+            ExternalMcpRefreshControl("Refresh / retry", enabled = true),
+            externalMcpRefreshControl(ExternalMcpManagerState.ACTIVE),
+        )
+        assertEquals(
+            ExternalMcpRefreshControl("Reload plugin required", enabled = false),
+            externalMcpRefreshControl(ExternalMcpManagerState.CRASHED),
+        )
+        assertEquals(
+            ExternalMcpRefreshControl("Plugin unloaded", enabled = false),
+            externalMcpRefreshControl(ExternalMcpManagerState.DISPOSED),
+        )
+    }
 }

@@ -3,6 +3,8 @@ package ai.rever.boss.plugin.dynamic.flowtab
 import ai.rever.boss.plugin.api.DynamicPlugin
 import ai.rever.boss.plugin.api.McpServerController
 import ai.rever.boss.plugin.api.PluginContext
+import ai.rever.boss.plugin.logging.BossLogger
+import ai.rever.boss.plugin.logging.LogCategory
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -21,6 +23,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  * It registers as a TabType via tabRegistry.registerTabType().
  */
 class FlowTabDynamicPlugin : DynamicPlugin {
+    private val logger by lazy { BossLogger.forComponent("FlowPlugin") }
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.flowtab"
     override val displayName: String = "Flow"
     override val version: String = "1.0.0"
@@ -51,6 +54,9 @@ class FlowTabDynamicPlugin : DynamicPlugin {
                 SecretResolver.fromSecrets(context),
                 SettingsStore(storage),
                 log = { message -> println("[flow-tab] ${boundedExternalMcpDiagnostic(message)}") },
+                logFatal = { message, failure ->
+                    logger.error(LogCategory.SYSTEM, message, error = failure)
+                },
             )
         }.getOrNull()
         externalMcp = external

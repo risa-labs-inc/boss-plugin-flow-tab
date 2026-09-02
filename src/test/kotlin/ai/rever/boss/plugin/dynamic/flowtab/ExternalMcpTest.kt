@@ -81,6 +81,7 @@ class ExternalMcpTest {
         secrets: SecretResolver = SecretResolver.constant(null),
         ioDispatcher: CoroutineDispatcher = Dispatchers.IO,
         log: (String) -> Unit = {},
+        logFatal: (String, Error) -> Unit = { _, _ -> },
         serverOperationTimeoutMs: Long = ExternalMcpManager.DEFAULT_SERVER_OPERATION_TIMEOUT_MS,
         implicitRetryCooldownMs: Long = ExternalMcpManager.DEFAULT_IMPLICIT_RETRY_COOLDOWN_MS,
         implicitRetryAwaitTimeoutMs: Long = ExternalMcpManager.DEFAULT_IMPLICIT_RETRY_AWAIT_TIMEOUT_MS,
@@ -92,6 +93,7 @@ class ExternalMcpTest {
         settings = SettingsStore(storage),
         transportFactory = factory,
         log = log,
+        logFatal = logFatal,
         ioDispatcher = ioDispatcher,
         serverOperationTimeoutMs = serverOperationTimeoutMs,
         implicitRetryCooldownMs = implicitRetryCooldownMs,
@@ -884,12 +886,21 @@ class ExternalMcpTest {
             storage,
             McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = true),
         )
-        val rawPayload = "fatal-provider-secret\nforged line"
+        val rawPayload = "fatal diagnostic context"
         val logged = mutableListOf<String>()
+        val fatalLogs = mutableListOf<Pair<String, Error>>()
         var closed = false
-        val m = manager(storage, ioDispatcher = dispatcher, log = logged::add) { _, _ ->
+        val fatal = NoClassDefFoundError(rawPayload).apply {
+            stackTrace = arrayOf(StackTraceElement("FlowActor", "connect", "FlowActor.kt", 42))
+        }
+        val m = manager(
+            storage,
+            ioDispatcher = dispatcher,
+            log = logged::add,
+            logFatal = { message, failure -> fatalLogs += message to failure },
+        ) { _, _ ->
             object : McpTransport {
-                override suspend fun connect(): Unit = throw NoClassDefFoundError(rawPayload)
+                override suspend fun connect(): Unit = throw fatal
                 override suspend fun listTools(): List<RemoteTool> = emptyList()
                 override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
                 override suspend fun close() { closed = true }
@@ -909,16 +920,53 @@ class ExternalMcpTest {
             m.serverStatuses.value.getValue("s"),
         )
         assertTrue(closed)
+        assertEquals(ExternalMcpManagerState.CRASHED, m.state.value)
         assertTrue(logged.any { "crashed; reload the plugin" in it && "NoClassDefFoundError" in it })
-        assertTrue(logged.none { "fatal-provider-secret" in it || "forged line" in it || '\n' in it })
+        assertTrue(logged.none { rawPayload in it })
         assertTrue(logged.all { it.length <= ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH })
+        assertEquals(1, fatalLogs.size)
+        assertTrue("crashed; reload the plugin" in fatalLogs.single().first)
+        assertTrue(fatalLogs.single().second is NoClassDefFoundError)
+        assertTrue(fatalLogs.single().second.stackTrace.isNotEmpty())
 
         val next = m.requestAddConfig(McpServerConfig("later", McpTransportKind.STDIO, command = "y"))
         assertTrue(next.isCompleted)
         val rejection = assertFailsWith<IllegalStateException> { next.await() }
         assertEquals("External MCP manager crashed; reload the plugin to retry", rejection.message)
         val rejectionChain = generateSequence<Throwable>(rejection) { it.cause }.toList()
-        assertTrue(rejectionChain.none { "fatal-provider-secret" in it.message.orEmpty() || '\n' in it.message.orEmpty() })
+        assertTrue(rejectionChain.none { rawPayload in it.message.orEmpty() })
+    }
+
+    @Test
+    fun `fatal logger failure cannot hide terminal manager failure`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        seedEnabledServer(
+            storage,
+            McpServerConfig("s", McpTransportKind.STDIO, command = "x", enabled = true),
+        )
+        val fallbackLogs = mutableListOf<String>()
+        val m = manager(
+            storage,
+            ioDispatcher = dispatcher,
+            log = fallbackLogs::add,
+            logFatal = { _, _ -> error("logger payload that must stay private") },
+        ) { _, _ ->
+            object : McpTransport {
+                override suspend fun connect(): Unit = throw LinkageError("actor failure")
+                override suspend fun listTools(): List<RemoteTool> = emptyList()
+                override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                override suspend fun close() = Unit
+            }
+        }
+
+        val failure = assertFailsWith<IllegalStateException> { m.requestStart().await() }
+
+        assertEquals("External MCP manager crashed; reload the plugin to retry", failure.message)
+        assertEquals(ExternalMcpManagerState.CRASHED, m.state.value)
+        assertTrue(fallbackLogs.any { "crashed; reload the plugin" in it && "LinkageError" in it })
+        assertTrue(fallbackLogs.any { it == "external MCP manager fatal diagnostic could not be recorded" })
+        assertTrue(fallbackLogs.none { "logger payload" in it || "actor failure" in it })
     }
 
     @Test
@@ -979,12 +1027,14 @@ class ExternalMcpTest {
             }
         }
         val logged = mutableListOf<String>()
+        val fatalLogs = mutableListOf<Error>()
         val m = ExternalMcpManager(
             storage = storage,
             secrets = SecretResolver.constant(null),
             settings = SettingsStore(storage),
             transportFactory = { _, _ -> FakeTransport(emptyList()) },
             log = logged::add,
+            logFatal = { _, failure -> fatalLogs += failure },
             ioDispatcher = dispatcher,
         )
 
@@ -998,6 +1048,7 @@ class ExternalMcpTest {
         assertTrue(logged.any { "operation failed" in it && "IllegalStateException" in it })
         assertTrue(logged.none { "storage-provider-secret" in it || "forged line" in it || '\n' in it })
         assertTrue(logged.all { it.length <= ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH })
+        assertTrue(fatalLogs.isEmpty())
         m.cancelNow()
     }
 
@@ -1177,6 +1228,7 @@ class ExternalMcpTest {
 
         assertTrue(transport.closed.get())
         assertTrue(m.descriptors.value.isEmpty())
+        assertEquals(ExternalMcpManagerState.DISPOSED, m.state.value)
         assertEquals(ExternalMcpServerState.DISCONNECTED, m.serverStatuses.value.getValue("s").state)
         assertEquals(before + 1, m.changeTick.value)
     }
@@ -1309,6 +1361,7 @@ class ExternalMcpTest {
         assertEquals("External MCP manager is disposed", lateFailure.message)
         val disposalFailure = assertFailsWith<IllegalStateException> { m.disposeAll() }
         assertEquals("External MCP manager is disposed", disposalFailure.message)
+        assertEquals(ExternalMcpManagerState.DISPOSED, m.state.value)
     }
 
     // ---- settings store -----------------------------------------------------
