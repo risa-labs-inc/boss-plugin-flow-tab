@@ -323,7 +323,7 @@ class ExternalMcpManager(
     }
 
     private fun markCrashed(fatal: Error) {
-        val shouldLog = synchronized(requestLock) {
+        val crashed = synchronized(requestLock) {
             if (terminalState == TerminalState.CRASHED) {
                 false
             } else {
@@ -332,7 +332,12 @@ class ExternalMcpManager(
                 true
             }
         }
-        if (shouldLog) logActorFailure("crashed; reload the plugin", fatal)
+        if (!crashed) return
+        // A dead manager must not keep showing connected rows. The fixed public
+        // message also keeps the provider-controlled fatal payload out of the UI.
+        val crashedStatus = ExternalMcpServerStatus(ExternalMcpServerState.ERROR, CRASHED_MESSAGE)
+        replaceStatuses(mutableServerStatuses.value.mapValues { _ -> crashedStatus })
+        logActorFailure("crashed; reload the plugin", fatal)
     }
 
     private fun terminalMessage(): String = synchronized(requestLock) { terminalMessageLocked() }
