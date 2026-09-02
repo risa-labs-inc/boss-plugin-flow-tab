@@ -161,7 +161,8 @@ class FlowMcpToolProviderTest {
             setOf(
                 "flow_create", "flow_rename", "flow_add_node", "flow_update_node",
                 "flow_connect", "flow_delete_node", "flow_delete_edge", "flow_run", "flow_stop",
-                "flow_status", "flow_result", "flow_runs", "flow_list", "flow_get", "flow_delete",
+                "flow_status", "flow_result", "flow_runs", "flow_set_schedule", "flow_list",
+                "flow_get", "flow_delete",
                 "prompt_upsert", "prompt_get", "prompt_list",
             ),
             names.toSet(),
@@ -253,6 +254,74 @@ class FlowMcpToolProviderTest {
         assertTrue(call(p, "flow_delete_node", """{"tabId":"$tabId","nodeId":"missing"}""").isError)
         assertTrue(call(p, "flow_delete_edge", """{"tabId":"$tabId","edgeId":"missing"}""").isError)
         assertTrue(call(p, "flow_rename", """{"tabId":"$tabId","name":"  "}""").isError)
+    }
+
+    @Test
+    fun `flow_set_schedule arms reports and disarms a recurring flow`() = runBlocking {
+        val p = provider()
+        val tabId = obj(call(p, "flow_create", """{"name":"Scheduled"}"""))
+            .getValue("tabId").jsonPrimitive.content
+
+        val armedResult = call(
+            p,
+            "flow_set_schedule",
+            """{"tabId":"$tabId","intervalMinutes":15}""",
+        )
+        assertFalse(armedResult.isError)
+        val armed = obj(armedResult)
+        assertEquals("true", armed.getValue("ok").jsonPrimitive.content)
+        assertEquals(tabId, armed.getValue("tabId").jsonPrimitive.content)
+        assertEquals("15", armed.getValue("intervalMinutes").jsonPrimitive.content)
+        assertTrue(armed.getValue("nextRunAtEpochMs").jsonPrimitive.content.toLong() > 0)
+
+        val stored = obj(call(p, "flow_get", """{"tabId":"$tabId"}"""))
+        assertEquals(
+            "15",
+            stored.getValue("metadata").jsonObject
+                .getValue("schedule").jsonObject
+                .getValue("intervalMinutes").jsonPrimitive.content,
+        )
+
+        val disarmed = obj(
+            call(p, "flow_set_schedule", """{"tabId":"$tabId","intervalMinutes":null}"""),
+        )
+        assertEquals("null", disarmed.getValue("intervalMinutes").jsonPrimitive.content)
+        assertFalse("nextRunAtEpochMs" in disarmed)
+        val afterDisarm = obj(call(p, "flow_get", """{"tabId":"$tabId"}"""))
+        assertEquals(
+            "null",
+            afterDisarm.getValue("metadata").jsonObject.getValue("schedule").jsonPrimitive.content,
+        )
+    }
+
+    @Test
+    fun `flow_set_schedule rejects invalid intervals and missing flows`() = runBlocking {
+        val p = provider()
+        val tabId = obj(call(p, "flow_create")).getValue("tabId").jsonPrimitive.content
+
+        assertTrue(call(p, "flow_set_schedule", """{"tabId":"$tabId"}""").isError)
+        assertTrue(call(p, "flow_set_schedule", """{"tabId":"$tabId","intervalMinutes":0}""").isError)
+        assertTrue(
+            call(
+                p,
+                "flow_set_schedule",
+                """{"tabId":"$tabId","intervalMinutes":525601}""",
+            ).isError,
+        )
+        assertTrue(
+            call(
+                p,
+                "flow_set_schedule",
+                """{"tabId":"$tabId","intervalMinutes":"15"}""",
+            ).isError,
+        )
+        assertTrue(
+            call(
+                p,
+                "flow_set_schedule",
+                """{"tabId":"missing","intervalMinutes":15}""",
+            ).isError,
+        )
     }
 
     @Test

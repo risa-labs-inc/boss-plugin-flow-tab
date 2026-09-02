@@ -10,6 +10,7 @@ import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
@@ -17,6 +18,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
 /**
@@ -192,6 +194,41 @@ class FlowMcpToolProvider(
                     "runs",
                     json.encodeToJsonElement(ListSerializer(RunSummary.serializer()), runs),
                 )
+            })
+        },
+        def(
+            "flow_set_schedule",
+            "Set a flow's recurring interval, or pass intervalMinutes=null to disable it. " +
+                "Intervals must be ${FlowController.MIN_SCHEDULE_INTERVAL_MINUTES} to " +
+                "${FlowController.MAX_SCHEDULE_INTERVAL_MINUTES} minutes. A tick is skipped while " +
+                "that flow is already running; at most ${FlowController.MAX_CONCURRENT_SCHEDULED_RUNS} " +
+                "scheduled flows run concurrently. Scheduled invocations appear in run history.",
+            schema(
+                """{"tabId":{"type":"string"},"intervalMinutes":{"type":["integer","null"],"minimum":${FlowController.MIN_SCHEDULE_INTERVAL_MINUTES},"maximum":${FlowController.MAX_SCHEDULE_INTERVAL_MINUTES}}""",
+                required = listOf("tabId", "intervalMinutes"),
+            ),
+            readOnly = false,
+        ) { a ->
+            val args = a.obj()
+            val tabId = args.str("tabId") ?: return@def err("flow_set_schedule requires 'tabId'")
+            val intervalValue = args["intervalMinutes"]
+                ?: return@def err("flow_set_schedule requires 'intervalMinutes'")
+            val intervalMinutes = when (intervalValue) {
+                JsonNull -> null
+                is JsonPrimitive -> if (intervalValue.isString) {
+                    return@def err("flow_set_schedule requires 'intervalMinutes' to be an integer or null")
+                } else {
+                    intervalValue.longOrNull
+                        ?: return@def err("flow_set_schedule requires 'intervalMinutes' to be an integer or null")
+                }
+                else -> return@def err("flow_set_schedule requires 'intervalMinutes' to be an integer or null")
+            }
+            val updated = controller.updateSchedule(tabId, intervalMinutes)
+            ok(buildJsonObject {
+                put("ok", true)
+                put("tabId", updated.tabId)
+                put("intervalMinutes", updated.schedule?.intervalMinutes)
+                updated.nextScheduledRunAtEpochMs?.let { put("nextRunAtEpochMs", it) }
             })
         },
         def("flow_list", "List every stored flow's tabId. Pass detail=true to also return " +
