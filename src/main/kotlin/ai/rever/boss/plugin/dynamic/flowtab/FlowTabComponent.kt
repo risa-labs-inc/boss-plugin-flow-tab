@@ -413,7 +413,11 @@ class FlowTabComponent(
                         snapshot = snapshot,
                         appliedGraphRevision = appliedRevision,
                     ) { current ->
-                        storage.putJson(storageKey, json.encodeToString(GraphSnapshot.serializer(), current))
+                        val previous = storage.getJson(storageKey)?.let { raw ->
+                            runCatching { json.decodeFromString(GraphSnapshot.serializer(), raw) }.getOrNull()
+                        }
+                        val persisted = current.withPersistenceTimestamps(previous, System.currentTimeMillis())
+                        storage.putJson(storageKey, json.encodeToString(GraphSnapshot.serializer(), persisted))
                     }
                 }
             }
@@ -695,7 +699,11 @@ class FlowTabComponent(
             }
             uiScope.launch {
                 val newId = "flow-${java.util.UUID.randomUUID()}"
-                val safeJson = json.encodeToString(GraphSnapshot.serializer(), imported)
+                val persisted = imported.withPersistenceTimestamps(
+                    previous = null,
+                    nowEpochMs = System.currentTimeMillis(),
+                )
+                val safeJson = json.encodeToString(GraphSnapshot.serializer(), persisted)
                 runCatching { store.putJson("graph:$newId", safeJson) }
                 splitView.openTab(FlowTabData(id = newId, title = title))
                 state.notice = notice

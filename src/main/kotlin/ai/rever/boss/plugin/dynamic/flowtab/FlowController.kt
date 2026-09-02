@@ -70,6 +70,8 @@ data class FlowSummary(
     val lastScheduledRunAtEpochMs: Long? = null,
     val nextScheduledRunAtEpochMs: Long? = null,
     val lastScheduledRunState: RunJobState? = null,
+    val createdAtEpochMs: Long? = null,
+    val modifiedAtEpochMs: Long? = null,
 )
 
 /** Durable scheduler cursor. Graph metadata remains the source of schedule configuration. */
@@ -360,8 +362,14 @@ class FlowController(
             lastScheduledRunAtEpochMs = scheduleState?.lastRunAtEpochMs,
             nextScheduledRunAtEpochMs = scheduleState?.nextRunAtEpochMs,
             lastScheduledRunState = scheduleState?.lastRunState,
+            createdAtEpochMs = snapshot?.createdAtEpochMs,
+            modifiedAtEpochMs = snapshot?.modifiedAtEpochMs,
         )
-    }
+    }.sortedWith(
+        compareByDescending<FlowSummary> { it.modifiedAtEpochMs ?: it.createdAtEpochMs ?: Long.MIN_VALUE }
+            .thenByDescending { it.createdAtEpochMs ?: Long.MIN_VALUE }
+            .thenBy { it.tabId }
+    )
 
     /**
      * Set a fixed-interval schedule, or disable scheduling with null. The graph update is
@@ -1201,12 +1209,17 @@ class FlowController(
 
     // ---- internals ----------------------------------------------------------
 
-    private suspend fun writeUnlocked(tabId: String, snapshot: GraphSnapshot) {
+    private suspend fun writeUnlocked(tabId: String, snapshot: GraphSnapshot): GraphSnapshot {
         // Read-modify-write callers already hold the per-flow mutex. Never acquire it
         // in this helper: kotlinx Mutex is non-reentrant and would deadlock.
-        val store = storage ?: return
-        store.putJson(graphKey(tabId), json.encodeToString(GraphSnapshot.serializer(), snapshot))
+        val store = storage ?: return snapshot
+        val previous = store.getJson(graphKey(tabId))?.let { raw ->
+            runCatching { json.decodeFromString(GraphSnapshot.serializer(), raw) }.getOrNull()
+        }
+        val persisted = snapshot.withPersistenceTimestamps(previous, nowMillis())
+        store.putJson(graphKey(tabId), json.encodeToString(GraphSnapshot.serializer(), persisted))
         FlowPersistenceCoordinator.publishFlowListChange()
+        return persisted
     }
 
     private suspend fun loadScheduleState(tabId: String): FlowScheduleState? {
