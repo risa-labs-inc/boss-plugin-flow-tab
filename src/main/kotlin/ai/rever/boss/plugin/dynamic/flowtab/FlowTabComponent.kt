@@ -10,6 +10,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -25,6 +26,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.AlertDialog
@@ -32,6 +35,8 @@ import androidx.compose.material.DropdownMenu
 import androidx.compose.material.DropdownMenuItem
 import androidx.compose.material.Icon
 import androidx.compose.material.IconButton
+import androidx.compose.material.MaterialTheme
+import androidx.compose.material.Surface
 import androidx.compose.material.Text
 import androidx.compose.material.TextButton
 import androidx.compose.material.TextField
@@ -84,6 +89,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import com.arkivanov.decompose.ComponentContext
 import com.arkivanov.essenty.lifecycle.Lifecycle
 import kotlinx.coroutines.CancellationException
@@ -112,11 +118,18 @@ private val IconTint = Color(0xFFCDCDD4)
 private val ConfirmBg = Color(0xFF3A2E12)
 private val NoticeBg = Color(0xFF26456E)
 private val RunGreen = Color(0xFF2E7D32)
+internal val RunHistoryDialogViewportMargin = 32.dp
+internal val RunHistoryDialogHeightCap = 560.dp
 private const val WAITING_FOR_PREVIOUS_NOTICE = "Waiting for the previous run to stop…"
 private val RunStartedFormatter = java.time.format.DateTimeFormatter.ofPattern(
     "MMM d, h:mm:ss a",
     java.util.Locale.getDefault(),
 )
+
+internal fun runHistoryDialogMaxHeight(viewportHeight: androidx.compose.ui.unit.Dp) =
+    (viewportHeight - RunHistoryDialogViewportMargin)
+        .coerceAtLeast(0.dp)
+        .coerceAtMost(RunHistoryDialogHeightCap)
 
 /** Clipboard providers are optional host services and may fail across the plugin boundary. */
 internal fun copyInspectorText(context: PluginContext, text: String): Boolean =
@@ -1191,72 +1204,35 @@ class FlowTabComponent(
             }
 
             if (showRunHistory) {
-                AlertDialog(
-                    onDismissRequest = { showRunHistory = false },
-                    title = { Text("Run history") },
-                    text = {
-                        Column(
-                            Modifier
-                                .fillMaxWidth()
-                                .heightIn(max = 420.dp)
-                                .verticalScroll(rememberScrollState())
-                        ) {
-                            when {
-                                runHistoryLoading -> Text("Loading…")
-                                runHistory.isEmpty() -> Text("No runs yet")
-                                else -> runHistory.forEach { summary ->
-                                    Row(
-                                        Modifier
-                                            .fillMaxWidth()
-                                            .clickable {
-                                                uiScope.launch {
-                                                    withContext(Dispatchers.IO) {
-                                                        controller.runSnapshot(summary.runId)
-                                                    }?.let { job ->
-                                                        if (job.state == RunJobState.RUNNING) {
-                                                            state.notice = "That run is still in progress; live status appears automatically"
-                                                        } else {
-                                                            val revision = job.revisionId?.let { id -> controller.workflowRevision(job.tabId, id) }
-                                                            if (revision == null) {
-                                                                state.notice = "This legacy run has no saved workflow revision"
-                                                            } else if (state.isRunning) {
-                                                                state.notice = "Stop the current run before viewing run history"
-                                                            } else if (!state.load(revision.snapshot)) {
-                                                                state.notice = "This workflow revision is not supported by this version of Flow"
-                                                            } else {
-                                                                state.applyRunJob(job)
-                                                                viewingHistoricalRevision = revision
-                                                                state.notice = "Viewing run ${summary.runId} · ${revision.id}"
-                                                            }
-                                                        }
-                                                    }
-                                                    showRunHistory = false
-                                                }
-                                            }
-                                            .padding(vertical = 8.dp),
-                                        verticalAlignment = Alignment.CenterVertically,
-                                    ) {
-                                        Column(Modifier.weight(1f)) {
-                                            Text(summary.runId, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                                            Text(
-                                                formatRunStarted(summary.startedAtMs),
-                                                color = FlowTheme.TextMuted,
-                                                fontSize = 11.sp,
-                                            )
-                                        }
-                                        Text(
-                                            "${summary.state} · ${summary.nodeCount} nodes" +
-                                                (summary.revisionId?.let { " · $it" } ?: ""),
-                                            fontSize = 11.sp,
-                                        )
+                RunHistoryDialog(
+                    loading = runHistoryLoading,
+                    runs = runHistory,
+                    onSelectRun = { summary ->
+                        uiScope.launch {
+                            withContext(Dispatchers.IO) {
+                                controller.runSnapshot(summary.runId)
+                            }?.let { job ->
+                                if (job.state == RunJobState.RUNNING) {
+                                    state.notice = "That run is still in progress; live status appears automatically"
+                                } else {
+                                    val revision = job.revisionId?.let { id -> controller.workflowRevision(job.tabId, id) }
+                                    if (revision == null) {
+                                        state.notice = "This legacy run has no saved workflow revision"
+                                    } else if (state.isRunning) {
+                                        state.notice = "Stop the current run before viewing run history"
+                                    } else if (!state.load(revision.snapshot)) {
+                                        state.notice = "This workflow revision is not supported by this version of Flow"
+                                    } else {
+                                        state.applyRunJob(job)
+                                        viewingHistoricalRevision = revision
+                                        state.notice = "Viewing run ${summary.runId} · ${revision.id}"
                                     }
                                 }
                             }
+                            showRunHistory = false
                         }
                     },
-                    confirmButton = {
-                        TextButton(onClick = { showRunHistory = false }) { Text("Close") }
-                    },
+                    onDismiss = { showRunHistory = false },
                 )
             }
 
@@ -1305,6 +1281,91 @@ class FlowTabComponent(
                 )
             }
         }
+    }
+}
+
+@Composable
+private fun RunHistoryDialog(
+    loading: Boolean,
+    runs: List<RunSummary>,
+    onSelectRun: (RunSummary) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    Dialog(onDismissRequest = onDismiss) {
+        BoxWithConstraints(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center,
+        ) {
+            val dialogWidth = (maxWidth - RunHistoryDialogViewportMargin)
+                .coerceAtLeast(0.dp)
+                .coerceAtMost(640.dp)
+            Surface(
+                modifier = Modifier
+                    .width(dialogWidth)
+                    .heightIn(max = runHistoryDialogMaxHeight(maxHeight)),
+                shape = RoundedCornerShape(4.dp),
+                color = MaterialTheme.colors.surface,
+                elevation = 24.dp,
+            ) {
+                Column {
+                    Text(
+                        text = "Run history",
+                        modifier = Modifier.padding(start = 24.dp, end = 24.dp, top = 20.dp, bottom = 12.dp),
+                        style = MaterialTheme.typography.h6,
+                    )
+                    when {
+                        loading -> Text(
+                            "Loading…",
+                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+                        )
+                        runs.isEmpty() -> Text(
+                            "No runs yet",
+                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 8.dp),
+                        )
+                        else -> LazyColumn(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f, fill = false),
+                        ) {
+                            items(runs, key = { it.runId }) { summary ->
+                                RunHistoryRow(summary = summary, onClick = { onSelectRun(summary) })
+                            }
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.End,
+                    ) {
+                        TextButton(onClick = onDismiss) { Text("Close") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RunHistoryRow(summary: RunSummary, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(horizontal = 24.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(summary.runId, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(
+                formatRunStarted(summary.startedAtMs),
+                color = FlowTheme.TextMuted,
+                fontSize = 11.sp,
+            )
+        }
+        Text(
+            "${summary.state} · ${summary.nodeCount} nodes" +
+                (summary.revisionId?.let { " · $it" } ?: ""),
+            fontSize = 11.sp,
+        )
     }
 }
 
