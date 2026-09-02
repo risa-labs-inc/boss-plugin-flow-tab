@@ -912,6 +912,13 @@ class ExternalMcpTest {
         val failure = assertFailsWith<IllegalStateException> { failedStart.await() }
         assertEquals("External MCP manager crashed; reload the plugin to retry", failure.message)
         assertFalse(rawPayload in failure.message.orEmpty())
+        assertEquals(
+            ExternalMcpServerStatus(
+                ExternalMcpServerState.ERROR,
+                "External MCP manager crashed; reload the plugin to retry",
+            ),
+            m.serverStatuses.value.getValue("s"),
+        )
         assertTrue(closed)
         assertEquals(ExternalMcpManagerState.CRASHED, m.state.value)
         assertTrue(logged.isEmpty())
@@ -958,6 +965,53 @@ class ExternalMcpTest {
         assertEquals(ExternalMcpManagerState.CRASHED, m.state.value)
         assertEquals(listOf("external MCP manager fatal diagnostic could not be recorded"), fallbackLogs)
         assertTrue(fallbackLogs.none { "logger payload" in it || "actor failure" in it })
+    }
+
+    @Test
+    fun `fatal error replaces every configured server status with safe crash detail`() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val storage = TestStorage()
+        val configs = listOf(
+            McpServerConfig("connected", McpTransportKind.STDIO, command = "x", enabled = true),
+            McpServerConfig("disabled", McpTransportKind.STDIO, command = "x", enabled = false),
+            McpServerConfig("failing", McpTransportKind.STDIO, command = "x", enabled = true),
+        )
+        storage.putJson(
+            ExternalMcpManager.CONFIG_KEY,
+            Json.encodeToString(ListSerializer(McpServerConfig.serializer()), configs),
+        )
+        SettingsStore(storage).setExternalMcpEnabled(true)
+        val rawPayload = "fatal-provider-secret\nforged line"
+        val m = manager(storage, ioDispatcher = dispatcher) { cfg, _ ->
+            when (cfg.name) {
+                "failing" -> FakeTransport(emptyList(), failConnect = true)
+                "fatal" -> object : McpTransport {
+                    override suspend fun connect(): Unit = throw LinkageError(rawPayload)
+                    override suspend fun listTools(): List<RemoteTool> = emptyList()
+                    override suspend fun callTool(name: String, argsJson: String) = RemoteToolResult("", false)
+                    override suspend fun close() = Unit
+                }
+                else -> FakeTransport(emptyList())
+            }
+        }
+        m.start()
+        assertEquals(ExternalMcpServerState.CONNECTED, m.serverStatuses.value.getValue("connected").state)
+        assertEquals(ExternalMcpServerState.DISCONNECTED, m.serverStatuses.value.getValue("disabled").state)
+        assertEquals(ExternalMcpServerState.ERROR, m.serverStatuses.value.getValue("failing").state)
+
+        val failedAdd = m.requestAddConfig(
+            McpServerConfig("fatal", McpTransportKind.STDIO, command = "x", enabled = true),
+        )
+        runCurrent()
+
+        assertFailsWith<IllegalStateException> { failedAdd.await() }
+        assertEquals(setOf("connected", "disabled", "failing", "fatal"), m.serverStatuses.value.keys)
+        m.serverStatuses.value.values.forEach { status ->
+            assertEquals(ExternalMcpServerState.ERROR, status.state)
+            assertEquals("External MCP manager crashed; reload the plugin to retry", status.detail)
+            assertFalse(rawPayload in status.detail.orEmpty())
+            assertFalse('\n' in status.detail.orEmpty())
+        }
     }
 
     @Test

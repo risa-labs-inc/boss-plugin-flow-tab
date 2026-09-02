@@ -336,27 +336,30 @@ class ExternalMcpManager(
     }
 
     private fun markCrashed(fatal: Error) {
-        val shouldLog = synchronized(requestLock) {
+        val crashed = synchronized(requestLock) {
             if (terminalState == ExternalMcpManagerState.CRASHED) {
                 false
             } else {
                 acceptingRequests = false
                 terminalState = ExternalMcpManagerState.CRASHED
-                mutableState.value = terminalState
                 true
             }
         }
-        if (shouldLog) {
+        if (!crashed) return
+        // A dead manager must not keep showing connected rows. The fixed public
+        // message also keeps the provider-controlled fatal payload out of the UI.
+        val crashedStatus = ExternalMcpServerStatus(ExternalMcpServerState.ERROR, CRASHED_MESSAGE)
+        replaceStatuses(mutableServerStatuses.value.mapValues { _ -> crashedStatus })
+        mutableState.value = ExternalMcpManagerState.CRASHED
+        try {
+            logFatal("external MCP manager crashed; reload the plugin", fatal)
+        } catch (_: Throwable) {
+            // Logging must never prevent the accepted request from receiving its
+            // bounded terminal failure. Do not include data from either throwable.
             try {
-                logFatal("external MCP manager crashed; reload the plugin", fatal)
+                log("external MCP manager fatal diagnostic could not be recorded")
             } catch (_: Throwable) {
-                // Logging must never prevent the accepted request from receiving its
-                // bounded terminal failure. Do not include data from either throwable.
-                try {
-                    log("external MCP manager fatal diagnostic could not be recorded")
-                } catch (_: Throwable) {
-                    // A caller-owned logging sink is outside the actor's trust boundary.
-                }
+                // A caller-owned logging sink is outside the actor's trust boundary.
             }
         }
     }

@@ -327,7 +327,8 @@ the manager actor; a terminal actor failure or forced `cancelNow` must also stop
 queued request, and boundedly reap already-open transports instead of leaving work or child processes
 without an owner. Plugin disposal joins that forced cleanup and the actor finalizer within a bounded
 unload budget. Fatal actor failure is logged without provider payloads and rejects later requests as crashed with plugin
-reload guidance, distinct from normal disposal.
+reload guidance. It also replaces every cached server status with `ERROR` carrying the fixed public
+crash message, distinct from normal disposal's `DISCONNECTED` status.
 
 Flow-owned schedules are optional fixed intervals stored in `FlowMeta.schedule`; an absent field
 keeps every legacy graph manual-only. The launcher is the scheduling UI: its clock action sets or
