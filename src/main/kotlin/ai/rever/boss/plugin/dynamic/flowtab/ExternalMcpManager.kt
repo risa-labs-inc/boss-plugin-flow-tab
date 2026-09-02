@@ -329,6 +329,9 @@ class ExternalMcpManager(
             } else {
                 acceptingRequests = false
                 terminalState = TerminalState.CRASHED
+                mutableServerStatuses.value = mutableServerStatuses.value.mapValues {
+                    ExternalMcpServerStatus(ExternalMcpServerState.ERROR, CRASHED_MESSAGE)
+                }
                 true
             }
         }
