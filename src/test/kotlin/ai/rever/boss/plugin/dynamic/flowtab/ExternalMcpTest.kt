@@ -921,7 +921,8 @@ class ExternalMcpTest {
         )
         assertTrue(closed)
         assertEquals(ExternalMcpManagerState.CRASHED, m.state.value)
-        assertTrue(logged.isEmpty())
+        assertTrue(logged.any { "crashed; reload the plugin" in it && "NoClassDefFoundError" in it })
+        assertTrue(logged.none { rawPayload in it })
         assertTrue(logged.all { it.length <= ExternalMcpManager.MAX_STATUS_DETAIL_LENGTH })
         assertEquals(1, fatalLogs.size)
         assertTrue("crashed; reload the plugin" in fatalLogs.single().first)
@@ -963,7 +964,8 @@ class ExternalMcpTest {
 
         assertEquals("External MCP manager crashed; reload the plugin to retry", failure.message)
         assertEquals(ExternalMcpManagerState.CRASHED, m.state.value)
-        assertEquals(listOf("external MCP manager fatal diagnostic could not be recorded"), fallbackLogs)
+        assertTrue(fallbackLogs.any { "crashed; reload the plugin" in it && "LinkageError" in it })
+        assertTrue(fallbackLogs.any { it == "external MCP manager fatal diagnostic could not be recorded" })
         assertTrue(fallbackLogs.none { "logger payload" in it || "actor failure" in it })
     }
 
@@ -1226,6 +1228,7 @@ class ExternalMcpTest {
 
         assertTrue(transport.closed.get())
         assertTrue(m.descriptors.value.isEmpty())
+        assertEquals(ExternalMcpManagerState.DISPOSED, m.state.value)
         assertEquals(ExternalMcpServerState.DISCONNECTED, m.serverStatuses.value.getValue("s").state)
         assertEquals(before + 1, m.changeTick.value)
     }
@@ -1358,6 +1361,7 @@ class ExternalMcpTest {
         assertEquals("External MCP manager is disposed", lateFailure.message)
         val disposalFailure = assertFailsWith<IllegalStateException> { m.disposeAll() }
         assertEquals("External MCP manager is disposed", disposalFailure.message)
+        assertEquals(ExternalMcpManagerState.DISPOSED, m.state.value)
     }
 
     // ---- settings store -----------------------------------------------------

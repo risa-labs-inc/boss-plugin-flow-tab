@@ -326,9 +326,12 @@ two-second NonCancellable cleanup bound, and publishes the terminal empty snapsh
 the manager actor; a terminal actor failure or forced `cancelNow` must also stop acceptance, fail every
 queued request, and boundedly reap already-open transports instead of leaving work or child processes
 without an owner. Plugin disposal joins that forced cleanup and the actor finalizer within a bounded
-unload budget. Fatal actor failure is logged without provider payloads and rejects later requests as crashed with plugin
-reload guidance. It also replaces every cached server status with `ERROR` carrying the fixed public
-crash message, distinct from normal disposal's `DISCONNECTED` status.
+unload budget. Fatal actor failure emits a bounded type-only breadcrumb, then sends the original
+`Error` and stack to the host's trusted structured logger; ordinary provider-controlled `Exception`
+diagnostics remain bounded and redacted. The manager rejects later requests with plugin reload
+guidance. It also replaces every cached server status with `ERROR` carrying the fixed public crash
+message before publishing `ExternalMcpManager.state` as `CRASHED`, so the dialog disables retry and
+states that reload is required. This is distinct from normal disposal's `DISCONNECTED` status.
 
 Flow-owned schedules are optional fixed intervals stored in `FlowMeta.schedule`; an absent field
 keeps every legacy graph manual-only. The launcher is the scheduling UI: its clock action sets or

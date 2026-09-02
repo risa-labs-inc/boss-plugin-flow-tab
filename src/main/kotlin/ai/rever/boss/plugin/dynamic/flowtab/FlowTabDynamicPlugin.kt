@@ -23,7 +23,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  * It registers as a TabType via tabRegistry.registerTabType().
  */
 class FlowTabDynamicPlugin : DynamicPlugin {
-    private val logger = BossLogger.forComponent("FlowPlugin")
+    private val logger by lazy { BossLogger.forComponent("FlowPlugin") }
     override val pluginId: String = "ai.rever.boss.plugin.dynamic.flowtab"
     override val displayName: String = "Flow"
     override val version: String = "1.0.0"

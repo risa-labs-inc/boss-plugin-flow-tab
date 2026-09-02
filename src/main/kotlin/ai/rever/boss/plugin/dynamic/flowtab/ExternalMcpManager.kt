@@ -321,17 +321,21 @@ class ExternalMcpManager(
     private fun isAcceptingRequests(): Boolean = synchronized(requestLock) { acceptingRequests }
 
     private fun stopAcceptanceAndDrain() {
-        synchronized(requestLock) {
+        val becameDisposed = synchronized(requestLock) {
             acceptingRequests = false
-            if (terminalState == ExternalMcpManagerState.ACTIVE) {
+            val changed = terminalState == ExternalMcpManagerState.ACTIVE
+            if (changed) {
                 terminalState = ExternalMcpManagerState.DISPOSED
-                mutableState.value = terminalState
             }
             requests.close()
             while (true) {
                 val pending = requests.tryReceive().getOrNull() ?: break
                 pending.fail(terminalFailureLocked())
             }
+            changed
+        }
+        if (becameDisposed) {
+            mutableState.compareAndSet(ExternalMcpManagerState.ACTIVE, ExternalMcpManagerState.DISPOSED)
         }
     }
 
@@ -352,12 +356,17 @@ class ExternalMcpManager(
         replaceStatuses(mutableServerStatuses.value.mapValues { _ -> crashedStatus })
         mutableState.value = ExternalMcpManagerState.CRASHED
         try {
+            logActorFailure("crashed; reload the plugin", fatal)
+        } catch (_: Throwable) {
+            // The structured fatal sink below remains the diagnostic source of truth.
+        }
+        try {
             logFatal("external MCP manager crashed; reload the plugin", fatal)
         } catch (_: Throwable) {
             // Logging must never prevent the accepted request from receiving its
             // bounded terminal failure. Do not include data from either throwable.
             try {
-                log("external MCP manager fatal diagnostic could not be recorded")
+                log(boundedExternalMcpDiagnostic("external MCP manager fatal diagnostic could not be recorded"))
             } catch (_: Throwable) {
                 // A caller-owned logging sink is outside the actor's trust boundary.
             }
@@ -731,18 +740,22 @@ class ExternalMcpManager(
      * Caller cancellation only stops awaiting; the manager-owned disposal keeps running.
      */
     suspend fun disposeAll() {
+        var becameDisposed = false
         val result = synchronized(requestLock) {
             disposeResult ?: CompletableDeferred<Unit>().also { completion ->
                 acceptingRequests = false
                 if (terminalState == ExternalMcpManagerState.ACTIVE) {
                     terminalState = ExternalMcpManagerState.DISPOSED
-                    mutableState.value = terminalState
+                    becameDisposed = true
                 }
                 disposeResult = completion
                 if (requests.trySend(ManagerRequest.Dispose(completion)).isFailure) {
                     completion.completeExceptionally(terminalFailureLocked())
                 }
             }
+        }
+        if (becameDisposed) {
+            mutableState.compareAndSet(ExternalMcpManagerState.ACTIVE, ExternalMcpManagerState.DISPOSED)
         }
         result.await()
         worker.join()
