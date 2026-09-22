@@ -120,23 +120,32 @@ class FlowExecutor(
                                 return@launch
                             }
 
-                            onStatus(node.id, NodeRun(RunStatus.RUNNING))
-                            // Realistic mode: pause a random, human-like beat before acting —
-                            // paces the run so it's watchable and mimics a person at the keyboard.
-                            if (humanize) delay(Random.nextLong(HUMANIZE_MIN_MS, HUMANIZE_MAX_MS))
                             val logs = mutableListOf<String>()
+                            var skipped = false
                             try {
                                 val incoming = incomingOf[node.id].orEmpty()
                                 val inputs = incoming
                                     .sortedBy { it.toPort }
                                     .flatMap { outputsById[it.fromNode]?.port(it.fromPort).orEmpty() }
-                                val skipped = incoming.isNotEmpty() && inputs.isEmpty()
-                                val out = if (skipped) {
+                                // Every dependency has finished, so the inputs are already final:
+                                // branch selection is decided here, *before* the node is announced
+                                // as RUNNING. A node on an unselected branch never executes, so it
+                                // must not flash RUNNING on the canvas, must not spend a humanize
+                                // beat, and must not be caught by Stop / dispose / timeout, all of
+                                // which retire a node still marked RUNNING as ERROR. Everything the
+                                // selected branch does hangs off the one `else` below, so the two
+                                // cannot drift apart.
+                                val out = if (incoming.isNotEmpty() && inputs.isEmpty()) {
                                     // An upstream control port emitted no items. Do not seed
                                     // and accidentally execute the unselected branch.
                                     logs.add(SKIP_NO_INPUT)
+                                    skipped = true
                                     NodeOutput.EMPTY
                                 } else {
+                                    onStatus(node.id, NodeRun(RunStatus.RUNNING))
+                                    // Realistic mode: pause a random, human-like beat before acting -
+                                    // paces the run so it's watchable and mimics a person at the keyboard.
+                                    if (humanize) delay(Random.nextLong(HUMANIZE_MIN_MS, HUMANIZE_MAX_MS))
                                     // Provider availability is a runtime property of the selected
                                     // branch. A dead branch must not fail an otherwise valid run.
                                     val spec = registry[node.kind]

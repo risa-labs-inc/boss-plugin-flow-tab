@@ -26,6 +26,7 @@ import kotlinx.serialization.json.put
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
+import kotlin.system.measureTimeMillis
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -187,6 +188,27 @@ private fun runGraph(
         ) { id, r -> states[id] = r }
     }
     return states
+}
+
+/**
+ * Every status published for each node, in order. [runGraph] keeps only the last one,
+ * so a transient RUNNING that is immediately overwritten by SKIPPED is invisible to it.
+ */
+private fun runGraphStatusLog(
+    nodes: List<PlanNode>,
+    edges: List<EdgeModel>,
+    humanize: Boolean = false,
+): Map<String, List<RunStatus>> {
+    val log = ConcurrentHashMap<String, MutableList<RunStatus>>()
+    runBlocking(Dispatchers.Default) {
+        FlowExecutor(FakeContext(null), builtinNodeRegistry(), SecretResolver.constant(null)).run(
+            nodes, edges, humanize = humanize,
+        ) { id, r ->
+            // onStatus for one node is only ever called from that node's own coroutine.
+            log.computeIfAbsent(id) { mutableListOf() }.add(r.status)
+        }
+    }
+    return log.mapValues { (_, statuses) -> statuses.toList() }
 }
 
 private fun JsonObject.str(key: String) = this[key]?.jsonPrimitive?.content
@@ -824,6 +846,59 @@ class FlowExecutorTest {
         assertEquals(RunStatus.SUCCESS, states["yes"]?.status)
         assertEquals("yes", states["yes"]!!.output.single().json.str("branch"))
         assertEquals(RunStatus.SKIPPED, states["no"]?.status)
+    }
+
+    @Test
+    fun `an unselected branch is never announced as RUNNING`() {
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            n("if", NodeType.IF, "condition" to "1 > 2"),
+            n("yes", NodeType.SET, "assignments" to """{"branch":"yes"}"""),
+            n("no", NodeType.SET, "assignments" to """{"branch":"no"}"""),
+            n("tail", NodeType.SET, "assignments" to """{"branch":"tail"}"""),
+        )
+        val edges = listOf(
+            e("t", "if"),
+            e("if", "yes", fp = 0),
+            e("if", "no", fp = 1),
+            e("yes", "tail"),
+        )
+
+        // 1 > 2 is false, so the If emits on port 1: "no" is selected, "yes" and
+        // everything behind it are not.
+        val log = runGraphStatusLog(nodes, edges)
+
+        // The selected branch still reports RUNNING, so the canvas animates work it is
+        // really doing. The unselected branch goes straight to SKIPPED: no RUNNING flash,
+        // and - since the humanize beat sits behind the same guard - no pause either.
+        assertEquals(listOf(RunStatus.RUNNING, RunStatus.SUCCESS), log["if"])
+        assertEquals(listOf(RunStatus.RUNNING, RunStatus.SUCCESS), log["no"])
+        assertEquals(listOf(RunStatus.SKIPPED), log["yes"])
+        assertEquals(listOf(RunStatus.SKIPPED), log["tail"])
+    }
+
+    @Test
+    fun `realistic mode spends no humanize beat on an unselected branch`() {
+        // Two nodes execute (trigger, if); twelve sit on the branch the If does not pick.
+        // A humanize beat is 600-2000ms, so the executed pair costs at most 4s, while
+        // beating all fourteen - the bug - costs at least 8.4s. 6s separates them with
+        // room for a slow machine.
+        val chain = ('a'..'l').map { it.toString() }
+        val nodes = listOf(
+            n("t", NodeType.TRIGGER),
+            n("if", NodeType.IF, "condition" to "1 > 2"),
+        ) + chain.map { n(it, NodeType.SET, "assignments" to """{"step":"$it"}""") }
+        val edges = listOf(e("t", "if"), e("if", chain.first(), fp = 0)) +
+            chain.zipWithNext { from, to -> e(from, to) }
+
+        val log: Map<String, List<RunStatus>>
+        val elapsedMs = measureTimeMillis { log = runGraphStatusLog(nodes, edges, humanize = true) }
+
+        // Timing first: it is the only assertion that can see the beat, and a status
+        // check ahead of it would fail first and leave this one unproven.
+        assertTrue(elapsedMs < 6_000, "unselected branch paused for a humanize beat: ${elapsedMs}ms")
+        assertEquals(listOf(RunStatus.RUNNING, RunStatus.SUCCESS), log["if"])
+        chain.forEach { assertEquals(listOf(RunStatus.SKIPPED), log[it], "node $it") }
     }
 
     @Test
